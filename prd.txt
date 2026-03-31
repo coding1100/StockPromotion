@@ -1,0 +1,86 @@
+Requirement Document ‒ Automation System
+for Stock Promotion (Phase 1)
+1. Objective
+To develop an automated system that:
+Promotes selected stocks across StockTwits and Telegram
+Generates engaging content based on trends
+Automates posting workflows to increase awareness among retail investors
+2. Scope of Work
+2.1 Data Extraction
+Extract trending stock-related discussions from:
+Reddit
+Other relevant sources
+Identify high-interest topics and stock mentions
+2.2 Content Generation
+Generate engaging, natural, and attention-grabbing content
+Content will be based on:
+Trending discussions
+Market sentiment
+Ensure variation in messaging to maintain engagement
+2.3 Publishing System
+StockTwits (Primary Platform)
+Posting will be handled using browser automation
+Automation flow:
+Login to account
+Navigate to posting interface
+Input generated content
+Submit post
+Telegram
+Use automation to:
+Discover stock-related groups (where possible)
+Join groups
+Post content automatically
+3. Automation Approach
+3.1 Browser Automation
+Use tools such as:
+Selenium
+Playwright
+Simulate real user behavior for:
+Navigation
+Posting
+Interaction flow
+3.2 Account Management
+Support multiple accounts for posting
+System will:
+Handle switching between accounts
+Replace accounts when they get restricted or blocked
+Account creation:
+Can be automated or semi-automated depending on platform behavior
+3.3 Anti-Blocking Strategy
+Address risks such as:
+Account bans
+IP blocking
+Measures may include:
+Controlled posting frequency
+Activity randomization
+Use of multiple environments (if required)
+4. End-to-End Workflow
+1. Extract trending discussions
+2. Process and filter relevant data
+3. Generate content
+4. Assign content to accounts
+5. Publish on:
+StockTwits
+Telegram groups
+6. Monitor posting status and account health
+5. What is Doable
+Trend extraction from supported sources
+Content generation based on trends
+Browser automation for StockTwits posting
+Automated Telegram posting
+Multi-account handling
+End-to-end automated workflow
+6. Limitations & Risks
+StockTwits automation depends on UI and may break if interface changes
+Accounts may get restricted or banned over time
+IP-based restrictions may occur
+Telegram group discovery and joining may have limitations
+Requires ongoing monitoring and maintenance
+7. Final Notes
+The system is technically feasible
+StockTwits automation will be treated as a core component using browser automation
+Telegram automation will complement distribution
+Continuous iteration will be required to maintain performance and stability
+For Data Extraction you have to specify me with the genre of the data, channel details from where we
+have to get the data etc.
+Which LLM provider you are willing to integrate for content generation?

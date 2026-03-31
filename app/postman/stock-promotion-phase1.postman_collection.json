@@ -1,0 +1,509 @@
+{
+  "info": {
+    "_postman_id": "7d4f95ab-c6b1-4aa3-868e-95a75ed4e640",
+    "name": "Stock Promotion Phase 1 API",
+    "description": "Pre-configured collection for Phase 1 backend testing.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Live",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/live",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "live"
+              ]
+            },
+            "description": "Public liveness endpoint."
+          }
+        },
+        {
+          "name": "Ready",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/ready",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "ready"
+              ]
+            },
+            "description": "Public readiness endpoint (returns 503 when degraded)."
+          }
+        },
+        {
+          "name": "Metrics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/health/metrics",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "metrics"
+              ]
+            },
+            "description": "Protected metrics endpoint."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Orchestration",
+      "item": [
+        {
+          "name": "Run Pipeline (Sync)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"sync\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/run",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "run"
+              ]
+            },
+            "description": "Runs full pipeline synchronously."
+          }
+        },
+        {
+          "name": "Run Pipeline (Async)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"async\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/run",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "run"
+              ]
+            },
+            "description": "Enqueues pipeline run."
+          }
+        },
+        {
+          "name": "List Trends",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/trends?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "trends"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Drafts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/drafts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "drafts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Drafts (AUTO_APPROVED)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/drafts?status=AUTO_APPROVED",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "drafts"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "AUTO_APPROVED"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Approve Draft",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/drafts/{{draftId}}/approve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "drafts",
+                "{{draftId}}",
+                "approve"
+              ]
+            },
+            "description": "Set {{draftId}} from List Drafts response."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Telegram",
+      "item": [
+        {
+          "name": "List Candidates",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/telegram/candidates",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "telegram",
+                "candidates"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Approve Candidate",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/telegram/candidates/{{candidateId}}/approve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "telegram",
+                "candidates",
+                "{{candidateId}}",
+                "approve"
+              ]
+            },
+            "description": "Set {{candidateId}} from List Candidates response."
+          }
+        },
+        {
+          "name": "Sync Join State",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/telegram/candidates/sync-join",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "telegram",
+                "candidates",
+                "sync-join"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Publishing",
+      "item": [
+        {
+          "name": "List Publish Jobs",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/publish/jobs?limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "publish",
+                "jobs"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Publish Jobs (FAILED)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/publish/jobs?limit=50&status=FAILED",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "publish",
+                "jobs"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                },
+                {
+                  "key": "status",
+                  "value": "FAILED"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Publish Job",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/publish/jobs/{{publishJobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "publish",
+                "jobs",
+                "{{publishJobId}}"
+              ]
+            },
+            "description": "Set {{publishJobId}} from List Publish Jobs response."
+          }
+        },
+        {
+          "name": "Retry Publish Job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "x-api-key",
+                "value": "{{apiKey}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/publish/jobs/{{publishJobId}}/retry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "publish",
+                "jobs",
+                "{{publishJobId}}",
+                "retry"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.request.headers.upsert({ key: 'Accept', value: 'application/json' });"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('HTTP status is not 5xx', function () {",
+          "  pm.expect(pm.response.code).to.be.below(500);",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000/api"
+    },
+    {
+      "key": "apiKey",
+      "value": "dev-secret-key"
+    },
+    {
+      "key": "draftId",
+      "value": ""
+    },
+    {
+      "key": "candidateId",
+      "value": ""
+    },
+    {
+      "key": "publishJobId",
+      "value": ""
+    }
+  ]
+}

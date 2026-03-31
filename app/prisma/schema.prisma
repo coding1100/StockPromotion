@@ -1,0 +1,205 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SourceType {
+  REDDIT
+  STOCKTWITS_SIGNAL
+  NEWS_API
+}
+
+enum AssetClass {
+  EQUITY
+  CRYPTO
+  UNKNOWN
+}
+
+enum TrendWindow {
+  H1
+  H6
+  H24
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum DraftStatus {
+  GENERATED
+  AUTO_APPROVED
+  FLAGGED
+  REJECTED
+  PUBLISHED
+  FAILED
+}
+
+enum PublishPlatform {
+  STOCKTWITS
+  TELEGRAM
+}
+
+enum PublishStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  SKIPPED
+}
+
+enum AccountPlatform {
+  STOCKTWITS
+  TELEGRAM
+}
+
+enum AccountStatus {
+  ACTIVE
+  QUARANTINED
+  DISABLED
+}
+
+model SourceEvent {
+  id             String     @id @default(cuid())
+  source         SourceType
+  sourceUrl      String?
+  externalId     String?
+  title          String?
+  body           String
+  symbols        String[]
+  sentimentScore Float?
+  engagementScore Float?
+  author         String?
+  rawPayload     Json
+  occurredAt     DateTime
+  ingestedAt     DateTime   @default(now())
+
+  @@index([source, occurredAt])
+  @@unique([source, externalId])
+}
+
+model TrendTopic {
+  id               String       @id @default(cuid())
+  symbol           String
+  assetClass       AssetClass
+  windowType       TrendWindow
+  score            Float
+  mentionCount     Int
+  averageSentiment Float?
+  windowStart      DateTime
+  windowEnd        DateTime
+  evidence         Json
+  createdAt        DateTime     @default(now())
+  drafts           ContentDraft[]
+
+  @@index([symbol, windowType, windowEnd])
+}
+
+model ContentDraft {
+  id            String      @id @default(cuid())
+  trendTopicId  String
+  trendTopic    TrendTopic  @relation(fields: [trendTopicId], references: [id], onDelete: Cascade)
+  title         String?
+  body          String
+  disclaimer    String
+  riskLevel     RiskLevel
+  policyFlags   String[]
+  provider      String
+  model         String
+  promptVersion String
+  status        DraftStatus @default(GENERATED)
+  contentHash   String      @unique
+  createdAt     DateTime    @default(now())
+  approvedAt    DateTime?
+  publishedAt   DateTime?
+  publishJobs   PublishJob[]
+}
+
+model AccountProfile {
+  id            String              @id @default(cuid())
+  platform      AccountPlatform
+  accountHandle String
+  status        AccountStatus       @default(ACTIVE)
+  healthScore   Float               @default(1.0)
+  config        Json
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  publishJobs   PublishJob[]
+  healthEvents  AccountHealthEvent[]
+
+  @@unique([platform, accountHandle])
+}
+
+model AccountHealthEvent {
+  id        String         @id @default(cuid())
+  accountId String
+  account   AccountProfile @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  severity  String
+  message   String
+  metadata  Json?
+  createdAt DateTime       @default(now())
+}
+
+model TelegramGroupCandidate {
+  id            String    @id @default(cuid())
+  title         String
+  inviteLink    String?   @unique
+  chatId        String?   @unique
+  approved      Boolean   @default(false)
+  joined        Boolean   @default(false)
+  lastAttemptAt DateTime?
+  statusNote    String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model PublishJob {
+  id             String         @id @default(cuid())
+  draftId        String
+  draft          ContentDraft   @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  platform       PublishPlatform
+  accountId      String?
+  account        AccountProfile? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  targetRef      String
+  scheduledAt    DateTime
+  status         PublishStatus  @default(PENDING)
+  idempotencyKey String         @unique
+  attempts       Int            @default(0)
+  lastError      String?
+  evidenceUri    String?
+  externalPostId String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  attemptsLog    PublishAttempt[]
+
+  @@index([platform, status, scheduledAt])
+}
+
+model PublishAttempt {
+  id              String    @id @default(cuid())
+  publishJobId    String
+  publishJob      PublishJob @relation(fields: [publishJobId], references: [id], onDelete: Cascade)
+  attemptedAt     DateTime  @default(now())
+  success         Boolean
+  errorClass      String?
+  errorMessage    String?
+  responsePayload Json?
+  evidenceUri     String?
+}
+
+model AuditEvent {
+  id        String   @id @default(cuid())
+  eventType String
+  actorType String
+  actorId   String?
+  entityType String
+  entityId  String
+  metadata  Json
+  createdAt DateTime @default(now())
+
+  @@index([eventType, createdAt])
+}
