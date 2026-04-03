@@ -694,6 +694,42 @@ export class PublishingService {
     };
   }
 
+  async getStocktwitsSessionStatus(): Promise<Record<string, unknown>> {
+    return this.stocktwitsPublisher.getSessionStatus();
+  }
+
+  async bootstrapStocktwitsSession(): Promise<Record<string, unknown>> {
+    await this.accountsService.syncAccountsFromConfig();
+    const account = await this.accountsService.getEligibleAccount(
+      AccountPlatform.STOCKTWITS,
+    );
+    if (!account) {
+      throw new NotFoundException('No active StockTwits account configured');
+    }
+
+    const credentials = this.accountsService.getStocktwitsCredentials(
+      account.accountHandle,
+    );
+    if (!credentials) {
+      throw new NotFoundException('StockTwits account credentials missing');
+    }
+
+    const result = await this.stocktwitsPublisher.bootstrapSession(credentials);
+    await this.auditService.record(
+      'stocktwits.session.bootstrap',
+      'account',
+      account.id,
+      {
+        accountHandle: account.accountHandle,
+        ...result,
+      },
+    );
+    return {
+      accountHandle: account.accountHandle,
+      ...result,
+    };
+  }
+
   private async resolveTelegramTargets(): Promise<string[]> {
     const defaults = (
       this.configService.get<string>('TELEGRAM_DEFAULT_CHAT_IDS') || ''

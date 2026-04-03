@@ -5,7 +5,7 @@ Production-oriented NestJS backend implementing the client-directed Phase 1 pipe
 - mockable Reddit ingestion for demo/staging when live Reddit API access is unavailable,
 - trend detection for equities and crypto,
 - LLM draft generation with strict structured outputs (OpenAI + Anthropic),
-- StockTwits browser automation publishing,
+- StockTwits browser automation publishing via Playwright,
 - Telegram publishing with discovery candidate approval flow,
 - multi-account routing, health scoring, quarantine, and replacement workflow,
 - connector health, weighting, and fallback-aware trend inputs,
@@ -91,6 +91,13 @@ Example:
 - `PHASE2_DUPLICATE_SIMILARITY_THRESHOLD` blocks near-duplicate posts before publish.
 - `SOURCE_CONNECTOR_WEIGHTS_JSON` and `SOURCE_CONNECTOR_PRIORITIES_JSON` control source weighting and failover ordering.
 
+## StockTwits Session Reuse
+- Set `STOCKTWITS_HEADLESS=false` for supervised local testing.
+- Set `STOCKTWITS_USER_DATA_DIR` to a persistent directory so Chromium keeps session cookies/local storage.
+- Set `STOCKTWITS_BROWSER_BINARY` if Playwright should use a non-default browser executable.
+- Use `POST /api/orchestration/stocktwits/session/bootstrap` to open the reusable session and complete login/challenge manually.
+- Use `GET /api/orchestration/stocktwits/session` to verify whether the saved session is still authenticated before dispatching publish jobs.
+
 ## Commands
 ```bash
 npm run build
@@ -102,7 +109,7 @@ npm run prisma:deploy
 
 ## Production Notes
 - Queue workers run in the same process for Phase 1.
-- StockTwits automation is UI-dependent; selector maintenance is expected.
+- StockTwits automation is UI-dependent and still subject to platform anti-bot challenges; selector maintenance and supervised testing are expected.
 - Use real secret management and regular key rotation in production.
 - Keep conservative publish cadence and monitor account health events.
 - Protect all non-health endpoints with `x-api-key` (`ADMIN_API_KEY`).

@@ -34,6 +34,7 @@ describe('TrendsService', () => {
     };
 
     const configService = {
+      get: jest.fn().mockReturnValue('1,6,24'),
       getOrThrow: jest.fn().mockReturnValue(1),
     };
     const auditService = {
@@ -58,6 +59,6 @@ describe('TrendsService', () => {
       TrendWindow.H6,
       TrendWindow.H24,
     ]);
-    expect(prisma.sourceEvent.findMany).toHaveBeenCalledTimes(3);
+    expect(prisma.sourceEvent.findMany).toHaveBeenCalledTimes(1);
   });
 });

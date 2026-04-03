@@ -4,6 +4,10 @@ import axios, { AxiosRequestConfig } from 'axios';
 import { Prisma, SourceType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { extractSymbols } from '../common/utils/symbol.util';
+import {
+  parseTrendWindowHours,
+  toRedditTimeRange,
+} from '../common/utils/trend-window.util';
 import { AuditService } from '../audit/audit.service';
 import { TelemetryService } from '../telemetry/telemetry.service';
 import { executeWithRetry } from '../common/utils/http.util';
@@ -26,6 +30,20 @@ export type IngestionSummary = {
   news: number;
   connectors: Record<ConnectorName, ConnectorResult>;
   activeSources: ConnectorName[];
+};
+
+type RedditRapidApiConfig = {
+  key: string;
+  host: string;
+  baseUrl: string;
+  pathTemplate: string;
+  method: 'GET' | 'POST';
+  limitParam: string;
+  timeParam: string;
+  timeValue: string;
+  syncTrendWindow: boolean;
+  itemsPath: string;
+  itemDataPath: string;
 };
 
 @Injectable()
@@ -199,15 +217,26 @@ export class IngestionService {
       return true;
     }
 
-    const clientId = this.configService.get<string>('REDDIT_CLIENT_ID') || '';
-    const clientSecret =
-      this.configService.get<string>('REDDIT_CLIENT_SECRET') || '';
+    const rapidApiKey =
+      this.configService.get<string>('REDDIT_RAPIDAPI_KEY') || '';
+    const rapidApiHost =
+      this.configService.get<string>('REDDIT_RAPIDAPI_HOST') || '';
+    const rapidApiBaseUrl =
+      this.configService.get<string>('REDDIT_RAPIDAPI_BASE_URL') || '';
+    const rapidApiPathTemplate =
+      this.configService.get<string>('REDDIT_RAPIDAPI_PATH_TEMPLATE') || '';
     const subreddits = this.configService
       .getOrThrow<string>('REDDIT_SUBREDDITS')
       .split(',')
       .map((value) => value.trim())
       .filter(Boolean);
-    return Boolean(clientId && clientSecret && subreddits.length > 0);
+    return Boolean(
+      rapidApiKey &&
+        rapidApiHost &&
+        rapidApiBaseUrl &&
+        rapidApiPathTemplate &&
+        subreddits.length > 0,
+    );
   }
 
   private isRedditMockEnabled(): boolean {
@@ -243,11 +272,7 @@ export class IngestionService {
       return this.ingestMockReddit();
     }
 
-    const clientId = this.configService.get<string>('REDDIT_CLIENT_ID') || '';
-    const clientSecret =
-      this.configService.get<string>('REDDIT_CLIENT_SECRET') || '';
-    const userAgent =
-      this.configService.getOrThrow<string>('REDDIT_USER_AGENT');
+    const rapidConfig = this.getRedditRapidApiConfig();
     const subreddits = this.configService
       .getOrThrow<string>('REDDIT_SUBREDDITS')
       .split(',')
@@ -255,48 +280,30 @@ export class IngestionService {
       .filter(Boolean);
     const fetchLimit =
       this.configService.getOrThrow<number>('REDDIT_FETCH_LIMIT');
-
-    const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-    const tokenResponse = await executeWithRetry(
-      () =>
-        axios.post<{ access_token: string }>(
-          'https://www.reddit.com/api/v1/access_token',
-          'grant_type=client_credentials',
-          {
-            headers: {
-              Authorization: `Basic ${auth}`,
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'User-Agent': userAgent,
-            },
-            timeout: this.requestTimeoutMs,
-          },
-        ),
-      {
-        maxRetries: this.maxRetries,
-        baseDelayMs: 200,
-        maxDelayMs: 2000,
-      },
-    );
-
-    const token = tokenResponse.data.access_token;
+    const timeRange = this.resolveRedditTimeRange(rapidConfig);
     let ingested = 0;
 
     for (const subreddit of subreddits) {
+      const requestUrl = this.buildRapidApiUrl(
+        rapidConfig.baseUrl,
+        rapidConfig.pathTemplate,
+        subreddit,
+        rapidConfig.timeParam,
+        timeRange,
+      );
       const request: AxiosRequestConfig = {
-        method: 'GET',
-        url: `https://oauth.reddit.com/r/${subreddit}/hot`,
-        params: { limit: fetchLimit },
+        method: rapidConfig.method,
+        url: requestUrl,
+        params: { [rapidConfig.limitParam]: fetchLimit },
         headers: {
-          Authorization: `Bearer ${token}`,
-          'User-Agent': userAgent,
+          'X-RapidAPI-Key': rapidConfig.key,
+          'X-RapidAPI-Host': rapidConfig.host,
         },
       };
 
       const response = await executeWithRetry(
         () =>
-          axios.request<{
-            data: { children: Array<{ data: Record<string, unknown> }> };
-          }>({
+          axios.request<Record<string, unknown>>({
             ...request,
             timeout: this.requestTimeoutMs,
           }),
@@ -307,9 +314,16 @@ export class IngestionService {
         },
       );
 
-      const rows = response.data.data.children.map((item) =>
-        this.mapRedditEvent(item.data, false),
+      const payloadRows = this.extractRapidApiItems(
+        response.data,
+        rapidConfig.itemsPath,
+        rapidConfig.itemDataPath,
       );
+      const rows = payloadRows.map((item) => this.mapRedditEvent(item, false));
+
+      if (rows.length === 0) {
+        continue;
+      }
 
       const result = await this.prisma.sourceEvent.createMany({
         data: rows,
@@ -358,24 +372,45 @@ export class IngestionService {
     mockMode: boolean,
   ): Prisma.SourceEventCreateManyInput {
     const title = this.asString(payload.title);
-    const body = this.asString(payload.selftext);
+    const body =
+      this.asString(payload.selftext) ||
+      this.asString(payload.body) ||
+      this.asString(payload.text);
     const combined = `${title}\n${body}`.trim();
+    const permalink = this.asString(payload.permalink);
+    const directUrl = this.asString(payload.url);
+    const sourceUrl = permalink
+      ? permalink.startsWith('http')
+        ? permalink
+        : `https://reddit.com${permalink}`
+      : directUrl;
 
     return {
       source: SourceType.REDDIT,
-      externalId: this.asString(payload.id),
-      sourceUrl: `https://reddit.com${this.asString(payload.permalink)}`,
+      externalId:
+        this.asString(payload.id) ||
+        this.asString(payload.post_id) ||
+        this.asString(payload.fullname),
+      sourceUrl,
       title,
       body: combined.slice(0, 6000),
       symbols: extractSymbols(combined),
       sentimentScore: null,
-      engagementScore: this.asNumber(payload.score),
-      author: this.asString(payload.author),
+      engagementScore:
+        this.asNumber(payload.score) ||
+        this.asNumber(payload.ups) ||
+        this.asNumber(payload.upvotes),
+      author:
+        this.asString(payload.author) ||
+        this.asString(payload.username) ||
+        this.asString(payload.user),
       rawPayload: {
         ...(payload as Prisma.JsonObject),
         mockMode,
       },
-      occurredAt: this.asDate(payload.created_utc),
+      occurredAt: this.asDate(
+        payload.created_utc ?? payload.createdAt ?? payload.created,
+      ),
     };
   }
 
@@ -697,6 +732,119 @@ export class IngestionService {
     } catch {
       return [];
     }
+  }
+
+  private getRedditRapidApiConfig(): RedditRapidApiConfig {
+    const rawMethod = this.configService
+      .getOrThrow<string>('REDDIT_RAPIDAPI_METHOD')
+      .trim()
+      .toUpperCase();
+    const method: 'GET' | 'POST' = rawMethod === 'POST' ? 'POST' : 'GET';
+
+    return {
+      key: this.configService.getOrThrow<string>('REDDIT_RAPIDAPI_KEY').trim(),
+      host: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_HOST')
+        .trim(),
+      baseUrl: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_BASE_URL')
+        .trim(),
+      pathTemplate: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_PATH_TEMPLATE')
+        .trim(),
+      method,
+      limitParam: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_LIMIT_PARAM')
+        .trim(),
+      timeParam: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_TIME_PARAM')
+        .trim(),
+      timeValue: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_TIME_VALUE')
+        .trim(),
+      syncTrendWindow:
+        this.configService.get<boolean>('REDDIT_SYNC_TREND_WINDOW') !== false,
+      itemsPath: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_ITEMS_PATH')
+        .trim(),
+      itemDataPath: this.configService
+        .getOrThrow<string>('REDDIT_RAPIDAPI_ITEM_DATA_PATH')
+        .trim(),
+    };
+  }
+
+  private buildRapidApiUrl(
+    baseUrl: string,
+    pathTemplate: string,
+    subreddit: string,
+    timeParam: string,
+    timeRange: string,
+  ): string {
+    const populatedPath = pathTemplate.replaceAll(
+      '{subreddit}',
+      encodeURIComponent(subreddit),
+    );
+    const url = new URL(populatedPath, baseUrl);
+
+    if (timeParam) {
+      url.searchParams.set(timeParam, timeRange);
+    }
+
+    return url.toString();
+  }
+
+  private resolveRedditTimeRange(config: RedditRapidApiConfig): string {
+    if (!config.syncTrendWindow) {
+      return config.timeValue || 'day';
+    }
+
+    const windows = parseTrendWindowHours(
+      this.configService.get<string>('TREND_WINDOWS_HOURS'),
+    );
+    const maxWindowHours = Math.max(...windows);
+    return toRedditTimeRange(maxWindowHours);
+  }
+
+  private extractRapidApiItems(
+    payload: Record<string, unknown>,
+    itemsPath: string,
+    itemDataPath: string,
+  ): Array<Record<string, unknown>> {
+    const container = this.getByPath(payload, itemsPath);
+    if (!Array.isArray(container)) {
+      return [];
+    }
+
+    return container
+      .map((item) => {
+        if (!item || typeof item !== 'object') {
+          return null;
+        }
+        const base = item as Record<string, unknown>;
+        const nested = itemDataPath ? this.getByPath(base, itemDataPath) : base;
+        if (nested && typeof nested === 'object') {
+          return nested as Record<string, unknown>;
+        }
+        return base;
+      })
+      .filter((item): item is Record<string, unknown> => Boolean(item));
+  }
+
+  private getByPath(source: unknown, path: string): unknown {
+    if (!path) {
+      return source;
+    }
+
+    return path
+      .split('.')
+      .map((segment) => segment.trim())
+      .filter(Boolean)
+      .reduce<unknown>((current, segment) => {
+        if (!current || typeof current !== 'object') {
+          return undefined;
+        }
+        return (current as Record<string, unknown>)[segment];
+      }, source);
   }
 
   private asString(value: unknown): string {

@@ -113,6 +113,16 @@ export class OrchestrationController {
     return this.ingestionService.listConnectorStates();
   }
 
+  @Get('stocktwits/session')
+  async getStocktwitsSessionStatus(): Promise<Record<string, unknown>> {
+    return this.publishingService.getStocktwitsSessionStatus();
+  }
+
+  @Post('stocktwits/session/bootstrap')
+  async bootstrapStocktwitsSession(): Promise<Record<string, unknown>> {
+    return this.publishingService.bootstrapStocktwitsSession();
+  }
+
   @Post('publish/jobs/:id/retry')
   async retryPublishJob(
     @Param('id') publishJobId: string,

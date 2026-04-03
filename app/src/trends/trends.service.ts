@@ -1,9 +1,15 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { AssetClass, TrendTopic, TrendWindow } from '@prisma/client';
+import {
+  AssetClass,
+  SourceEvent,
+  TrendTopic,
+  TrendWindow,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { TelemetryService } from '../telemetry/telemetry.service';
+import { parseTrendWindowHours } from '../common/utils/trend-window.util';
 
 type WindowSpec = {
   type: TrendWindow;
@@ -12,12 +18,6 @@ type WindowSpec = {
 
 @Injectable()
 export class TrendsService {
-  private readonly windows: WindowSpec[] = [
-    { type: TrendWindow.H1, hours: 1 },
-    { type: TrendWindow.H6, hours: 6 },
-    { type: TrendWindow.H24, hours: 24 },
-  ];
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
@@ -27,19 +27,43 @@ export class TrendsService {
 
   async computeTrends(): Promise<TrendTopic[]> {
     const now = new Date();
+    const windows = this.resolveWindows();
     const topLimit = this.configService.getOrThrow<number>('TOP_TRENDS_LIMIT');
+    const minWeightedMentions = this.configService.getOrThrow<number>(
+      'TREND_MIN_WEIGHTED_MENTIONS',
+    );
+    const minUniqueEvents = this.configService.getOrThrow<number>(
+      'TREND_MIN_UNIQUE_EVENTS',
+    );
+    const minScore = this.configService.getOrThrow<number>('TREND_MIN_SCORE');
     const connectorStates = await this.prisma.sourceConnectorState.findMany();
     const weightBySource = new Map(
       connectorStates.map((row) => [row.source, row.weight]),
     );
+    const maxWindowHours = Math.max(...windows.map((window) => window.hours));
+    const maxWindowStart = new Date(
+      now.getTime() - maxWindowHours * 60 * 60 * 1000,
+    );
+    const recentEvents = await this.prisma.sourceEvent.findMany({
+      where: {
+        occurredAt: { gte: maxWindowStart, lte: now },
+      },
+      orderBy: {
+        occurredAt: 'desc',
+      },
+    });
 
     const created: TrendTopic[] = [];
-    for (const windowSpec of this.windows) {
+    for (const windowSpec of windows) {
       const rows = await this.computeWindowTrends(
         windowSpec,
         now,
         topLimit,
         weightBySource,
+        recentEvents,
+        minWeightedMentions,
+        minUniqueEvents,
+        minScore,
       );
       created.push(...rows);
     }
@@ -49,7 +73,7 @@ export class TrendsService {
 
     await this.auditService.record('trend.computed', 'system', 'trend_batch', {
       count: created.length,
-      windows: this.windows.map((windowSpec) => windowSpec.type),
+      windows: windows.map((windowSpec) => windowSpec.type),
       symbols: created.map((item) => item.symbol),
     });
 
@@ -68,48 +92,50 @@ export class TrendsService {
     now: Date,
     topLimit: number,
     weightBySource: Map<string, number>,
+    events: SourceEvent[],
+    minWeightedMentions: number,
+    minUniqueEvents: number,
+    minScore: number,
   ): Promise<TrendTopic[]> {
     const windowStart = new Date(
       now.getTime() - windowSpec.hours * 60 * 60 * 1000,
     );
 
-    const events = await this.prisma.sourceEvent.findMany({
-      where: {
-        occurredAt: { gte: windowStart, lte: now },
-      },
-      orderBy: {
-        occurredAt: 'desc',
-      },
-    });
-
     const grouped = new Map<
       string,
       {
-        mentions: number;
+        weightedMentions: number;
         engagementTotal: number;
         sentimentTotal: number;
         sentimentCount: number;
-        evidenceIds: string[];
+        evidenceIds: Set<string>;
+        sources: Set<string>;
       }
     >();
 
     for (const event of events) {
+      if (event.occurredAt < windowStart || event.occurredAt > now) {
+        continue;
+      }
+
       const sourceWeight = weightBySource.get(event.source) ?? 1;
       for (const symbol of event.symbols) {
         const current = grouped.get(symbol) ?? {
-          mentions: 0,
+          weightedMentions: 0,
           engagementTotal: 0,
           sentimentTotal: 0,
           sentimentCount: 0,
-          evidenceIds: [],
+          evidenceIds: new Set<string>(),
+          sources: new Set<string>(),
         };
-        current.mentions += sourceWeight;
+        current.weightedMentions += sourceWeight;
         current.engagementTotal += (event.engagementScore ?? 0) * sourceWeight;
         if (event.sentimentScore !== null) {
           current.sentimentTotal += event.sentimentScore * sourceWeight;
           current.sentimentCount += sourceWeight;
         }
-        current.evidenceIds.push(event.id);
+        current.evidenceIds.add(event.id);
+        current.sources.add(event.source);
         grouped.set(symbol, current);
       }
     }
@@ -120,18 +146,32 @@ export class TrendsService {
           value.sentimentCount > 0
             ? value.sentimentTotal / value.sentimentCount
             : null;
+        const uniqueEventCount = value.evidenceIds.size;
+        const sourceDiversity = value.sources.size;
+        const normalizedEngagement = Math.log10(1 + value.engagementTotal);
         const score =
-          value.mentions +
-          value.engagementTotal * 0.05 +
-          (averageSentiment ? averageSentiment * 2 : 0);
+          value.weightedMentions * 1.5 +
+          uniqueEventCount * 1.2 +
+          sourceDiversity * 0.8 +
+          normalizedEngagement +
+          (averageSentiment ?? 0) * 2;
 
         return {
           symbol,
-          mentions: Math.round(value.mentions),
+          mentions: Math.max(1, Math.round(value.weightedMentions)),
+          weightedMentions: value.weightedMentions,
+          uniqueEventCount,
           averageSentiment,
           score,
-          evidenceIds: value.evidenceIds.slice(0, 20),
+          evidenceIds: Array.from(value.evidenceIds).slice(0, 20),
         };
+      })
+      .filter((trend) => {
+        return (
+          trend.weightedMentions >= minWeightedMentions &&
+          trend.uniqueEventCount >= minUniqueEvents &&
+          trend.score >= minScore
+        );
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, topLimit);
@@ -165,5 +205,15 @@ export class TrendsService {
   private classifyAsset(symbol: string): AssetClass {
     const crypto = new Set(['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE']);
     return crypto.has(symbol) ? AssetClass.CRYPTO : AssetClass.EQUITY;
+  }
+
+  private resolveWindows(): WindowSpec[] {
+    const hours = parseTrendWindowHours(
+      this.configService.get<string>('TREND_WINDOWS_HOURS'),
+    );
+    return hours.map((value) => ({
+      type: value === 1 ? TrendWindow.H1 : value === 6 ? TrendWindow.H6 : TrendWindow.H24,
+      hours: value,
+    }));
   }
 }
