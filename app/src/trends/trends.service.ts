@@ -28,10 +28,19 @@ export class TrendsService {
   async computeTrends(): Promise<TrendTopic[]> {
     const now = new Date();
     const topLimit = this.configService.getOrThrow<number>('TOP_TRENDS_LIMIT');
+    const connectorStates = await this.prisma.sourceConnectorState.findMany();
+    const weightBySource = new Map(
+      connectorStates.map((row) => [row.source, row.weight]),
+    );
 
     const created: TrendTopic[] = [];
     for (const windowSpec of this.windows) {
-      const rows = await this.computeWindowTrends(windowSpec, now, topLimit);
+      const rows = await this.computeWindowTrends(
+        windowSpec,
+        now,
+        topLimit,
+        weightBySource,
+      );
       created.push(...rows);
     }
 
@@ -58,6 +67,7 @@ export class TrendsService {
     windowSpec: WindowSpec,
     now: Date,
     topLimit: number,
+    weightBySource: Map<string, number>,
   ): Promise<TrendTopic[]> {
     const windowStart = new Date(
       now.getTime() - windowSpec.hours * 60 * 60 * 1000,
@@ -84,6 +94,7 @@ export class TrendsService {
     >();
 
     for (const event of events) {
+      const sourceWeight = weightBySource.get(event.source) ?? 1;
       for (const symbol of event.symbols) {
         const current = grouped.get(symbol) ?? {
           mentions: 0,
@@ -92,11 +103,11 @@ export class TrendsService {
           sentimentCount: 0,
           evidenceIds: [],
         };
-        current.mentions += 1;
-        current.engagementTotal += event.engagementScore ?? 0;
+        current.mentions += sourceWeight;
+        current.engagementTotal += (event.engagementScore ?? 0) * sourceWeight;
         if (event.sentimentScore !== null) {
-          current.sentimentTotal += event.sentimentScore;
-          current.sentimentCount += 1;
+          current.sentimentTotal += event.sentimentScore * sourceWeight;
+          current.sentimentCount += sourceWeight;
         }
         current.evidenceIds.push(event.id);
         grouped.set(symbol, current);
@@ -116,7 +127,7 @@ export class TrendsService {
 
         return {
           symbol,
-          mentions: value.mentions,
+          mentions: Math.round(value.mentions),
           averageSentiment,
           score,
           evidenceIds: value.evidenceIds.slice(0, 20),

@@ -63,27 +63,33 @@ enum AccountStatus {
   DISABLED
 }
 
-model SourceEvent {
-  id             String     @id @default(cuid())
-  source         SourceType
-  sourceUrl      String?
-  externalId     String?
-  title          String?
-  body           String
-  symbols        String[]
-  sentimentScore Float?
-  engagementScore Float?
-  author         String?
-  rawPayload     Json
-  occurredAt     DateTime
-  ingestedAt     DateTime   @default(now())
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
 
-  @@index([source, occurredAt])
+model SourceEvent {
+  id              String     @id @default(cuid())
+  source          SourceType
+  sourceUrl       String?
+  externalId      String?
+  title           String?
+  body            String
+  symbols         String[]
+  sentimentScore  Float?
+  engagementScore Float?
+  author          String?
+  rawPayload      Json
+  occurredAt      DateTime
+  ingestedAt      DateTime   @default(now())
+
   @@unique([source, externalId])
+  @@index([source, occurredAt])
 }
 
 model TrendTopic {
-  id               String       @id @default(cuid())
+  id               String         @id @default(cuid())
   symbol           String
   assetClass       AssetClass
   windowType       TrendWindow
@@ -93,16 +99,16 @@ model TrendTopic {
   windowStart      DateTime
   windowEnd        DateTime
   evidence         Json
-  createdAt        DateTime     @default(now())
+  createdAt        DateTime       @default(now())
   drafts           ContentDraft[]
 
   @@index([symbol, windowType, windowEnd])
 }
 
 model ContentDraft {
-  id            String      @id @default(cuid())
+  id            String       @id @default(cuid())
   trendTopicId  String
-  trendTopic    TrendTopic  @relation(fields: [trendTopicId], references: [id], onDelete: Cascade)
+  trendTopic    TrendTopic   @relation(fields: [trendTopicId], references: [id], onDelete: Cascade)
   title         String?
   body          String
   disclaimer    String
@@ -111,27 +117,59 @@ model ContentDraft {
   provider      String
   model         String
   promptVersion String
-  status        DraftStatus @default(GENERATED)
-  contentHash   String      @unique
-  createdAt     DateTime    @default(now())
+  status        DraftStatus  @default(GENERATED)
+  contentHash   String       @unique
+  createdAt     DateTime     @default(now())
   approvedAt    DateTime?
   publishedAt   DateTime?
   publishJobs   PublishJob[]
 }
 
 model AccountProfile {
-  id            String              @id @default(cuid())
-  platform      AccountPlatform
-  accountHandle String
-  status        AccountStatus       @default(ACTIVE)
-  healthScore   Float               @default(1.0)
-  config        Json
-  createdAt     DateTime            @default(now())
-  updatedAt     DateTime            @updatedAt
-  publishJobs   PublishJob[]
-  healthEvents  AccountHealthEvent[]
+  id                     String                 @id @default(cuid())
+  platform               AccountPlatform
+  accountHandle          String
+  status                 AccountStatus          @default(ACTIVE)
+  healthScore            Float                  @default(1.0)
+  config                 Json
+  replacementRequestedAt DateTime?
+  replacementNotes       String?
+  lastSelectedAt         DateTime?
+  createdAt              DateTime               @default(now())
+  updatedAt              DateTime               @updatedAt
+  credentialsRef         AccountCredentialsRef?
+  healthState            AccountHealthState?
+  publishJobs            PublishJob[]
+  healthEvents           AccountHealthEvent[]
+  restrictionEvents      RestrictionEvent[]
 
   @@unique([platform, accountHandle])
+}
+
+model AccountCredentialsRef {
+  id        String         @id @default(cuid())
+  accountId String         @unique
+  account   AccountProfile @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  secretRef String
+  username  String?
+  metadata  Json?
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+}
+
+model AccountHealthState {
+  id                   String         @id @default(cuid())
+  accountId            String         @unique
+  account              AccountProfile @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  rollingSuccessRate   Float          @default(1)
+  consecutiveFailures  Int            @default(0)
+  consecutiveSuccesses Int            @default(0)
+  softFailureCount     Int            @default(0)
+  restrictionCount     Int            @default(0)
+  lastOutcome          String?
+  lastPublishedAt      DateTime?
+  lastRestrictedAt     DateTime?
+  updatedAt            DateTime       @updatedAt
 }
 
 model AccountHealthEvent {
@@ -144,46 +182,93 @@ model AccountHealthEvent {
   createdAt DateTime       @default(now())
 }
 
+model RestrictionEvent {
+  id              String         @id @default(cuid())
+  accountId       String
+  account         AccountProfile @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  restrictionType String
+  severity        String
+  message         String
+  metadata        Json?
+  detectedAt      DateTime       @default(now())
+}
+
+model RotationPolicy {
+  id                           String          @id @default(cuid())
+  platform                     AccountPlatform @unique
+  perAccountQuota              Int             @default(4)
+  globalQuota                  Int             @default(12)
+  quietHoursStart              Int?
+  quietHoursEnd                Int?
+  minDelayMinutes              Int             @default(10)
+  maxDelayMinutes              Int             @default(45)
+  adaptiveCooldownMinutes      Int             @default(30)
+  duplicateSimilarityThreshold Float           @default(0.82)
+  createdAt                    DateTime        @default(now())
+  updatedAt                    DateTime        @updatedAt
+}
+
+model SourceConnectorState {
+  id                  String     @id @default(cuid())
+  source              SourceType @unique
+  configured          Boolean    @default(false)
+  enabled             Boolean    @default(true)
+  healthy             Boolean    @default(false)
+  priority            Int        @default(100)
+  weight              Float      @default(1)
+  lastSuccessAt       DateTime?
+  lastFailureAt       DateTime?
+  lastError           String?
+  consecutiveFailures Int        @default(0)
+  metadata            Json?
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+}
+
 model TelegramGroupCandidate {
-  id            String    @id @default(cuid())
-  title         String
-  inviteLink    String?   @unique
-  chatId        String?   @unique
-  approved      Boolean   @default(false)
-  joined        Boolean   @default(false)
-  lastAttemptAt DateTime?
-  statusNote    String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id                String       @id @default(cuid())
+  title             String
+  inviteLink        String?      @unique
+  chatId            String?      @unique
+  approved          Boolean      @default(false)
+  reviewStatus      ReviewStatus @default(PENDING)
+  priorityScore     Float        @default(0)
+  joined            Boolean      @default(false)
+  lastAttemptAt     DateTime?
+  throttleUntil     DateTime?
+  statusNote        String?
+  discoveryMetadata Json?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
 }
 
 model PublishJob {
-  id             String         @id @default(cuid())
+  id             String           @id @default(cuid())
   draftId        String
-  draft          ContentDraft   @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  draft          ContentDraft     @relation(fields: [draftId], references: [id], onDelete: Cascade)
   platform       PublishPlatform
   accountId      String?
-  account        AccountProfile? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  account        AccountProfile?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
   targetRef      String
   scheduledAt    DateTime
-  status         PublishStatus  @default(PENDING)
-  idempotencyKey String         @unique
-  attempts       Int            @default(0)
+  status         PublishStatus    @default(PENDING)
+  idempotencyKey String           @unique
+  attempts       Int              @default(0)
   lastError      String?
   evidenceUri    String?
   externalPostId String?
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
   attemptsLog    PublishAttempt[]
 
   @@index([platform, status, scheduledAt])
 }
 
 model PublishAttempt {
-  id              String    @id @default(cuid())
+  id              String     @id @default(cuid())
   publishJobId    String
   publishJob      PublishJob @relation(fields: [publishJobId], references: [id], onDelete: Cascade)
-  attemptedAt     DateTime  @default(now())
+  attemptedAt     DateTime   @default(now())
   success         Boolean
   errorClass      String?
   errorMessage    String?
@@ -192,14 +277,14 @@ model PublishAttempt {
 }
 
 model AuditEvent {
-  id        String   @id @default(cuid())
-  eventType String
-  actorType String
-  actorId   String?
+  id         String   @id @default(cuid())
+  eventType  String
+  actorType  String
+  actorId    String?
   entityType String
-  entityId  String
-  metadata  Json
-  createdAt DateTime @default(now())
+  entityId   String
+  metadata   Json
+  createdAt  DateTime @default(now())
 
   @@index([eventType, createdAt])
 }

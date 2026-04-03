@@ -6,6 +6,12 @@
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
+    "postinstall": "npm run prisma:generate",
+    "prestart": "npm run prisma:generate",
+    "prestart:dev": "npm run prisma:generate",
+    "prestart:prod": "npm run prisma:generate",
+    "prebuild": "npm run prisma:generate",
+    "pretest": "npm run prisma:generate",
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
@@ -82,6 +88,9 @@
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
+    },
+    "moduleNameMapper": {
+      "^@prisma/client$": "<rootDir>/../node_modules/@prisma/client/default.js"
     },
     "collectCoverageFrom": [
       "**/*.(t|j)s"

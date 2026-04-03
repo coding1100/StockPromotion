@@ -12,8 +12,14 @@ describe('IngestionService', () => {
       NEWS_SENTIMENT_API_URL: '',
     };
 
+    const prisma = {
+      sourceConnectorState: {
+        upsert: jest.fn().mockResolvedValue(undefined),
+      },
+    };
+
     const service = new IngestionService(
-      {} as never,
+      prisma as never,
       {
         get: (key: string) => configValues[key],
         getOrThrow: (key: string) => {
@@ -39,5 +45,6 @@ describe('IngestionService', () => {
       'connector_not_configured',
     );
     expect(summary.connectors.news.error).toBe('connector_not_configured');
+    expect(prisma.sourceConnectorState.upsert).toHaveBeenCalledTimes(3);
   });
 });

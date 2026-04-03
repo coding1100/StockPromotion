@@ -11,6 +11,7 @@ import { ApiTags } from '@nestjs/swagger';
 import { DraftStatus, PublishStatus } from '@prisma/client';
 import { OrchestrationService } from './orchestration.service';
 import { PublishingService } from '../publishing/publishing.service';
+import { IngestionService } from '../ingestion/ingestion.service';
 
 @Controller('orchestration')
 @ApiTags('orchestration')
@@ -18,6 +19,7 @@ export class OrchestrationController {
   constructor(
     private readonly orchestrationService: OrchestrationService,
     private readonly publishingService: PublishingService,
+    private readonly ingestionService: IngestionService,
   ) {}
 
   @Post('run')
@@ -101,11 +103,37 @@ export class OrchestrationController {
     return this.publishingService.getPublishJob(publishJobId);
   }
 
+  @Get('dashboard/operations')
+  async getOperationsDashboard(): Promise<Record<string, unknown>> {
+    return this.publishingService.getOperationsDashboard();
+  }
+
+  @Get('connectors')
+  async listConnectors(): Promise<Record<string, unknown>[]> {
+    return this.ingestionService.listConnectorStates();
+  }
+
   @Post('publish/jobs/:id/retry')
   async retryPublishJob(
     @Param('id') publishJobId: string,
   ): Promise<{ queued: boolean }> {
     await this.publishingService.retryPublishJob(publishJobId);
+    return { queued: true };
+  }
+
+  @Post('publish/jobs/:id/dispatch-now')
+  async dispatchPublishJobNow(
+    @Param('id') publishJobId: string,
+  ): Promise<{ queued: boolean }> {
+    await this.publishingService.dispatchPublishJobNow(publishJobId);
+    return { queued: true };
+  }
+
+  @Post('publish/jobs/:id/rerun-now')
+  async rerunFailedPublishJobNow(
+    @Param('id') publishJobId: string,
+  ): Promise<{ queued: boolean }> {
+    await this.publishingService.rerunFailedPublishJobNow(publishJobId);
     return { queued: true };
   }
 

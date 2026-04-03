@@ -1,8 +1,12 @@
 FROM node:22-bookworm-slim AS builder
 WORKDIR /usr/src/app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 COPY prisma ./prisma
 RUN npx prisma generate
@@ -18,7 +22,7 @@ WORKDIR /usr/src/app
 ENV NODE_ENV=production
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --ignore-scripts
 
 COPY --from=builder /usr/src/app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /usr/src/app/node_modules/@prisma ./node_modules/@prisma

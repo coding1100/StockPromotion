@@ -6,6 +6,9 @@ describe('TrendsService', () => {
     const createdRows: Array<{ windowType: TrendWindow }> = [];
 
     const prisma = {
+      sourceConnectorState: {
+        findMany: jest.fn().mockResolvedValue([]),
+      },
       sourceEvent: {
         findMany: jest.fn().mockResolvedValue([
           {

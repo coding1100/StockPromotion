@@ -18,8 +18,10 @@ export class TelegramPublisher {
   async sendMessage(
     chatId: string,
     text: string,
+    botToken?: string,
   ): Promise<{ externalPostId: string; responsePayload: unknown }> {
-    const token = this.configService.get<string>('TELEGRAM_BOT_TOKEN') || '';
+    const token =
+      botToken || this.configService.get<string>('TELEGRAM_BOT_TOKEN') || '';
     if (!token) {
       throw new Error('TELEGRAM_BOT_TOKEN is not configured');
     }
@@ -56,8 +58,9 @@ export class TelegramPublisher {
     };
   }
 
-  async canAccessChat(chatId: string): Promise<boolean> {
-    const token = this.configService.get<string>('TELEGRAM_BOT_TOKEN') || '';
+  async canAccessChat(chatId: string, botToken?: string): Promise<boolean> {
+    const token =
+      botToken || this.configService.get<string>('TELEGRAM_BOT_TOKEN') || '';
     if (!token) {
       return false;
     }

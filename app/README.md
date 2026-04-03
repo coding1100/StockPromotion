@@ -1,11 +1,15 @@
-# Stock Promotion Automation - Phase 1 Backend
+# Stock Promotion Automation - Phase 1 + Phase 2 Backend
 
-Production-oriented NestJS backend implementing Phase 1 pipeline:
+Production-oriented NestJS backend implementing the client-directed Phase 1 pipeline plus Phase 2 scale automation:
 - multi-source ingestion (Reddit + additional connectors),
+- mockable Reddit ingestion for demo/staging when live Reddit API access is unavailable,
 - trend detection for equities and crypto,
 - LLM draft generation with strict structured outputs (OpenAI + Anthropic),
 - StockTwits browser automation publishing,
 - Telegram publishing with discovery candidate approval flow,
+- multi-account routing, health scoring, quarantine, and replacement workflow,
+- connector health, weighting, and fallback-aware trend inputs,
+- duplicate and near-duplicate suppression before publish,
 - queue-based orchestration and auditability.
 
 ## Stack
@@ -46,12 +50,46 @@ Metrics: `GET /api/health/metrics`
 - `GET /api/orchestration/trends`
 - `GET /api/orchestration/drafts`
 - `POST /api/orchestration/drafts/:id/approve`
+- `GET /api/orchestration/connectors`
+- `GET /api/orchestration/dashboard/operations`
 - `GET /api/orchestration/telegram/candidates`
 - `POST /api/orchestration/telegram/candidates/:id/approve`
 - `POST /api/orchestration/telegram/candidates/sync-join`
 - `GET /api/orchestration/publish/jobs`
 - `GET /api/orchestration/publish/jobs/:id`
 - `POST /api/orchestration/publish/jobs/:id/retry`
+- `GET /api/accounts`
+- `PATCH /api/accounts/:id/quarantine`
+- `POST /api/accounts/:id/replacement-request`
+- `POST /api/accounts/replacement`
+
+## Demo Mode Without Reddit API
+- Set `REDDIT_MOCK_ENABLED=true`.
+- Provide `REDDIT_MOCK_DATA_JSON` with an array of mock Reddit-like rows.
+- Keep at least one secondary connector configured (`STOCKTWITS_SIGNAL_API_URL` or `NEWS_SENTIMENT_API_URL`) to satisfy the Phase 1 multi-source requirement.
+
+Example:
+```json
+[
+  {
+    "id": "mock-1",
+    "title": "AAPL discussion volume is climbing",
+    "body": "Retail traders are mentioning AAPL and NVDA more often today.",
+    "author": "demo-user",
+    "score": 42,
+    "createdAt": "2026-03-31T09:30:00.000Z"
+  }
+]
+```
+
+## Phase 2 Configuration
+- `TELEGRAM_BOT_ACCOUNTS_JSON` supports multiple Telegram bot identities.
+- `PHASE2_PER_ACCOUNT_QUOTA` and `PHASE2_GLOBAL_QUOTA` enforce conservative dispatch limits.
+- `PHASE2_QUIET_HOURS_START` and `PHASE2_QUIET_HOURS_END` pause scheduling during configured hours.
+- `PHASE2_MIN_DELAY_MINUTES` and `PHASE2_MAX_DELAY_MINUTES` control randomized dispatch windows.
+- `PHASE2_ADAPTIVE_COOLDOWN_MINUTES` delays reroutes after soft failures or restrictions.
+- `PHASE2_DUPLICATE_SIMILARITY_THRESHOLD` blocks near-duplicate posts before publish.
+- `SOURCE_CONNECTOR_WEIGHTS_JSON` and `SOURCE_CONNECTOR_PRIORITIES_JSON` control source weighting and failover ordering.
 
 ## Commands
 ```bash

@@ -13,6 +13,7 @@ import {
   Prisma,
   PublishPlatform,
   PublishStatus,
+  ReviewStatus,
 } from '@prisma/client';
 import { createHash, randomInt } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -25,6 +26,7 @@ import {
 import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
 import { TelemetryService } from '../telemetry/telemetry.service';
+import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
 
 @Injectable()
 export class PublishingService {
@@ -53,19 +55,28 @@ export class PublishingService {
         title: seed,
         chatId: looksLikeChatId ? seed : null,
         inviteLink: looksLikeChatId ? null : seed,
+        reviewStatus: ReviewStatus.PENDING,
+        priorityScore: this.scoreTelegramCandidate(seed),
+        discoveryMetadata: {
+          source: 'seed',
+        },
       };
 
       if (looksLikeChatId) {
         await this.prisma.telegramGroupCandidate.upsert({
           where: { chatId: seed },
           create: data,
-          update: {},
+          update: {
+            priorityScore: this.scoreTelegramCandidate(seed),
+          },
         });
       } else {
         await this.prisma.telegramGroupCandidate.upsert({
           where: { inviteLink: seed },
           create: data,
-          update: {},
+          update: {
+            priorityScore: this.scoreTelegramCandidate(seed),
+          },
         });
       }
     }
@@ -73,8 +84,13 @@ export class PublishingService {
 
   async attemptApprovedTelegramJoins(): Promise<void> {
     const candidates = await this.prisma.telegramGroupCandidate.findMany({
-      where: { approved: true },
-      orderBy: { updatedAt: 'asc' },
+      where: {
+        approved: true,
+        reviewStatus: ReviewStatus.APPROVED,
+        OR: [{ throttleUntil: null }, { throttleUntil: { lte: new Date() } }],
+      },
+      orderBy: [{ priorityScore: 'desc' }, { updatedAt: 'asc' }],
+      take: 100,
     });
 
     for (const candidate of candidates) {
@@ -89,18 +105,31 @@ export class PublishingService {
             lastAttemptAt: now,
             statusNote:
               'No chat identifier resolved. Manual admin add may be required.',
+            throttleUntil: new Date(now.getTime() + 30 * 60_000),
           },
         });
         continue;
       }
 
-      const accessible = await this.telegramPublisher.canAccessChat(chatRef);
+      const account = await this.accountsService.getEligibleAccount(
+        AccountPlatform.TELEGRAM,
+      );
+      const credentials = account
+        ? this.accountsService.getTelegramCredentials(account.accountHandle)
+        : null;
+
+      const accessible = credentials
+        ? await this.telegramPublisher.canAccessChat(chatRef, credentials.botToken)
+        : false;
       await this.prisma.telegramGroupCandidate.update({
         where: { id: candidate.id },
         data: {
           chatId: candidate.chatId ?? chatRef,
           joined: accessible,
           lastAttemptAt: now,
+          throttleUntil: accessible
+            ? null
+            : new Date(now.getTime() + 60 * 60_000),
           statusNote: accessible
             ? 'Bot access verified for this chat.'
             : 'Bot cannot access chat yet. Add bot as admin/member and retry.',
@@ -114,6 +143,7 @@ export class PublishingService {
         {
           chatRef,
           success: accessible,
+          accountHandle: account?.accountHandle ?? null,
         },
       );
     }
@@ -124,33 +154,39 @@ export class PublishingService {
       id: string;
       title: string;
       approved: boolean;
+      reviewStatus: ReviewStatus;
+      priorityScore: number;
       joined: boolean;
       chatId: string | null;
       inviteLink: string | null;
       statusNote: string | null;
       lastAttemptAt: Date | null;
+      throttleUntil: Date | null;
     }>
   > {
     const rows = await this.prisma.telegramGroupCandidate.findMany({
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ priorityScore: 'desc' }, { createdAt: 'desc' }],
       take: 200,
     });
     return rows.map((row) => ({
       id: row.id,
       title: row.title,
       approved: row.approved,
+      reviewStatus: row.reviewStatus,
+      priorityScore: row.priorityScore,
       joined: row.joined,
       chatId: row.chatId,
       inviteLink: row.inviteLink,
       statusNote: row.statusNote,
       lastAttemptAt: row.lastAttemptAt,
+      throttleUntil: row.throttleUntil,
     }));
   }
 
   async approveTelegramCandidate(candidateId: string): Promise<void> {
     await this.prisma.telegramGroupCandidate.update({
       where: { id: candidateId },
-      data: { approved: true },
+      data: { approved: true, reviewStatus: ReviewStatus.APPROVED },
     });
     await this.auditService.record(
       'telegram.candidate.approved',
@@ -173,9 +209,15 @@ export class PublishingService {
     const publishCooldown = this.configService.getOrThrow<number>(
       'PUBLISH_COOLDOWN_MINUTES',
     );
-    let scheduledCount = 0;
+    const stocktwitsPolicy = await this.accountsService.getRotationPolicy(
+      AccountPlatform.STOCKTWITS,
+    );
+    const telegramPolicy = await this.accountsService.getRotationPolicy(
+      AccountPlatform.TELEGRAM,
+    );
 
-    for (const draftId of draftIds) {
+    let scheduledCount = 0;
+    for (const [draftIndex, draftId] of draftIds.entries()) {
       const draft = await this.prisma.contentDraft.findUnique({
         where: { id: draftId },
       });
@@ -183,32 +225,48 @@ export class PublishingService {
         continue;
       }
 
-      const stocktwitsAccount = await this.accountsService.getActiveAccount(
+      const stocktwitsAccount = await this.accountsService.getEligibleAccount(
         AccountPlatform.STOCKTWITS,
+        {
+          scheduledAt: this.resolveScheduledTime(stocktwitsPolicy, draftIndex),
+        },
       );
-
       if (stocktwitsAccount) {
-        const jitterMinutes = randomInt(5, Math.max(6, publishCooldown));
         scheduledCount += await this.createAndQueuePublishJob({
           draftId,
           platform: PublishPlatform.STOCKTWITS,
           accountId: stocktwitsAccount.id,
           targetRef: stocktwitsAccount.accountHandle,
-          scheduleAt: new Date(Date.now() + jitterMinutes * 60_000),
+          scheduleAt: this.resolveScheduledTime(stocktwitsPolicy, draftIndex),
           cooldownMinutes: publishCooldown,
+          similarityThreshold: stocktwitsPolicy.duplicateSimilarityThreshold,
         });
       }
 
       const telegramTargets = await this.resolveTelegramTargets();
-      for (const target of telegramTargets) {
-        const jitterMinutes = randomInt(2, Math.max(3, publishCooldown));
+      for (const [targetIndex, target] of telegramTargets.entries()) {
+        const scheduleAt = this.resolveScheduledTime(
+          telegramPolicy,
+          draftIndex + targetIndex,
+        );
+        const telegramAccount = await this.accountsService.getEligibleAccount(
+          AccountPlatform.TELEGRAM,
+          {
+            scheduledAt: scheduleAt,
+          },
+        );
+        if (!telegramAccount) {
+          continue;
+        }
+
         scheduledCount += await this.createAndQueuePublishJob({
           draftId,
           platform: PublishPlatform.TELEGRAM,
-          accountId: null,
+          accountId: telegramAccount.id,
           targetRef: target,
-          scheduleAt: new Date(Date.now() + jitterMinutes * 60_000),
+          scheduleAt,
           cooldownMinutes: publishCooldown,
+          similarityThreshold: telegramPolicy.duplicateSimilarityThreshold,
         });
       }
     }
@@ -233,21 +291,58 @@ export class PublishingService {
     }
 
     try {
+      let activeAccount = job.account;
+      if (job.platform === PublishPlatform.TELEGRAM) {
+        activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
+          AccountPlatform.TELEGRAM,
+          job.accountId,
+        );
+      }
+      if (job.platform === PublishPlatform.STOCKTWITS) {
+        activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
+          AccountPlatform.STOCKTWITS,
+          job.accountId,
+        );
+      }
+
+      if (activeAccount && activeAccount.id !== job.accountId) {
+        await this.prisma.publishJob.update({
+          where: { id: job.id },
+          data: {
+            accountId: activeAccount.id,
+          },
+        });
+      }
+
       let externalPostId = '';
       let evidenceUri = '';
       let responsePayload: unknown = {};
 
       if (job.platform === PublishPlatform.TELEGRAM) {
+        if (!activeAccount) {
+          throw new Error('Telegram account is not available');
+        }
+        const credentials = this.accountsService.getTelegramCredentials(
+          activeAccount.accountHandle,
+        );
+        if (!credentials) {
+          throw new Error('Telegram bot credentials missing');
+        }
+
         const result = await this.telegramPublisher.sendMessage(
           job.targetRef,
           job.draft.body,
+          credentials.botToken,
         );
         externalPostId = result.externalPostId;
         responsePayload = result.responsePayload;
       } else {
-        const accountHandle = job.account?.accountHandle || '';
-        const credentials =
-          this.accountsService.getStocktwitsCredentials(accountHandle);
+        if (!activeAccount) {
+          throw new Error('StockTwits account is not available');
+        }
+        const credentials = this.accountsService.getStocktwitsCredentials(
+          activeAccount.accountHandle,
+        );
         if (!credentials) {
           throw new Error('StockTwits account credentials missing');
         }
@@ -284,15 +379,44 @@ export class PublishingService {
       });
       await this.reconcileDraftPublishState(job.draftId);
 
+      if (activeAccount?.id) {
+        await this.accountsService.recordPublishOutcome(activeAccount.id, {
+          success: true,
+          metadata: {
+            platform: job.platform,
+            targetRef: job.targetRef,
+          },
+        });
+      }
+
       this.telemetryService.increment('pipeline.publish.success');
       await this.auditService.record('publish.success', 'publish_job', job.id, {
         platform: job.platform,
         targetRef: job.targetRef,
+        accountHandle: activeAccount?.accountHandle ?? null,
       });
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Unexpected publish error';
       const evidenceUri = this.extractEvidenceUriFromError(message);
+      const restricted = isRestrictionError(message);
+
+      if (job.accountId) {
+        await this.accountsService.recordPublishOutcome(job.accountId, {
+          success: false,
+          reason: message,
+          restricted,
+          metadata: {
+            platform: job.platform,
+            targetRef: job.targetRef,
+          },
+        });
+      }
+
+      const rerouted = await this.tryRerouteFailedJob(job.id, message);
+      if (rerouted) {
+        return;
+      }
 
       await this.prisma.publishJob.update({
         where: { id: job.id },
@@ -310,16 +434,12 @@ export class PublishingService {
         data: {
           publishJobId: job.id,
           success: false,
-          errorClass: 'publish_error',
+          errorClass: restricted ? 'restriction' : 'publish_error',
           errorMessage: message,
           evidenceUri: evidenceUri || null,
         },
       });
       await this.reconcileDraftPublishState(job.draftId);
-
-      if (job.accountId) {
-        await this.accountsService.penalizeAccount(job.accountId, message);
-      }
 
       this.telemetryService.increment('pipeline.publish.failed');
       await this.auditService.record('publish.failed', 'publish_job', job.id, {
@@ -345,6 +465,7 @@ export class PublishingService {
       externalPostId: string | null;
       evidenceUri: string | null;
       lastError: string | null;
+      accountId: string | null;
     }>
   > {
     const rows = await this.prisma.publishJob.findMany({
@@ -364,6 +485,7 @@ export class PublishingService {
       externalPostId: row.externalPostId,
       evidenceUri: row.evidenceUri,
       lastError: row.lastError,
+      accountId: row.accountId,
     }));
   }
 
@@ -374,6 +496,14 @@ export class PublishingService {
         attemptsLog: {
           orderBy: { attemptedAt: 'desc' },
           take: 20,
+        },
+        account: {
+          select: {
+            accountHandle: true,
+            platform: true,
+            status: true,
+            healthScore: true,
+          },
         },
       },
     });
@@ -438,6 +568,132 @@ export class PublishingService {
     );
   }
 
+  async dispatchPublishJobNow(publishJobId: string): Promise<void> {
+    const existing = await this.prisma.publishJob.findUnique({
+      where: { id: publishJobId },
+      select: {
+        id: true,
+        status: true,
+        scheduledAt: true,
+      },
+    });
+    if (!existing) {
+      throw new NotFoundException('Publish job not found');
+    }
+    if (existing.status !== PublishStatus.PENDING) {
+      throw new BadRequestException('Only PENDING publish jobs can be dispatched immediately');
+    }
+
+    const now = new Date();
+    const job = await this.prisma.publishJob.update({
+      where: { id: publishJobId },
+      data: {
+        scheduledAt: now,
+      },
+    });
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId },
+      {
+        jobId: `${job.id}:dispatch-now:${Date.now()}`,
+        delay: 0,
+      },
+    );
+
+    await this.auditService.record(
+      'publish.dispatch_now.queued',
+      'publish_job',
+      job.id,
+      {
+        previousScheduledAt: existing.scheduledAt.toISOString(),
+        dispatchedAt: now.toISOString(),
+      },
+    );
+  }
+
+  async rerunFailedPublishJobNow(publishJobId: string): Promise<void> {
+    const existing = await this.prisma.publishJob.findUnique({
+      where: { id: publishJobId },
+      select: {
+        id: true,
+        status: true,
+        scheduledAt: true,
+        draftId: true,
+        attempts: true,
+      },
+    });
+    if (!existing) {
+      throw new NotFoundException('Publish job not found');
+    }
+    if (existing.status !== PublishStatus.FAILED) {
+      throw new BadRequestException('Only FAILED publish jobs can be rerun immediately');
+    }
+
+    const now = new Date();
+    const job = await this.prisma.publishJob.update({
+      where: { id: publishJobId },
+      data: {
+        status: PublishStatus.PENDING,
+        scheduledAt: now,
+        lastError: null,
+        evidenceUri: null,
+        externalPostId: null,
+      },
+    });
+    await this.reconcileDraftPublishState(existing.draftId);
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId },
+      {
+        jobId: `${job.id}:rerun-now:${Date.now()}`,
+        delay: 0,
+      },
+    );
+
+    await this.auditService.record(
+      'publish.rerun_now.queued',
+      'publish_job',
+      job.id,
+      {
+        previousScheduledAt: existing.scheduledAt.toISOString(),
+        previousAttempts: existing.attempts,
+        rerunAt: now.toISOString(),
+      },
+    );
+  }
+
+  async getOperationsDashboard(): Promise<Record<string, unknown>> {
+    const [accountSummary, pendingCandidates, jobSummary, connectorSummary] =
+      await Promise.all([
+        this.accountsService.listAccountsDashboard(),
+        this.prisma.telegramGroupCandidate.findMany({
+          where: {
+            reviewStatus: ReviewStatus.PENDING,
+          },
+          orderBy: [{ priorityScore: 'desc' }, { createdAt: 'asc' }],
+          take: 25,
+        }),
+        this.prisma.publishJob.groupBy({
+          by: ['status', 'platform'],
+          _count: {
+            _all: true,
+          },
+        }),
+        this.prisma.sourceConnectorState.findMany({
+          orderBy: [{ priority: 'desc' }],
+        }),
+      ]);
+
+    return {
+      accounts: accountSummary,
+      telegramReviewQueue: pendingCandidates,
+      publishJobs: jobSummary,
+      connectors: connectorSummary,
+    };
+  }
+
   private async resolveTelegramTargets(): Promise<string[]> {
     const defaults = (
       this.configService.get<string>('TELEGRAM_DEFAULT_CHAT_IDS') || ''
@@ -449,6 +705,7 @@ export class PublishingService {
     const approvedJoined = await this.prisma.telegramGroupCandidate.findMany({
       where: {
         approved: true,
+        reviewStatus: ReviewStatus.APPROVED,
         joined: true,
         chatId: {
           not: null,
@@ -457,6 +714,8 @@ export class PublishingService {
       select: {
         chatId: true,
       },
+      orderBy: [{ priorityScore: 'desc' }],
+      take: 50,
     });
 
     const merged = new Set<string>(defaults);
@@ -505,6 +764,20 @@ export class PublishingService {
     return match[1].trim();
   }
 
+  private resolveScheduledTime(
+    policy: {
+      minDelayMinutes: number;
+      maxDelayMinutes: number;
+    },
+    offsetSeed = 0,
+  ): Date {
+    const jitterMinutes = randomInt(
+      policy.minDelayMinutes,
+      Math.max(policy.minDelayMinutes + 1, policy.maxDelayMinutes + 1),
+    );
+    return new Date(Date.now() + (jitterMinutes + offsetSeed * 2) * 60_000);
+  }
+
   private async createAndQueuePublishJob(input: {
     draftId: string;
     platform: PublishPlatform;
@@ -512,6 +785,7 @@ export class PublishingService {
     targetRef: string;
     scheduleAt: Date;
     cooldownMinutes: number;
+    similarityThreshold: number;
   }): Promise<number> {
     const duplicateExists = await this.hasRecentDuplicateWithinCooldown(
       input.draftId,
@@ -519,6 +793,7 @@ export class PublishingService {
       input.targetRef,
       input.scheduleAt,
       input.cooldownMinutes,
+      input.similarityThreshold,
     );
     if (duplicateExists) {
       await this.auditService.record(
@@ -539,7 +814,7 @@ export class PublishingService {
     );
     const idempotencyKey = createHash('sha256')
       .update(
-        `${input.draftId}:${input.platform}:${input.targetRef}:${cooldownBucket}`,
+        `${input.draftId}:${input.platform}:${input.targetRef}:${input.accountId ?? 'unassigned'}:${cooldownBucket}`,
       )
       .digest('hex');
 
@@ -647,10 +922,11 @@ export class PublishingService {
     targetRef: string,
     scheduleAt: Date,
     cooldownMinutes: number,
+    similarityThreshold: number,
   ): Promise<boolean> {
     const draft = await this.prisma.contentDraft.findUnique({
       where: { id: draftId },
-      select: { contentHash: true },
+      select: { contentHash: true, body: true },
     });
     if (!draft) {
       return false;
@@ -674,6 +950,139 @@ export class PublishingService {
       },
       select: { id: true },
     });
-    return Boolean(existing);
+    if (existing) {
+      return true;
+    }
+
+    const recentBodies = await this.prisma.publishJob.findMany({
+      where: {
+        platform,
+        targetRef,
+        status: {
+          in: [PublishStatus.PENDING, PublishStatus.SUCCESS],
+        },
+        scheduledAt: {
+          gte: cutoff,
+          lte: scheduleAt,
+        },
+      },
+      include: {
+        draft: {
+          select: {
+            body: true,
+          },
+        },
+      },
+      take: 20,
+      orderBy: {
+        scheduledAt: 'desc',
+      },
+    });
+
+    return recentBodies.some(
+      (row) =>
+        calculateContentSimilarity(row.draft.body, draft.body) >=
+        similarityThreshold,
+    );
   }
+
+  private async tryRerouteFailedJob(
+    publishJobId: string,
+    errorMessage: string,
+  ): Promise<boolean> {
+    const job = await this.prisma.publishJob.findUnique({
+      where: { id: publishJobId },
+      include: {
+        account: true,
+      },
+    });
+    if (!job || !job.accountId || !isReroutableFailure(errorMessage)) {
+      return false;
+    }
+
+    const platform =
+      job.platform === PublishPlatform.TELEGRAM
+        ? AccountPlatform.TELEGRAM
+        : AccountPlatform.STOCKTWITS;
+    const fallback = await this.accountsService.getEligibleAccount(platform, {
+      excludeAccountId: job.accountId,
+      scheduledAt: new Date(
+        Date.now() +
+          this.configService.getOrThrow<number>('PHASE2_ADAPTIVE_COOLDOWN_MINUTES') *
+            60_000,
+      ),
+    });
+    if (!fallback) {
+      return false;
+    }
+
+    const rescheduleAt = new Date(
+      Date.now() +
+        this.configService.getOrThrow<number>('PHASE2_ADAPTIVE_COOLDOWN_MINUTES') *
+          60_000,
+    );
+    await this.prisma.publishJob.update({
+      where: { id: publishJobId },
+      data: {
+        accountId: fallback.id,
+        status: PublishStatus.PENDING,
+        scheduledAt: rescheduleAt,
+        lastError: `Rerouted after failure: ${errorMessage}`,
+        attempts: {
+          increment: 1,
+        },
+      },
+    });
+    await this.prisma.publishAttempt.create({
+      data: {
+        publishJobId,
+        success: false,
+        errorClass: 'rerouted',
+        errorMessage,
+      },
+    });
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId },
+      {
+        jobId: `${publishJobId}:reroute:${Date.now()}`,
+        delay: Math.max(0, rescheduleAt.getTime() - Date.now()),
+      },
+    );
+
+    await this.auditService.record('publish.rerouted', 'publish_job', publishJobId, {
+      fromAccountId: job.accountId,
+      toAccountId: fallback.id,
+      reason: errorMessage,
+      retryAt: rescheduleAt.toISOString(),
+    });
+    return true;
+  }
+
+  private scoreTelegramCandidate(seed: string): number {
+    let score = 0.4;
+    if (/stocks?|crypto|invest|trade|alpha/i.test(seed)) {
+      score += 0.35;
+    }
+    if (/t\.me\/|^@/.test(seed)) {
+      score += 0.15;
+    }
+    if (/vip|signals?|pump/i.test(seed)) {
+      score -= 0.2;
+    }
+    return Math.max(0, Math.min(1, score));
+  }
+}
+
+function isRestrictionError(message: string): boolean {
+  return /(ban|blocked|restricted|suspended|captcha|locked|challenge)/i.test(
+    message,
+  );
+}
+
+function isReroutableFailure(message: string): boolean {
+  return /(timeout|429|5\d\d|captcha|challenge|blocked|restricted|network)/i.test(
+    message,
+  );
 }
