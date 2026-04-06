@@ -152,7 +152,7 @@ export class IngestionService {
     fn: () => Promise<number>,
   ): Promise<ConnectorResult> {
     const { weight, priority } = this.getConnectorPolicy(source);
-    const mockMode = source === SourceType.REDDIT && this.isRedditMockEnabled();
+    const mockMode = this.shouldUseMockData();
 
     if (!configured) {
       await this.persistConnectorState(source, {
@@ -179,7 +179,10 @@ export class IngestionService {
 
     try {
       const ingested = await fn();
-      const fresh = ingested > 0;
+      // A healthy connector can legitimately ingest 0 new rows when upstream
+      // data is unchanged and createMany(skipDuplicates) filters everything.
+      // Treat healthy executions as fresh to avoid false source degradation.
+      const fresh = true;
       this.telemetryService.increment(`connector.${name}.success`);
       await this.persistConnectorState(source, {
         configured: true,
@@ -237,7 +240,7 @@ export class IngestionService {
   }
 
   private isRedditConfigured(): boolean {
-    if (this.isRedditMockEnabled()) {
+    if (this.shouldUseMockData()) {
       return true;
     }
 
@@ -263,36 +266,22 @@ export class IngestionService {
     );
   }
 
-  private isRedditMockEnabled(): boolean {
-    return this.configService.get<boolean>('REDDIT_MOCK_ENABLED') === true;
-  }
-
   private isStocktwitsSignalConfigured(): boolean {
-    if (this.isStocktwitsSignalMockEnabled()) {
+    if (this.shouldUseMockData()) {
       return true;
     }
     return Boolean(this.configService.get<string>('STOCKTWITS_SIGNAL_API_URL'));
   }
 
-  private isStocktwitsSignalMockEnabled(): boolean {
-    return (
-      this.configService.get<boolean>('STOCKTWITS_SIGNAL_MOCK_ENABLED') === true
-    );
-  }
-
   private isNewsConfigured(): boolean {
-    if (this.isNewsMockEnabled()) {
+    if (this.shouldUseMockData()) {
       return true;
     }
     return Boolean(this.configService.get<string>('NEWS_SENTIMENT_API_URL'));
   }
 
-  private isNewsMockEnabled(): boolean {
-    return this.configService.get<boolean>('NEWS_MOCK_ENABLED') === true;
-  }
-
   private async ingestReddit(): Promise<number> {
-    if (this.isRedditMockEnabled()) {
+    if (this.shouldUseMockData()) {
       return this.ingestMockReddit();
     }
 
@@ -450,7 +439,7 @@ export class IngestionService {
   }
 
   private async ingestStocktwitsSignals(): Promise<number> {
-    if (this.isStocktwitsSignalMockEnabled()) {
+    if (this.shouldUseMockData()) {
       return this.ingestMockStocktwitsSignals();
     }
 
@@ -603,7 +592,7 @@ export class IngestionService {
   }
 
   private async ingestNewsSentiment(): Promise<number> {
-    if (this.isNewsMockEnabled()) {
+    if (this.shouldUseMockData()) {
       return this.ingestMockNewsSentiment();
     }
 
@@ -976,6 +965,10 @@ export class IngestionService {
         .map((value) => value.trim().toUpperCase())
         .filter(Boolean),
     );
+  }
+
+  private shouldUseMockData(): boolean {
+    return this.configService.get<string>('NODE_ENV') === 'development';
   }
 
   private asString(value: unknown): string {

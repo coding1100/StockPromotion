@@ -71,10 +71,13 @@ Metrics: `GET /api/health/metrics`
 - `POST /api/accounts/:id/replacement-request`
 - `POST /api/accounts/replacement`
 
-## Demo Mode Without Reddit API
-- Set `REDDIT_MOCK_ENABLED=true`.
-- Provide `REDDIT_MOCK_DATA_JSON` with an array of mock Reddit-like rows.
-- Keep at least one secondary connector configured (`STOCKTWITS_SIGNAL_API_URL` or `NEWS_SENTIMENT_API_URL`) to satisfy the Phase 1 multi-source requirement.
+## Development Mock Data Mode
+- When `NODE_ENV=development`, ingestion uses mock payload envs automatically:
+  - `REDDIT_MOCK_DATA_JSON`
+  - `STOCKTWITS_SIGNAL_MOCK_DATA_JSON`
+  - `NEWS_MOCK_DATA_JSON`
+- Outside development (`test`/`production`), ingestion uses live connector endpoints only.
+- In non-development environments, keep at least one secondary live connector configured (`STOCKTWITS_SIGNAL_API_URL` or `NEWS_SENTIMENT_API_URL`).
 
 Example:
 ```json

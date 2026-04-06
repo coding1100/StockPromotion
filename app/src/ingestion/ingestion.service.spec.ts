@@ -39,6 +39,7 @@ describe('IngestionService', () => {
 
   it('reports connector_not_configured when sources are missing', async () => {
     const configValues: Record<string, unknown> = {
+      NODE_ENV: 'production',
       REDDIT_RAPIDAPI_KEY: '',
       REDDIT_RAPIDAPI_HOST: '',
       REDDIT_RAPIDAPI_BASE_URL: '',
@@ -49,11 +50,8 @@ describe('IngestionService', () => {
       REDDIT_RAPIDAPI_ITEM_DATA_PATH: 'data',
       REDDIT_SUBREDDITS: 'stocks',
       REDDIT_FETCH_LIMIT: 25,
-      REDDIT_MOCK_ENABLED: false,
       STOCKTWITS_SIGNAL_API_URL: '',
-      STOCKTWITS_SIGNAL_MOCK_ENABLED: false,
       NEWS_SENTIMENT_API_URL: '',
-      NEWS_MOCK_ENABLED: false,
       SOURCE_CONNECTOR_WEIGHTS_JSON: '{}',
       SOURCE_CONNECTOR_PRIORITIES_JSON: '{}',
       HTTP_REQUEST_TIMEOUT_MS: 10000,
@@ -74,7 +72,7 @@ describe('IngestionService', () => {
 
   it('considers reddit configured when RapidAPI env is set', () => {
     const configValues: Record<string, unknown> = {
-      REDDIT_MOCK_ENABLED: false,
+      NODE_ENV: 'production',
       REDDIT_RAPIDAPI_KEY: 'key',
       REDDIT_RAPIDAPI_HOST: 'host',
       REDDIT_RAPIDAPI_BASE_URL: 'https://example-reddit-api.p.rapidapi.com',

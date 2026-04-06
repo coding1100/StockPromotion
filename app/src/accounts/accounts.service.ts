@@ -107,6 +107,8 @@ export class AccountsService {
     platform: AccountPlatform,
     currentAccountId: string | null,
   ): Promise<AccountProfile> {
+    await this.syncAccountsFromConfig();
+
     const current = currentAccountId
       ? await this.prisma.accountProfile.findUnique({
           where: { id: currentAccountId },
@@ -120,12 +122,22 @@ export class AccountsService {
     const fallback = await this.getEligibleAccount(platform, {
       excludeAccountId: currentAccountId,
     });
-    if (!fallback) {
-      throw new ServiceUnavailableException(
-        `No eligible ${platform.toLowerCase()} account is available`,
-      );
+    if (fallback) {
+      return fallback;
     }
-    return fallback;
+
+    if (currentAccountId) {
+      const refreshedCurrent = await this.prisma.accountProfile.findUnique({
+        where: { id: currentAccountId },
+      });
+      if (refreshedCurrent && refreshedCurrent.status === AccountStatus.ACTIVE) {
+        return refreshedCurrent;
+      }
+    }
+
+    throw new ServiceUnavailableException(
+      `No eligible ${platform.toLowerCase()} account is available`,
+    );
   }
 
   getStocktwitsCredentials(accountHandle: string): {

@@ -2,11 +2,13 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
+import { AxiosError } from 'axios';
 import {
   AccountPlatform,
   DeadLetterStatus,
@@ -32,6 +34,7 @@ import { calculateContentSimilarity } from '../common/utils/content-similarity.u
 @Injectable()
 export class PublishingService {
   private static readonly PUBLISH_LOCK_KEY_PREFIX = 'publish-job';
+  private readonly logger = new Logger(PublishingService.name);
 
   constructor(
     private readonly prisma: PrismaService,
@@ -121,19 +124,22 @@ export class PublishingService {
         ? this.accountsService.getTelegramCredentials(account.accountHandle)
         : null;
 
-      const accessible = credentials
-        ? await this.telegramPublisher.canAccessChat(chatRef, credentials.botToken)
-        : false;
+      const accessResult = credentials
+        ? await this.telegramPublisher.inspectChatAccess(
+            chatRef,
+            credentials.botToken,
+          )
+        : { accessible: false, resolvedChatId: chatRef };
       await this.prisma.telegramGroupCandidate.update({
         where: { id: candidate.id },
         data: {
-          chatId: candidate.chatId ?? chatRef,
-          joined: accessible,
+          chatId: accessResult.resolvedChatId,
+          joined: accessResult.accessible,
           lastAttemptAt: now,
-          throttleUntil: accessible
+          throttleUntil: accessResult.accessible
             ? null
             : new Date(now.getTime() + 60 * 60_000),
-          statusNote: accessible
+          statusNote: accessResult.accessible
             ? 'Bot access verified for this chat.'
             : 'Bot cannot access chat yet. Add bot as admin/member and retry.',
         },
@@ -145,7 +151,8 @@ export class PublishingService {
         candidate.id,
         {
           chatRef,
-          success: accessible,
+          resolvedChatRef: accessResult.resolvedChatId,
+          success: accessResult.accessible,
           accountHandle: account?.accountHandle ?? null,
         },
       );
@@ -299,6 +306,9 @@ export class PublishingService {
       if (!job || job.status !== PublishStatus.PENDING) {
         return;
       }
+      this.logger.log(
+        `Executing publish job ${job.id} (${job.platform}) -> ${job.targetRef}`,
+      );
 
       try {
         let activeAccount = job.account;
@@ -327,6 +337,7 @@ export class PublishingService {
         let externalPostId = '';
         let evidenceUri = '';
         let responsePayload: unknown = {};
+        let resolvedTargetRef = job.targetRef;
 
         if (job.platform === PublishPlatform.TELEGRAM) {
           if (!activeAccount) {
@@ -346,6 +357,9 @@ export class PublishingService {
           );
           externalPostId = result.externalPostId;
           responsePayload = result.responsePayload;
+          if (result.resolvedChatId) {
+            resolvedTargetRef = result.resolvedChatId;
+          }
         } else {
           if (!activeAccount) {
             throw new Error('StockTwits account is not available');
@@ -380,6 +394,7 @@ export class PublishingService {
             attempts: {
               increment: 1,
             },
+            targetRef: resolvedTargetRef,
             externalPostId,
             evidenceUri: evidenceUri || null,
           },
@@ -400,7 +415,7 @@ export class PublishingService {
             success: true,
             metadata: {
               platform: job.platform,
-              targetRef: job.targetRef,
+              targetRef: resolvedTargetRef,
             },
           });
         }
@@ -412,7 +427,7 @@ export class PublishingService {
           job.id,
           {
             platform: job.platform,
-            targetRef: job.targetRef,
+            targetRef: resolvedTargetRef,
             accountHandle: activeAccount?.accountHandle ?? null,
           },
         );
@@ -422,6 +437,7 @@ export class PublishingService {
         const evidenceUri = this.extractEvidenceUriFromError(message);
         const restricted = isRestrictionError(message);
         const nextAttempts = job.attempts + 1;
+        const failurePayload = this.extractFailurePayload(error);
 
         if (job.accountId) {
           await this.accountsService.recordPublishOutcome(job.accountId, {
@@ -458,6 +474,7 @@ export class PublishingService {
             success: false,
             errorClass: restricted ? 'restriction' : 'publish_error',
             errorMessage: message,
+            responsePayload: failurePayload ?? undefined,
             evidenceUri: evidenceUri || null,
           },
         });
@@ -474,6 +491,9 @@ export class PublishingService {
         });
 
         this.telemetryService.increment('pipeline.publish.failed');
+        this.logger.error(
+          `Publish failed for job ${job.id} (${job.platform}) -> ${job.targetRef}. ${message}`,
+        );
         await this.auditService.record('publish.failed', 'publish_job', job.id, {
           platform: job.platform,
           message,
@@ -1483,6 +1503,33 @@ export class PublishingService {
       ...base,
       ...(patch ?? {}),
     };
+  }
+
+  private extractFailurePayload(error: unknown): Prisma.JsonObject | null {
+    if (error instanceof AxiosError) {
+      const status = error.response?.status ?? null;
+      const data = error.response?.data;
+      return {
+        provider: 'http',
+        status,
+        data:
+          data && typeof data === 'object'
+            ? (data as Prisma.JsonObject)
+            : data !== undefined
+              ? { raw: String(data) }
+              : null,
+      };
+    }
+
+    if (error instanceof Error) {
+      return {
+        provider: 'runtime',
+        message: error.message,
+        name: error.name,
+      };
+    }
+
+    return null;
   }
 
   private scoreTelegramCandidate(seed: string): number {

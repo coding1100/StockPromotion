@@ -44,17 +44,14 @@ export const envValidationSchema = Joi.object({
   REDDIT_RAPIDAPI_ITEM_DATA_PATH: Joi.string().default('data'),
   REDDIT_SUBREDDITS: Joi.string().default('stocks,investing,wallstreetbets'),
   REDDIT_FETCH_LIMIT: Joi.number().integer().min(1).max(100).default(25),
-  REDDIT_MOCK_ENABLED: Joi.boolean().default(false),
   REDDIT_MOCK_DATA_JSON: Joi.string().allow('').optional(),
 
   // --- TRENDS & ANALYSIS CONFIG ---
   WATCHLIST_SYMBOLS: Joi.string().default('AAPL,TSLA,NVDA,BTC,ETH'),
   STOCKTWITS_SIGNAL_API_URL: Joi.string().uri().allow('').optional(),
-  STOCKTWITS_SIGNAL_MOCK_ENABLED: Joi.boolean().default(false),
   STOCKTWITS_SIGNAL_MOCK_DATA_JSON: Joi.string().allow('').optional(),
   NEWS_SENTIMENT_API_URL: Joi.string().uri().allow('').optional(),
   NEWS_SENTIMENT_API_KEY: Joi.string().allow('').optional(),
-  NEWS_MOCK_ENABLED: Joi.boolean().default(false),
   NEWS_MOCK_DATA_JSON: Joi.string().allow('').optional(),
 
   // --- AI MODELS ---
@@ -123,19 +120,18 @@ export const envValidationSchema = Joi.object({
   RETENTION_DLQ_DAYS: Joi.number().integer().min(1).max(3650).default(180),
 }).custom((value, helpers) => {
   const env = value as Record<string, unknown>;
-  
-  // Custom logic for secondary source validation
+  const isDevelopment = env.NODE_ENV === 'development';
+
+  // In non-development environments, require at least one live secondary source.
   const hasSecondarySource = Boolean(
     (env.STOCKTWITS_SIGNAL_API_URL as string | undefined)?.trim() ||
-    (env.NEWS_SENTIMENT_API_URL as string | undefined)?.trim() ||
-    env.STOCKTWITS_SIGNAL_MOCK_ENABLED === true ||
-    env.NEWS_MOCK_ENABLED === true,
+      (env.NEWS_SENTIMENT_API_URL as string | undefined)?.trim(),
   );
-  
-  if (!hasSecondarySource) {
+
+  if (!isDevelopment && !hasSecondarySource) {
     return helpers.error('any.custom', {
       message:
-        'At least one additional trend connector must be configured: STOCKTWITS_SIGNAL_API_URL or NEWS_SENTIMENT_API_URL.',
+        'At least one live secondary trend connector must be configured outside development: STOCKTWITS_SIGNAL_API_URL or NEWS_SENTIMENT_API_URL.',
     });
   }
 
