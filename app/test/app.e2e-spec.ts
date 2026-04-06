@@ -7,6 +7,7 @@ import { OrchestrationController } from '../src/orchestration/orchestration.cont
 import { HealthService } from '../src/health/health.service';
 import { OrchestrationService } from '../src/orchestration/orchestration.service';
 import { PublishingService } from '../src/publishing/publishing.service';
+import { RetentionService } from '../src/retention/retention.service';
 
 @Module({
   controllers: [HealthController, OrchestrationController],
@@ -45,6 +46,13 @@ import { PublishingService } from '../src/publishing/publishing.service';
         listPublishJobs: jest.fn().mockResolvedValue([]),
         getPublishJob: jest.fn().mockResolvedValue(null),
         retryPublishJob: jest.fn().mockResolvedValue(undefined),
+      },
+    },
+    {
+      provide: RetentionService,
+      useValue: {
+        getPolicy: jest.fn().mockReturnValue({ enabled: true }),
+        runRetentionNow: jest.fn().mockResolvedValue({ skipped: false }),
       },
     },
   ],

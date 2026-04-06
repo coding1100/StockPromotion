@@ -1,4 +1,4 @@
-# Stock Promotion Automation - Phase 1 + Phase 2 Backend
+# Stock Promotion Automation - Phase 1 + Phase 2 + Phase 3 Hardening Backend
 
 Production-oriented NestJS backend implementing the client-directed Phase 1 pipeline plus Phase 2 scale automation:
 - multi-source ingestion (Reddit + additional connectors),
@@ -10,6 +10,8 @@ Production-oriented NestJS backend implementing the client-directed Phase 1 pipe
 - multi-account routing, health scoring, quarantine, and replacement workflow,
 - connector health, weighting, and fallback-aware trend inputs,
 - duplicate and near-duplicate suppression before publish,
+- dead-letter queue triage + replay tooling for failed windows,
+- retention controls for operational data lifecycle,
 - queue-based orchestration and auditability.
 
 ## Stack
@@ -58,6 +60,12 @@ Metrics: `GET /api/health/metrics`
 - `GET /api/orchestration/publish/jobs`
 - `GET /api/orchestration/publish/jobs/:id`
 - `POST /api/orchestration/publish/jobs/:id/retry`
+- `GET /api/orchestration/publish/dlq`
+- `POST /api/orchestration/publish/dlq/:id/replay`
+- `POST /api/orchestration/publish/dlq/:id/dismiss`
+- `POST /api/orchestration/publish/replay-window`
+- `GET /api/orchestration/retention/policy`
+- `POST /api/orchestration/retention/run`
 - `GET /api/accounts`
 - `PATCH /api/accounts/:id/quarantine`
 - `POST /api/accounts/:id/replacement-request`
@@ -84,6 +92,11 @@ Example:
 
 ## Phase 2 Configuration
 - `TELEGRAM_BOT_ACCOUNTS_JSON` supports multiple Telegram bot identities.
+- `PUBLISH_RETRY_DELAY_SECONDS` controls retry delay after manual retry.
+- `PUBLISH_DEAD_LETTER_ENABLED` toggles dead-letter recording after retry exhaustion.
+- `PUBLISH_REPLAY_BATCH_SIZE` caps failed-window replay size.
+- `CONTENT_PROMPT_VERSION` and `CONTENT_DISCLOSURE_VERSION` version generated content.
+- `RETENTION_*` variables configure scheduled lifecycle cleanup.
 - `PHASE2_PER_ACCOUNT_QUOTA` and `PHASE2_GLOBAL_QUOTA` enforce conservative dispatch limits.
 - `PHASE2_QUIET_HOURS_START` and `PHASE2_QUIET_HOURS_END` pause scheduling during configured hours.
 - `PHASE2_MIN_DELAY_MINUTES` and `PHASE2_MAX_DELAY_MINUTES` control randomized dispatch windows.
@@ -105,6 +118,10 @@ npm test
 npm run prisma:generate
 npm run prisma:migrate
 npm run prisma:deploy
+npm run ops:backup-db
+npm run ops:restore-db -- -BackupFile .\backups\<file>.dump -DropExisting
+npm run ops:verify-restore
+npm run ops:replay-window -- -FromIso 2026-04-01T00:00:00Z -ToIso 2026-04-01T06:00:00Z -Platform STOCKTWITS
 ```
 
 ## Production Notes
@@ -114,3 +131,4 @@ npm run prisma:deploy
 - Keep conservative publish cadence and monitor account health events.
 - Protect all non-health endpoints with `x-api-key` (`ADMIN_API_KEY`).
 - In production, set `SWAGGER_ENABLED=false` unless docs access is explicitly required.
+- Use `../ops` runbooks/checklists for promotion, rollback, and incident response.

@@ -69,6 +69,12 @@ enum ReviewStatus {
   REJECTED
 }
 
+enum DeadLetterStatus {
+  OPEN
+  REPLAYED
+  DISMISSED
+}
+
 model SourceEvent {
   id              String     @id @default(cuid())
   source          SourceType
@@ -117,6 +123,7 @@ model ContentDraft {
   provider      String
   model         String
   promptVersion String
+  disclosureVersion String   @default("v1")
   status        DraftStatus  @default(GENERATED)
   contentHash   String       @unique
   createdAt     DateTime     @default(now())
@@ -260,6 +267,7 @@ model PublishJob {
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
   attemptsLog    PublishAttempt[]
+  deadLetter     PublishDeadLetter?
 
   @@index([platform, status, scheduledAt])
 }
@@ -274,6 +282,21 @@ model PublishAttempt {
   errorMessage    String?
   responsePayload Json?
   evidenceUri     String?
+}
+
+model PublishDeadLetter {
+  id          String          @id @default(cuid())
+  publishJobId String         @unique
+  publishJob  PublishJob      @relation(fields: [publishJobId], references: [id], onDelete: Cascade)
+  status      DeadLetterStatus @default(OPEN)
+  reason      String
+  attempts    Int
+  firstFailedAt DateTime
+  movedAt     DateTime        @default(now())
+  replayedAt  DateTime?
+  metadata    Json?
+
+  @@index([status, movedAt])
 }
 
 model AuditEvent {

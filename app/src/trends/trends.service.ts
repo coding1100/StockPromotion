@@ -6,6 +6,7 @@ import {
   TrendTopic,
   TrendWindow,
 } from '@prisma/client';
+import { createHash } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { TelemetryService } from '../telemetry/telemetry.service';
@@ -180,8 +181,40 @@ export class TrendsService {
       return [];
     }
 
+    const existingRows = await this.prisma.trendTopic.findMany({
+      where: {
+        windowType: windowSpec.type,
+        windowEnd: {
+          gte: windowStart,
+          lte: now,
+        },
+      },
+      select: {
+        symbol: true,
+        evidence: true,
+      },
+    });
+    const existingFingerprintsBySymbol = new Map<string, Set<string>>();
+    for (const row of existingRows) {
+      const evidence = row.evidence as { fingerprint?: string } | null;
+      const fingerprint = evidence?.fingerprint;
+      if (!fingerprint) {
+        continue;
+      }
+      const current = existingFingerprintsBySymbol.get(row.symbol) ?? new Set();
+      current.add(fingerprint);
+      existingFingerprintsBySymbol.set(row.symbol, current);
+    }
+
     const created: TrendTopic[] = [];
     for (const trend of scored) {
+      const fingerprint = this.getEvidenceFingerprint(trend.evidenceIds);
+      const symbolFingerprints =
+        existingFingerprintsBySymbol.get(trend.symbol) ?? new Set<string>();
+      if (symbolFingerprints.has(fingerprint)) {
+        continue;
+      }
+
       const row = await this.prisma.trendTopic.create({
         data: {
           symbol: trend.symbol,
@@ -194,10 +227,13 @@ export class TrendsService {
           windowEnd: now,
           evidence: {
             eventIds: trend.evidenceIds,
+            fingerprint,
           },
         },
       });
       created.push(row);
+      symbolFingerprints.add(fingerprint);
+      existingFingerprintsBySymbol.set(trend.symbol, symbolFingerprints);
     }
     return created;
   }
@@ -215,5 +251,10 @@ export class TrendsService {
       type: value === 1 ? TrendWindow.H1 : value === 6 ? TrendWindow.H6 : TrendWindow.H24,
       hours: value,
     }));
+  }
+
+  private getEvidenceFingerprint(eventIds: string[]): string {
+    const canonical = [...eventIds].sort().join('|');
+    return createHash('sha256').update(canonical).digest('hex');
   }
 }

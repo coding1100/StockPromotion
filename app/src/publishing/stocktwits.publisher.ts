@@ -166,10 +166,6 @@ export class StocktwitsPublisher {
     const userDataDir = this.configService.get<string>('STOCKTWITS_USER_DATA_DIR')?.trim() || join(process.cwd(), '.pw-stocktwits');
     const browserBinary = this.configService.get<string>('STOCKTWITS_BROWSER_BINARY')?.trim() || '';
 
-    // LOG THIS: Check your terminal for this line to see what it actually says
-    this.logger.log(`DEBUG: STOCKTWITS_HEADLESS raw value is: ${rawHeadless} (type: ${typeof rawHeadless})`);
-    this.logger.log(`DEBUG: Browser will launch with headless = ${isHeadless}`);
-
     await mkdir(userDataDir, { recursive: true });
 
     const context = await chromium.launchPersistentContext(userDataDir, {

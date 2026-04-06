@@ -26,7 +26,11 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy"
+    "prisma:deploy": "prisma migrate deploy",
+    "ops:backup-db": "powershell -ExecutionPolicy Bypass -File ./scripts/backup-postgres.ps1",
+    "ops:restore-db": "powershell -ExecutionPolicy Bypass -File ./scripts/restore-postgres.ps1",
+    "ops:verify-restore": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-restore.ps1",
+    "ops:replay-window": "powershell -ExecutionPolicy Bypass -File ./scripts/replay-failed-window.ps1"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",

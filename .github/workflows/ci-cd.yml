@@ -1,0 +1,86 @@
+name: CI-CD
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      promote_to:
+        description: "Promotion target environment"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: "Existing image tag to promote (optional)"
+        required: false
+        type: string
+
+jobs:
+  quality:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Prisma Generate
+        run: npm run prisma:generate
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit Tests
+        run: npm test -- --runInBand
+
+      - name: Build
+        run: npm run build
+
+  docker-build:
+    name: Build Container
+    runs-on: ubuntu-latest
+    needs: [quality]
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t stockpromo:${{ github.sha }} ./app
+
+  promote:
+    name: Promote Environment
+    runs-on: ubuntu-latest
+    needs: [quality]
+    if: github.event_name == 'workflow_dispatch'
+    environment: ${{ inputs.promote_to }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Promotion summary
+        run: |
+          echo "Promoting build to ${{ inputs.promote_to }}"
+          echo "Image tag: ${{ inputs.image_tag || github.sha }}"
+          echo "Follow ops/deployment/promotion-and-rollback.md for rollout gates."
+
+      - name: Deploy placeholder
+        run: |
+          echo "Replace this step with your deploy command (Kubernetes/VM/compose)."
+          echo "Keep staging soak + rollback policy unchanged."

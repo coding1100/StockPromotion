@@ -92,8 +92,13 @@ export const envValidationSchema = Joi.object({
   TREND_MIN_SCORE: Joi.number().default(0),
   TOP_TRENDS_LIMIT: Joi.number().integer().min(1).max(100).default(10),
   AUTO_APPROVAL_MIN_SCORE: Joi.number().default(0.75),
+  CONTENT_PROMPT_VERSION: Joi.string().default('phase1-v1'),
+  CONTENT_DISCLOSURE_VERSION: Joi.string().default('v1'),
   PUBLISH_COOLDOWN_MINUTES: Joi.number().integer().min(1).default(90),
   PUBLISH_MAX_RETRIES: Joi.number().integer().min(1).max(10).default(3),
+  PUBLISH_RETRY_DELAY_SECONDS: Joi.number().integer().min(5).max(600).default(30),
+  PUBLISH_DEAD_LETTER_ENABLED: Joi.boolean().default(true),
+  PUBLISH_REPLAY_BATCH_SIZE: Joi.number().integer().min(1).max(1000).default(200),
   PHASE2_PER_ACCOUNT_QUOTA: Joi.number().integer().min(1).default(4),
   PHASE2_GLOBAL_QUOTA: Joi.number().integer().min(1).default(12),
   PHASE2_QUIET_HOURS_START: Joi.number().integer().min(0).max(23).optional(),
@@ -110,6 +115,12 @@ export const envValidationSchema = Joi.object({
     .max(120000)
     .default(10000),
   HTTP_MAX_RETRIES: Joi.number().integer().min(0).max(6).default(2),
+  RETENTION_ENABLED: Joi.boolean().default(true),
+  RETENTION_CRON: Joi.string().default('15 2 * * *'),
+  RETENTION_SOURCE_EVENTS_DAYS: Joi.number().integer().min(1).max(3650).default(30),
+  RETENTION_AUDIT_EVENTS_DAYS: Joi.number().integer().min(1).max(3650).default(365),
+  RETENTION_PUBLISH_ATTEMPTS_DAYS: Joi.number().integer().min(1).max(3650).default(90),
+  RETENTION_DLQ_DAYS: Joi.number().integer().min(1).max(3650).default(180),
 }).custom((value, helpers) => {
   const env = value as Record<string, unknown>;
   

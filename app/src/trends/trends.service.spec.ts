@@ -20,6 +20,7 @@ describe('TrendsService', () => {
         ]),
       },
       trendTopic: {
+        findMany: jest.fn().mockResolvedValue([]),
         create: jest
           .fn()
           .mockImplementation((args: { data: { windowType: TrendWindow } }) => {

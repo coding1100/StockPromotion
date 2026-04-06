@@ -8,10 +8,16 @@ import {
   Query,
 } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { DraftStatus, PublishStatus } from '@prisma/client';
+import {
+  DeadLetterStatus,
+  DraftStatus,
+  PublishPlatform,
+  PublishStatus,
+} from '@prisma/client';
 import { OrchestrationService } from './orchestration.service';
 import { PublishingService } from '../publishing/publishing.service';
 import { IngestionService } from '../ingestion/ingestion.service';
+import { RetentionService } from '../retention/retention.service';
 
 @Controller('orchestration')
 @ApiTags('orchestration')
@@ -20,6 +26,7 @@ export class OrchestrationController {
     private readonly orchestrationService: OrchestrationService,
     private readonly publishingService: PublishingService,
     private readonly ingestionService: IngestionService,
+    private readonly retentionService: RetentionService,
   ) {}
 
   @Post('run')
@@ -103,6 +110,51 @@ export class OrchestrationController {
     return this.publishingService.getPublishJob(publishJobId);
   }
 
+  @Get('publish/dlq')
+  async listDeadLetterJobs(
+    @Query('limit') limit?: string,
+    @Query('status') status?: string,
+  ): Promise<Record<string, unknown>[]> {
+    const parsedLimit = limit ? Number(limit) : 100;
+    const parsedStatus = this.parseDeadLetterStatus(status);
+    return this.publishingService.listDeadLetterJobs(
+      Number.isFinite(parsedLimit)
+        ? Math.max(1, Math.min(parsedLimit, 500))
+        : 100,
+      parsedStatus,
+    );
+  }
+
+  @Post('publish/dlq/:id/replay')
+  async replayDeadLetter(
+    @Param('id') deadLetterId: string,
+  ): Promise<{ queued: boolean }> {
+    await this.publishingService.replayDeadLetter(deadLetterId);
+    return { queued: true };
+  }
+
+  @Post('publish/dlq/:id/dismiss')
+  async dismissDeadLetter(
+    @Param('id') deadLetterId: string,
+    @Body() body: { note?: string },
+  ): Promise<{ dismissed: boolean }> {
+    await this.publishingService.dismissDeadLetter(deadLetterId, body.note);
+    return { dismissed: true };
+  }
+
+  @Post('publish/replay-window')
+  async replayFailedWindow(
+    @Body()
+    body: { fromIso: string; toIso: string; platform?: string },
+  ): Promise<Record<string, unknown>> {
+    const platform = this.parsePublishPlatform(body.platform);
+    return this.publishingService.replayFailedWindow({
+      fromIso: body.fromIso,
+      toIso: body.toIso,
+      platform,
+    });
+  }
+
   @Get('dashboard/operations')
   async getOperationsDashboard(): Promise<Record<string, unknown>> {
     return this.publishingService.getOperationsDashboard();
@@ -116,6 +168,16 @@ export class OrchestrationController {
   @Get('stocktwits/session')
   async getStocktwitsSessionStatus(): Promise<Record<string, unknown>> {
     return this.publishingService.getStocktwitsSessionStatus();
+  }
+
+  @Get('retention/policy')
+  async getRetentionPolicy(): Promise<Record<string, unknown>> {
+    return this.retentionService.getPolicy();
+  }
+
+  @Post('retention/run')
+  async runRetentionNow(): Promise<Record<string, unknown>> {
+    return this.retentionService.runRetentionNow('manual');
   }
 
   @Post('stocktwits/session/bootstrap')
@@ -165,5 +227,25 @@ export class OrchestrationController {
       return value as PublishStatus;
     }
     throw new BadRequestException(`Invalid publish status: ${value}`);
+  }
+
+  private parseDeadLetterStatus(value?: string): DeadLetterStatus | undefined {
+    if (!value) {
+      return undefined;
+    }
+    if ((Object.values(DeadLetterStatus) as string[]).includes(value)) {
+      return value as DeadLetterStatus;
+    }
+    throw new BadRequestException(`Invalid dead-letter status: ${value}`);
+  }
+
+  private parsePublishPlatform(value?: string): PublishPlatform | undefined {
+    if (!value) {
+      return undefined;
+    }
+    if ((Object.values(PublishPlatform) as string[]).includes(value)) {
+      return value as PublishPlatform;
+    }
+    throw new BadRequestException(`Invalid publish platform: ${value}`);
   }
 }

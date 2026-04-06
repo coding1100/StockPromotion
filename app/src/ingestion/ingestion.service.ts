@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosRequestConfig } from 'axios';
 import { Prisma, SourceType } from '@prisma/client';
+import { createHash } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { extractSymbols } from '../common/utils/symbol.util';
 import {
@@ -17,6 +18,7 @@ type ConnectorName = 'reddit' | 'stocktwitsSignal' | 'news';
 type ConnectorResult = {
   configured: boolean;
   healthy: boolean;
+  fresh: boolean;
   ingested: number;
   error: string | null;
   weight: number;
@@ -44,6 +46,16 @@ type RedditRapidApiConfig = {
   syncTrendWindow: boolean;
   itemsPath: string;
   itemDataPath: string;
+};
+
+type EventCandidate = {
+  source: SourceType;
+  sourceUrl: string;
+  title: string;
+  body: string;
+  author: string;
+  createdRaw: unknown;
+  explicitExternalId?: unknown;
 };
 
 @Injectable()
@@ -80,7 +92,9 @@ export class IngestionService {
       stocktwitsSignal,
       news,
     })
-      .filter(([, value]) => value.configured && value.healthy)
+      .filter(
+        ([, value]) => value.configured && value.healthy && value.fresh,
+      )
       .sort(([, left], [, right]) => right.priority - left.priority)
       .map(([key]) => key as ConnectorName);
 
@@ -144,6 +158,8 @@ export class IngestionService {
       await this.persistConnectorState(source, {
         configured: false,
         healthy: false,
+        fresh: false,
+        ingested: 0,
         weight,
         priority,
         error: 'connector_not_configured',
@@ -152,6 +168,7 @@ export class IngestionService {
       return {
         configured: false,
         healthy: false,
+        fresh: false,
         ingested: 0,
         error: 'connector_not_configured',
         weight,
@@ -162,10 +179,13 @@ export class IngestionService {
 
     try {
       const ingested = await fn();
+      const fresh = ingested > 0;
       this.telemetryService.increment(`connector.${name}.success`);
       await this.persistConnectorState(source, {
         configured: true,
         healthy: true,
+        fresh,
+        ingested,
         weight,
         priority,
         error: null,
@@ -174,6 +194,7 @@ export class IngestionService {
       return {
         configured: true,
         healthy: true,
+        fresh,
         ingested,
         error: null,
         weight,
@@ -187,6 +208,8 @@ export class IngestionService {
       await this.persistConnectorState(source, {
         configured: true,
         healthy: false,
+        fresh: false,
+        ingested: 0,
         weight,
         priority,
         error: message,
@@ -203,6 +226,7 @@ export class IngestionService {
       return {
         configured: true,
         healthy: false,
+        fresh: false,
         ingested: 0,
         error: message,
         weight,
@@ -346,7 +370,7 @@ export class IngestionService {
         {
           id:
             this.asString(item.id) ||
-            `mock-reddit-${Date.now()}-${String(index + 1).padStart(2, '0')}`,
+            `mock-reddit-${String(index + 1).padStart(2, '0')}`,
           title: this.asString(item.title),
           selftext: this.asString(item.body),
           permalink:
@@ -384,33 +408,44 @@ export class IngestionService {
         ? permalink
         : `https://reddit.com${permalink}`
       : directUrl;
+    const author =
+      this.asString(payload.author) ||
+      this.asString(payload.username) ||
+      this.asString(payload.user);
+    const createdRaw = payload.created_utc ?? payload.createdAt ?? payload.created;
+    const occurredAt = this.asDate(createdRaw);
 
     return {
       source: SourceType.REDDIT,
-      externalId:
-        this.asString(payload.id) ||
-        this.asString(payload.post_id) ||
-        this.asString(payload.fullname),
+      externalId: this.resolveExternalId({
+        source: SourceType.REDDIT,
+        sourceUrl,
+        title,
+        body: combined,
+        author,
+        createdRaw,
+        explicitExternalId:
+          this.asString(payload.id) ||
+          this.asString(payload.post_id) ||
+          this.asString(payload.fullname),
+      }),
       sourceUrl,
       title,
       body: combined.slice(0, 6000),
-      symbols: extractSymbols(combined),
+      symbols: extractSymbols(combined, {
+        allowedSymbols: this.watchlistSymbols,
+      }),
       sentimentScore: null,
       engagementScore:
         this.asNumber(payload.score) ||
         this.asNumber(payload.ups) ||
         this.asNumber(payload.upvotes),
-      author:
-        this.asString(payload.author) ||
-        this.asString(payload.username) ||
-        this.asString(payload.user),
+      author,
       rawPayload: {
         ...(payload as Prisma.JsonObject),
         mockMode,
       },
-      occurredAt: this.asDate(
-        payload.created_utc ?? payload.createdAt ?? payload.created,
-      ),
+      occurredAt,
     };
   }
 
@@ -450,23 +485,37 @@ export class IngestionService {
         const body = this.asString(message.body);
         const joinedSymbols = [
           symbol,
-          ...extractSymbols(body).filter((value) => value !== symbol),
+          ...extractSymbols(body, {
+            allowedSymbols: this.watchlistSymbols,
+          }).filter((value) => value !== symbol),
         ];
+        const sourceUrl = this.asString(message.url);
+        const author = this.asString(
+          (message.user as { username?: unknown })?.username,
+        );
+        const createdRaw = message.created_at;
+        const occurredAt = this.asDate(createdRaw);
 
         return {
           source: SourceType.STOCKTWITS_SIGNAL,
-          externalId: this.asString(message.id) || `${symbol}-${Date.now()}`,
-          sourceUrl: this.asString(message.url),
+          externalId: this.resolveExternalId({
+            source: SourceType.STOCKTWITS_SIGNAL,
+            sourceUrl,
+            title: '',
+            body,
+            author,
+            createdRaw,
+            explicitExternalId: this.asString(message.id),
+          }),
+          sourceUrl,
           title: null,
           body: body.slice(0, 6000),
           symbols: joinedSymbols,
           sentimentScore: null,
           engagementScore: this.asNumber(message.likes),
-          author: this.asString(
-            (message.user as { username?: unknown })?.username,
-          ),
+          author,
           rawPayload: message as Prisma.JsonObject,
-          occurredAt: this.asDate(message.created_at),
+          occurredAt,
         };
       });
 
@@ -491,29 +540,44 @@ export class IngestionService {
     const rows = payload.map((item, index) => {
       const body = this.asString(item.body);
       const primarySymbol =
-        extractSymbols(this.asString(item.symbol) || body)[0] || 'AAPL';
+        extractSymbols(this.asString(item.symbol) || body, {
+          allowedSymbols: this.watchlistSymbols,
+        })[0] || 'AAPL';
       const symbols = [
         primarySymbol,
-        ...extractSymbols(body).filter((value) => value !== primarySymbol),
+        ...extractSymbols(body, {
+          allowedSymbols: this.watchlistSymbols,
+        }).filter((value) => value !== primarySymbol),
       ];
+      const sourceUrl =
+        this.asString(item.url) || `https://stocktwits.com/symbol/${primarySymbol}`;
+      const author = this.asString(item.author) || 'mock-stocktwits-user';
+      const createdRaw = item.createdAt;
+      const occurredAt = this.asDate(createdRaw);
 
       return {
         source: SourceType.STOCKTWITS_SIGNAL,
-        externalId:
-          this.asString(item.id) ||
-          `mock-stocktwits-${Date.now()}-${String(index + 1).padStart(2, '0')}`,
-        sourceUrl: this.asString(item.url) || `https://stocktwits.com/symbol/${primarySymbol}`,
+        externalId: this.resolveExternalId({
+          source: SourceType.STOCKTWITS_SIGNAL,
+          sourceUrl,
+          title: '',
+          body,
+          author,
+          createdRaw,
+          explicitExternalId: this.asString(item.id),
+        }),
+        sourceUrl,
         title: null,
         body: body.slice(0, 6000),
         symbols,
         sentimentScore: this.asNumber(item.sentiment) || null,
         engagementScore: this.asNumber(item.likes),
-        author: this.asString(item.author) || 'mock-stocktwits-user',
+        author,
         rawPayload: {
           ...(item as Prisma.JsonObject),
           mockMode: true,
         },
-        occurredAt: this.asDate(item.createdAt),
+        occurredAt,
       };
     });
 
@@ -567,20 +631,33 @@ export class IngestionService {
       const title = this.asString(item.title) || this.asString(item.headline);
       const body =
         this.asString(item.summary) || this.asString(item.description) || title;
+      const sourceUrl = this.asString(item.url);
+      const author = this.asString(item.source);
+      const createdRaw = item.publishedAt ?? item.time;
+      const occurredAt = this.asDate(createdRaw);
 
       return {
         source: SourceType.NEWS_API,
-        externalId:
-          this.asString(item.id) || this.asString(item.url) || `${Date.now()}`,
-        sourceUrl: this.asString(item.url),
+        externalId: this.resolveExternalId({
+          source: SourceType.NEWS_API,
+          sourceUrl,
+          title,
+          body,
+          author,
+          createdRaw,
+          explicitExternalId: this.asString(item.id),
+        }),
+        sourceUrl,
         title: title.slice(0, 512),
         body: body.slice(0, 6000),
-        symbols: extractSymbols(`${title}\n${body}`),
+        symbols: extractSymbols(`${title}\n${body}`, {
+          allowedSymbols: this.watchlistSymbols,
+        }),
         sentimentScore: this.asNumber(item.sentiment),
         engagementScore: this.asNumber(item.rank),
-        author: this.asString(item.source),
+        author,
         rawPayload: item as Prisma.JsonObject,
-        occurredAt: this.asDate(item.publishedAt ?? item.time),
+        occurredAt,
       };
     });
 
@@ -608,25 +685,37 @@ export class IngestionService {
         this.asString(item.description) ||
         this.asString(item.body) ||
         title;
+      const sourceUrl =
+        this.asString(item.url) || `https://example.test/mock-news/${index + 1}`;
+      const author = this.asString(item.source) || 'mock-news';
+      const createdRaw = item.publishedAt ?? item.time ?? item.createdAt;
+      const occurredAt = this.asDate(createdRaw);
 
       return {
         source: SourceType.NEWS_API,
-        externalId:
-          this.asString(item.id) ||
-          this.asString(item.url) ||
-          `mock-news-${Date.now()}-${String(index + 1).padStart(2, '0')}`,
-        sourceUrl: this.asString(item.url) || `https://example.test/mock-news/${index + 1}`,
+        externalId: this.resolveExternalId({
+          source: SourceType.NEWS_API,
+          sourceUrl,
+          title,
+          body,
+          author,
+          createdRaw,
+          explicitExternalId: this.asString(item.id),
+        }),
+        sourceUrl,
         title: title.slice(0, 512),
         body: body.slice(0, 6000),
-        symbols: extractSymbols(`${title}\n${body}`),
+        symbols: extractSymbols(`${title}\n${body}`, {
+          allowedSymbols: this.watchlistSymbols,
+        }),
         sentimentScore: this.asNumber(item.sentiment),
         engagementScore: this.asNumber(item.rank),
-        author: this.asString(item.source) || 'mock-news',
+        author,
         rawPayload: {
           ...(item as Prisma.JsonObject),
           mockMode: true,
         },
-        occurredAt: this.asDate(item.publishedAt ?? item.time ?? item.createdAt),
+        occurredAt,
       };
     });
 
@@ -642,6 +731,8 @@ export class IngestionService {
     input: {
       configured: boolean;
       healthy: boolean;
+      fresh: boolean;
+      ingested: number;
       weight: number;
       priority: number;
       error: string | null;
@@ -667,6 +758,9 @@ export class IngestionService {
             },
         metadata: {
           mockMode: input.mockMode,
+          fresh: input.fresh,
+          lastIngestedCount: input.ingested,
+          lastIngestedAt: new Date().toISOString(),
         },
       },
       create: {
@@ -681,6 +775,9 @@ export class IngestionService {
         consecutiveFailures: input.healthy ? 0 : 1,
         metadata: {
           mockMode: input.mockMode,
+          fresh: input.fresh,
+          lastIngestedCount: input.ingested,
+          lastIngestedAt: new Date().toISOString(),
         },
       },
     });
@@ -845,6 +942,40 @@ export class IngestionService {
         }
         return (current as Record<string, unknown>)[segment];
       }, source);
+  }
+
+  private resolveExternalId(candidate: EventCandidate): string {
+    const explicitId = this.asString(candidate.explicitExternalId);
+    if (explicitId) {
+      return explicitId;
+    }
+
+    const createdValue =
+      typeof candidate.createdRaw === 'number' ||
+      typeof candidate.createdRaw === 'string'
+        ? String(candidate.createdRaw)
+        : '';
+
+    const fingerprint = [
+      candidate.source,
+      candidate.sourceUrl,
+      candidate.title,
+      candidate.body,
+      candidate.author,
+      createdValue,
+    ].join('|');
+
+    return createHash('sha256').update(fingerprint).digest('hex');
+  }
+
+  private get watchlistSymbols(): Set<string> {
+    const raw = this.configService.get<string>('WATCHLIST_SYMBOLS') || '';
+    return new Set(
+      raw
+        .split(',')
+        .map((value) => value.trim().toUpperCase())
+        .filter(Boolean),
+    );
   }
 
   private asString(value: unknown): string {

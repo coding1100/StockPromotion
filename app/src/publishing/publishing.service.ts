@@ -9,6 +9,7 @@ import { Queue } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
 import {
   AccountPlatform,
+  DeadLetterStatus,
   DraftStatus,
   Prisma,
   PublishPlatform,
@@ -30,6 +31,8 @@ import { calculateContentSimilarity } from '../common/utils/content-similarity.u
 
 @Injectable()
 export class PublishingService {
+  private static readonly PUBLISH_LOCK_KEY_PREFIX = 'publish-job';
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
@@ -279,174 +282,206 @@ export class PublishingService {
   }
 
   async executePublishJob(publishJobId: string): Promise<void> {
-    const job = await this.prisma.publishJob.findUnique({
-      where: { id: publishJobId },
-      include: {
-        draft: true,
-        account: true,
-      },
-    });
-    if (!job || job.status !== PublishStatus.PENDING) {
+    const lockKey = `${PublishingService.PUBLISH_LOCK_KEY_PREFIX}:${publishJobId}`;
+    const lockAcquired = await this.acquirePublishJobLock(lockKey);
+    if (!lockAcquired) {
       return;
     }
 
     try {
-      let activeAccount = job.account;
-      if (job.platform === PublishPlatform.TELEGRAM) {
-        activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
-          AccountPlatform.TELEGRAM,
-          job.accountId,
-        );
-      }
-      if (job.platform === PublishPlatform.STOCKTWITS) {
-        activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
-          AccountPlatform.STOCKTWITS,
-          job.accountId,
-        );
-      }
-
-      if (activeAccount && activeAccount.id !== job.accountId) {
-        await this.prisma.publishJob.update({
-          where: { id: job.id },
-          data: {
-            accountId: activeAccount.id,
-          },
-        });
-      }
-
-      let externalPostId = '';
-      let evidenceUri = '';
-      let responsePayload: unknown = {};
-
-      if (job.platform === PublishPlatform.TELEGRAM) {
-        if (!activeAccount) {
-          throw new Error('Telegram account is not available');
-        }
-        const credentials = this.accountsService.getTelegramCredentials(
-          activeAccount.accountHandle,
-        );
-        if (!credentials) {
-          throw new Error('Telegram bot credentials missing');
-        }
-
-        const result = await this.telegramPublisher.sendMessage(
-          job.targetRef,
-          job.draft.body,
-          credentials.botToken,
-        );
-        externalPostId = result.externalPostId;
-        responsePayload = result.responsePayload;
-      } else {
-        if (!activeAccount) {
-          throw new Error('StockTwits account is not available');
-        }
-        const credentials = this.accountsService.getStocktwitsCredentials(
-          activeAccount.accountHandle,
-        );
-        if (!credentials) {
-          throw new Error('StockTwits account credentials missing');
-        }
-
-        const result = await this.stocktwitsPublisher.publish(
-          credentials,
-          job.draft.body,
-          job.id,
-        );
-        externalPostId = result.externalPostId;
-        evidenceUri = result.evidenceUri;
-        responsePayload = result;
-      }
-
-      await this.prisma.publishJob.update({
-        where: { id: job.id },
-        data: {
-          status: PublishStatus.SUCCESS,
-          attempts: {
-            increment: 1,
-          },
-          externalPostId,
-          evidenceUri: evidenceUri || null,
+      const job = await this.prisma.publishJob.findUnique({
+        where: { id: publishJobId },
+        include: {
+          draft: true,
+          account: true,
         },
       });
-
-      await this.prisma.publishAttempt.create({
-        data: {
-          publishJobId: job.id,
-          success: true,
-          responsePayload: responsePayload as Prisma.JsonObject,
-          evidenceUri: evidenceUri || null,
-        },
-      });
-      await this.reconcileDraftPublishState(job.draftId);
-
-      if (activeAccount?.id) {
-        await this.accountsService.recordPublishOutcome(activeAccount.id, {
-          success: true,
-          metadata: {
-            platform: job.platform,
-            targetRef: job.targetRef,
-          },
-        });
-      }
-
-      this.telemetryService.increment('pipeline.publish.success');
-      await this.auditService.record('publish.success', 'publish_job', job.id, {
-        platform: job.platform,
-        targetRef: job.targetRef,
-        accountHandle: activeAccount?.accountHandle ?? null,
-      });
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Unexpected publish error';
-      const evidenceUri = this.extractEvidenceUriFromError(message);
-      const restricted = isRestrictionError(message);
-
-      if (job.accountId) {
-        await this.accountsService.recordPublishOutcome(job.accountId, {
-          success: false,
-          reason: message,
-          restricted,
-          metadata: {
-            platform: job.platform,
-            targetRef: job.targetRef,
-          },
-        });
-      }
-
-      const rerouted = await this.tryRerouteFailedJob(job.id, message);
-      if (rerouted) {
+      if (!job || job.status !== PublishStatus.PENDING) {
         return;
       }
 
-      await this.prisma.publishJob.update({
-        where: { id: job.id },
-        data: {
-          status: PublishStatus.FAILED,
-          attempts: {
-            increment: 1,
+      try {
+        let activeAccount = job.account;
+        if (job.platform === PublishPlatform.TELEGRAM) {
+          activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
+            AccountPlatform.TELEGRAM,
+            job.accountId,
+          );
+        }
+        if (job.platform === PublishPlatform.STOCKTWITS) {
+          activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
+            AccountPlatform.STOCKTWITS,
+            job.accountId,
+          );
+        }
+
+        if (activeAccount && activeAccount.id !== job.accountId) {
+          await this.prisma.publishJob.update({
+            where: { id: job.id },
+            data: {
+              accountId: activeAccount.id,
+            },
+          });
+        }
+
+        let externalPostId = '';
+        let evidenceUri = '';
+        let responsePayload: unknown = {};
+
+        if (job.platform === PublishPlatform.TELEGRAM) {
+          if (!activeAccount) {
+            throw new Error('Telegram account is not available');
+          }
+          const credentials = this.accountsService.getTelegramCredentials(
+            activeAccount.accountHandle,
+          );
+          if (!credentials) {
+            throw new Error('Telegram bot credentials missing');
+          }
+
+          const result = await this.telegramPublisher.sendMessage(
+            job.targetRef,
+            job.draft.body,
+            credentials.botToken,
+          );
+          externalPostId = result.externalPostId;
+          responsePayload = result.responsePayload;
+        } else {
+          if (!activeAccount) {
+            throw new Error('StockTwits account is not available');
+          }
+          const credentials = this.accountsService.getStocktwitsCredentials(
+            activeAccount.accountHandle,
+          );
+          if (!credentials) {
+            throw new Error('StockTwits account credentials missing');
+          }
+
+          const result = await this.stocktwitsPublisher.publish(
+            credentials,
+            job.draft.body,
+            job.id,
+          );
+          externalPostId = result.externalPostId;
+          evidenceUri = result.evidenceUri;
+          responsePayload = result;
+        }
+
+        if (!externalPostId) {
+          throw new Error(
+            `${job.platform.toLowerCase()}_publish_not_confirmed`,
+          );
+        }
+
+        await this.prisma.publishJob.update({
+          where: { id: job.id },
+          data: {
+            status: PublishStatus.SUCCESS,
+            attempts: {
+              increment: 1,
+            },
+            externalPostId,
+            evidenceUri: evidenceUri || null,
           },
-          lastError: message,
-          evidenceUri: evidenceUri || null,
-        },
-      });
+        });
 
-      await this.prisma.publishAttempt.create({
-        data: {
+        await this.prisma.publishAttempt.create({
+          data: {
+            publishJobId: job.id,
+            success: true,
+            responsePayload: responsePayload as Prisma.JsonObject,
+            evidenceUri: evidenceUri || null,
+          },
+        });
+        await this.reconcileDraftPublishState(job.draftId);
+
+        if (activeAccount?.id) {
+          await this.accountsService.recordPublishOutcome(activeAccount.id, {
+            success: true,
+            metadata: {
+              platform: job.platform,
+              targetRef: job.targetRef,
+            },
+          });
+        }
+
+        this.telemetryService.increment('pipeline.publish.success');
+        await this.auditService.record(
+          'publish.success',
+          'publish_job',
+          job.id,
+          {
+            platform: job.platform,
+            targetRef: job.targetRef,
+            accountHandle: activeAccount?.accountHandle ?? null,
+          },
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'Unexpected publish error';
+        const evidenceUri = this.extractEvidenceUriFromError(message);
+        const restricted = isRestrictionError(message);
+        const nextAttempts = job.attempts + 1;
+
+        if (job.accountId) {
+          await this.accountsService.recordPublishOutcome(job.accountId, {
+            success: false,
+            reason: message,
+            restricted,
+            metadata: {
+              platform: job.platform,
+              targetRef: job.targetRef,
+            },
+          });
+        }
+
+        const rerouted = await this.tryRerouteFailedJob(job.id, message);
+        if (rerouted) {
+          return;
+        }
+
+        await this.prisma.publishJob.update({
+          where: { id: job.id },
+          data: {
+            status: PublishStatus.FAILED,
+            attempts: {
+              increment: 1,
+            },
+            lastError: message,
+            evidenceUri: evidenceUri || null,
+          },
+        });
+
+        await this.prisma.publishAttempt.create({
+          data: {
+            publishJobId: job.id,
+            success: false,
+            errorClass: restricted ? 'restriction' : 'publish_error',
+            errorMessage: message,
+            evidenceUri: evidenceUri || null,
+          },
+        });
+        await this.reconcileDraftPublishState(job.draftId);
+        await this.moveToDeadLetterIfExhausted({
           publishJobId: job.id,
-          success: false,
-          errorClass: restricted ? 'restriction' : 'publish_error',
-          errorMessage: message,
-          evidenceUri: evidenceUri || null,
-        },
-      });
-      await this.reconcileDraftPublishState(job.draftId);
+          attempts: nextAttempts,
+          reason: message,
+          metadata: {
+            platform: job.platform,
+            targetRef: job.targetRef,
+            evidenceUri: evidenceUri ?? null,
+          },
+        });
 
-      this.telemetryService.increment('pipeline.publish.failed');
-      await this.auditService.record('publish.failed', 'publish_job', job.id, {
-        platform: job.platform,
-        message,
-        evidenceUri,
-      });
+        this.telemetryService.increment('pipeline.publish.failed');
+        await this.auditService.record('publish.failed', 'publish_job', job.id, {
+          platform: job.platform,
+          message,
+          evidenceUri,
+        });
+      }
+    } finally {
+      await this.releasePublishJobLock(lockKey);
     }
   }
 
@@ -513,6 +548,253 @@ export class PublishingService {
     return row;
   }
 
+  async listDeadLetterJobs(
+    limit = 100,
+    status?: DeadLetterStatus,
+  ): Promise<
+    Array<{
+      id: string;
+      publishJobId: string;
+      status: DeadLetterStatus;
+      reason: string;
+      attempts: number;
+      firstFailedAt: Date;
+      movedAt: Date;
+      replayedAt: Date | null;
+      platform: PublishPlatform;
+      targetRef: string;
+      publishStatus: PublishStatus;
+      draftId: string;
+      accountId: string | null;
+    }>
+  > {
+    const rows = await this.prisma.publishDeadLetter.findMany({
+      where: status ? { status } : undefined,
+      include: {
+        publishJob: {
+          select: {
+            id: true,
+            platform: true,
+            targetRef: true,
+            status: true,
+            draftId: true,
+            accountId: true,
+          },
+        },
+      },
+      orderBy: { movedAt: 'desc' },
+      take: Math.max(1, Math.min(limit, 500)),
+    });
+
+    return rows.map((row) => ({
+      id: row.id,
+      publishJobId: row.publishJobId,
+      status: row.status,
+      reason: row.reason,
+      attempts: row.attempts,
+      firstFailedAt: row.firstFailedAt,
+      movedAt: row.movedAt,
+      replayedAt: row.replayedAt,
+      platform: row.publishJob.platform,
+      targetRef: row.publishJob.targetRef,
+      publishStatus: row.publishJob.status,
+      draftId: row.publishJob.draftId,
+      accountId: row.publishJob.accountId,
+    }));
+  }
+
+  async dismissDeadLetter(
+    deadLetterId: string,
+    note?: string,
+  ): Promise<void> {
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { id: deadLetterId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Dead-letter entry not found');
+    }
+
+    await this.prisma.publishDeadLetter.update({
+      where: { id: deadLetterId },
+      data: {
+        status: DeadLetterStatus.DISMISSED,
+        metadata: this.mergeDeadLetterMetadata(existing.metadata, {
+          dismissedAt: new Date().toISOString(),
+          dismissalNote: note ?? null,
+        }),
+      },
+    });
+
+    await this.auditService.record(
+      'publish.dead_letter.dismissed',
+      'publish_dead_letter',
+      deadLetterId,
+      {
+        publishJobId: existing.publishJobId,
+        note: note ?? null,
+      },
+    );
+  }
+
+  async replayDeadLetter(deadLetterId: string): Promise<void> {
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { id: deadLetterId },
+      include: {
+        publishJob: {
+          select: {
+            id: true,
+            status: true,
+            draftId: true,
+            scheduledAt: true,
+          },
+        },
+      },
+    });
+    if (!existing) {
+      throw new NotFoundException('Dead-letter entry not found');
+    }
+    if (existing.status !== DeadLetterStatus.OPEN) {
+      throw new BadRequestException('Only OPEN dead-letter entries can be replayed');
+    }
+    if (existing.publishJob.status !== PublishStatus.FAILED) {
+      throw new BadRequestException(
+        'Replay requires the linked publish job to be in FAILED status',
+      );
+    }
+
+    const replayAt = new Date();
+    await this.prisma.publishJob.update({
+      where: { id: existing.publishJobId },
+      data: {
+        status: PublishStatus.PENDING,
+        attempts: 0,
+        lastError: null,
+        evidenceUri: null,
+        externalPostId: null,
+        scheduledAt: replayAt,
+      },
+    });
+    await this.reconcileDraftPublishState(existing.publishJob.draftId);
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId: existing.publishJobId },
+      {
+        jobId: `${existing.publishJobId}:dlq-replay:${Date.now()}`,
+        delay: 0,
+      },
+    );
+
+    await this.markDeadLetterAsReplayedIfOpen(existing.publishJobId, 'dlq_replay');
+
+    await this.auditService.record(
+      'publish.dead_letter.replayed',
+      'publish_dead_letter',
+      deadLetterId,
+      {
+        publishJobId: existing.publishJobId,
+      },
+    );
+  }
+
+  async replayFailedWindow(input: {
+    fromIso: string;
+    toIso: string;
+    platform?: PublishPlatform;
+  }): Promise<Record<string, unknown>> {
+    const from = new Date(input.fromIso);
+    const to = new Date(input.toIso);
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+      throw new BadRequestException('fromIso/toIso must be valid ISO timestamps');
+    }
+    if (from > to) {
+      throw new BadRequestException('fromIso cannot be after toIso');
+    }
+
+    const batchSize = this.configService.getOrThrow<number>(
+      'PUBLISH_REPLAY_BATCH_SIZE',
+    );
+    const candidates = await this.prisma.publishJob.findMany({
+      where: {
+        status: PublishStatus.FAILED,
+        scheduledAt: {
+          gte: from,
+          lte: to,
+        },
+        ...(input.platform ? { platform: input.platform } : {}),
+      },
+      select: {
+        id: true,
+        draftId: true,
+      },
+      orderBy: { scheduledAt: 'asc' },
+      take: batchSize,
+    });
+
+    let replayed = 0;
+    const replayedDraftIds = new Set<string>();
+    const replayAnchor = Date.now();
+    for (const [index, candidate] of candidates.entries()) {
+      const replayAt = new Date(replayAnchor + index * 250);
+      const updateResult = await this.prisma.publishJob.updateMany({
+        where: {
+          id: candidate.id,
+          status: PublishStatus.FAILED,
+        },
+        data: {
+          status: PublishStatus.PENDING,
+          attempts: 0,
+          lastError: null,
+          evidenceUri: null,
+          externalPostId: null,
+          scheduledAt: replayAt,
+        },
+      });
+      if (updateResult.count === 0) {
+        continue;
+      }
+
+      await this.publishQueue.add(
+        PUBLISH_JOB_EXECUTE,
+        { publishJobId: candidate.id },
+        {
+          jobId: `${candidate.id}:window-replay:${Date.now()}:${index}`,
+          delay: Math.max(0, replayAt.getTime() - Date.now()),
+        },
+      );
+      await this.markDeadLetterAsReplayedIfOpen(candidate.id, 'window_replay');
+      replayedDraftIds.add(candidate.draftId);
+      replayed += 1;
+    }
+
+    for (const draftId of replayedDraftIds) {
+      await this.reconcileDraftPublishState(draftId);
+    }
+
+    await this.auditService.record(
+      'publish.failed_window.replayed',
+      'system',
+      'publish_window',
+      {
+        fromIso: from.toISOString(),
+        toIso: to.toISOString(),
+        platform: input.platform ?? null,
+        matched: candidates.length,
+        replayed,
+        replayBatchSize: batchSize,
+      },
+    );
+
+    return {
+      fromIso: from.toISOString(),
+      toIso: to.toISOString(),
+      platform: input.platform ?? null,
+      matched: candidates.length,
+      replayed,
+      replayBatchSize: batchSize,
+    };
+  }
+
   async retryPublishJob(publishJobId: string): Promise<void> {
     const maxRetries = this.configService.getOrThrow<number>(
       'PUBLISH_MAX_RETRIES',
@@ -537,12 +819,15 @@ export class PublishingService {
         `Retry limit reached (${maxRetries}) for publish job`,
       );
     }
+    const retryDelayMs =
+      this.configService.getOrThrow<number>('PUBLISH_RETRY_DELAY_SECONDS') *
+      1000;
 
     const job = await this.prisma.publishJob.update({
       where: { id: publishJobId },
       data: {
         status: PublishStatus.PENDING,
-        scheduledAt: new Date(Date.now() + 30_000),
+        scheduledAt: new Date(Date.now() + retryDelayMs),
         lastError: null,
       },
     });
@@ -553,9 +838,10 @@ export class PublishingService {
       { publishJobId },
       {
         jobId: `${job.id}:retry:${Date.now()}`,
-        delay: 30_000,
+        delay: retryDelayMs,
       },
     );
+    await this.markDeadLetterAsReplayedIfOpen(job.id, 'retry');
 
     await this.auditService.record(
       'publish.retry.queued',
@@ -651,6 +937,7 @@ export class PublishingService {
         delay: 0,
       },
     );
+    await this.markDeadLetterAsReplayedIfOpen(job.id, 'rerun_now');
 
     await this.auditService.record(
       'publish.rerun_now.queued',
@@ -1096,6 +1383,108 @@ export class PublishingService {
     return true;
   }
 
+  private async moveToDeadLetterIfExhausted(input: {
+    publishJobId: string;
+    attempts: number;
+    reason: string;
+    metadata?: Prisma.JsonObject;
+  }): Promise<void> {
+    const deadLetterEnabled = this.configService.getOrThrow<boolean>(
+      'PUBLISH_DEAD_LETTER_ENABLED',
+    );
+    if (!deadLetterEnabled) {
+      return;
+    }
+
+    const maxRetries = this.configService.getOrThrow<number>('PUBLISH_MAX_RETRIES');
+    if (input.attempts < maxRetries) {
+      return;
+    }
+
+    const now = new Date();
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { publishJobId: input.publishJobId },
+      select: {
+        metadata: true,
+        firstFailedAt: true,
+      },
+    });
+
+    await this.prisma.publishDeadLetter.upsert({
+      where: { publishJobId: input.publishJobId },
+      update: {
+        status: DeadLetterStatus.OPEN,
+        reason: input.reason,
+        attempts: input.attempts,
+        movedAt: now,
+        replayedAt: null,
+        metadata: this.mergeDeadLetterMetadata(existing?.metadata, input.metadata),
+      },
+      create: {
+        publishJobId: input.publishJobId,
+        status: DeadLetterStatus.OPEN,
+        reason: input.reason,
+        attempts: input.attempts,
+        firstFailedAt: existing?.firstFailedAt ?? now,
+        movedAt: now,
+        metadata: input.metadata ?? {},
+      },
+    });
+
+    this.telemetryService.increment('pipeline.publish.dead_lettered');
+    await this.auditService.record(
+      'publish.dead_lettered',
+      'publish_job',
+      input.publishJobId,
+      {
+        attempts: input.attempts,
+        reason: input.reason,
+      },
+    );
+  }
+
+  private async markDeadLetterAsReplayedIfOpen(
+    publishJobId: string,
+    replaySource: 'retry' | 'rerun_now' | 'dlq_replay' | 'window_replay',
+  ): Promise<void> {
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { publishJobId },
+      select: {
+        id: true,
+        status: true,
+        metadata: true,
+      },
+    });
+    if (!existing || existing.status !== DeadLetterStatus.OPEN) {
+      return;
+    }
+
+    await this.prisma.publishDeadLetter.update({
+      where: { publishJobId },
+      data: {
+        status: DeadLetterStatus.REPLAYED,
+        replayedAt: new Date(),
+        metadata: this.mergeDeadLetterMetadata(existing.metadata, {
+          replaySource,
+        }),
+      },
+    });
+  }
+
+  private mergeDeadLetterMetadata(
+    existing: Prisma.JsonValue | null | undefined,
+    patch: Prisma.JsonObject | undefined,
+  ): Prisma.JsonObject {
+    const base =
+      existing && typeof existing === 'object' && !Array.isArray(existing)
+        ? (existing as Prisma.JsonObject)
+        : {};
+    return {
+      ...base,
+      ...(patch ?? {}),
+    };
+  }
+
   private scoreTelegramCandidate(seed: string): number {
     let score = 0.4;
     if (/stocks?|crypto|invest|trade|alpha/i.test(seed)) {
@@ -1108,6 +1497,19 @@ export class PublishingService {
       score -= 0.2;
     }
     return Math.max(0, Math.min(1, score));
+  }
+
+  private async acquirePublishJobLock(lockKey: string): Promise<boolean> {
+    const result = await this.prisma.$queryRaw<Array<{ locked: boolean }>>`
+      SELECT pg_try_advisory_lock(hashtext(${lockKey})::bigint) AS locked
+    `;
+    return result[0]?.locked === true;
+  }
+
+  private async releasePublishJobLock(lockKey: string): Promise<void> {
+    await this.prisma.$queryRaw`
+      SELECT pg_advisory_unlock(hashtext(${lockKey})::bigint)
+    `;
   }
 }
 

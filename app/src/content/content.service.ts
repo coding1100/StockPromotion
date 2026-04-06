@@ -22,11 +22,24 @@ export class ContentService {
   ): Promise<{ createdDraftIds: string[]; autoApprovedDraftIds: string[] }> {
     const createdDraftIds: string[] = [];
     const autoApprovedDraftIds: string[] = [];
+    const processedSymbols = new Set<string>();
     const minAutoApprovalScore = this.configService.getOrThrow<number>(
       'AUTO_APPROVAL_MIN_SCORE',
     );
+    const promptVersion = this.configService.getOrThrow<string>(
+      'CONTENT_PROMPT_VERSION',
+    );
+    const disclosureVersion = this.configService.getOrThrow<string>(
+      'CONTENT_DISCLOSURE_VERSION',
+    );
 
-    for (const trend of trends) {
+    const prioritizedTrends = [...trends].sort((a, b) => b.score - a.score);
+    for (const trend of prioritizedTrends) {
+      if (processedSymbols.has(trend.symbol)) {
+        continue;
+      }
+      processedSymbols.add(trend.symbol);
+
       const evidenceEventIds = this.extractEvidenceIds(trend.evidence);
       const evidenceEvents = await this.prisma.sourceEvent.findMany({
         where: {
@@ -69,7 +82,8 @@ export class ContentService {
           policyFlags: policy.flags,
           provider: generated.provider,
           model: generated.model,
-          promptVersion: 'phase1-v1',
+          promptVersion,
+          disclosureVersion,
           status: autoApproved
             ? DraftStatus.AUTO_APPROVED
             : DraftStatus.FLAGGED,
@@ -89,6 +103,7 @@ export class ContentService {
         minAutoApprovalScore,
         policyAutoApproved: policy.autoApproved,
         riskLevel: row.riskLevel,
+        disclosureVersion: row.disclosureVersion,
         status: row.status,
       });
     }
@@ -102,6 +117,7 @@ export class ContentService {
       symbol: string;
       status: DraftStatus;
       riskLevel: string;
+      disclosureVersion: string;
       createdAt: Date;
       body: string;
     }>
@@ -122,6 +138,7 @@ export class ContentService {
       symbol: row.trendTopic.symbol,
       status: row.status,
       riskLevel: row.riskLevel,
+      disclosureVersion: row.disclosureVersion,
       createdAt: row.createdAt,
       body: row.body,
     }));
