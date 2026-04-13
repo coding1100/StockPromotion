@@ -9,6 +9,14 @@ describe('OrchestrationService', () => {
 
     const service = new OrchestrationService(
       {
+        get: jest.fn().mockImplementation((key: string) => {
+          if (key === 'PIPELINE_MIN_ACTIVE_SOURCES') {
+            return 2;
+          }
+          return undefined;
+        }),
+      } as never,
+      {
         $queryRaw: queryRaw,
       } as never,
       {

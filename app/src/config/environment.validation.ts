@@ -39,6 +39,17 @@ export const envValidationSchema = Joi.object({
   REDDIT_RAPIDAPI_TIME_VALUE: Joi.string()
     .valid('hour', 'day', 'week', 'month', 'year', 'all')
     .default('day'),
+  REDDIT_RAPIDAPI_QUERY_PARAM: Joi.string().default('q'),
+  REDDIT_QUERY_KEYWORDS: Joi.string().allow('').optional(),
+  REDDIT_QUERY_KEYWORD_LIMIT: Joi.number().integer().min(1).max(100).default(18),
+  REDDIT_REQUIRE_KEYWORD_MATCH: Joi.boolean().default(false),
+  REDDIT_ENABLE_WATCHLIST_KEYWORDS: Joi.boolean().default(true),
+  REDDIT_ENABLE_THEME_KEYWORDS: Joi.boolean().default(true),
+  REDDIT_EMPTY_RETRY_ATTEMPTS: Joi.number().integer().min(0).max(10).default(2),
+  REDDIT_EMPTY_RETRY_DELAY_MS: Joi.number().integer().min(0).max(10000).default(250),
+  REDDIT_RETRY_KEYWORD_SLICE_SIZE: Joi.number().integer().min(1).max(50).default(8),
+  REDDIT_EMPTY_RETRY_TIME_VALUES: Joi.string().default('day,week,month'),
+  REDDIT_MIN_QUALIFIED_POSTS: Joi.number().integer().min(1).max(100).default(1),
   REDDIT_SYNC_TREND_WINDOW: Joi.boolean().default(true),
   REDDIT_RAPIDAPI_ITEMS_PATH: Joi.string().default('data.children'),
   REDDIT_RAPIDAPI_ITEM_DATA_PATH: Joi.string().default('data'),
@@ -83,6 +94,7 @@ export const envValidationSchema = Joi.object({
 
   // --- PIPELINE & QUOTAS ---
   PIPELINE_CRON: Joi.string().default('*/5 * * * *'),
+  PIPELINE_MIN_ACTIVE_SOURCES: Joi.number().integer().min(1).max(3).default(2),
   TREND_WINDOWS_HOURS: Joi.string().default('1,6,24'),
   TREND_MIN_WEIGHTED_MENTIONS: Joi.number().min(0).default(1),
   TREND_MIN_UNIQUE_EVENTS: Joi.number().integer().min(1).default(1),
@@ -91,6 +103,8 @@ export const envValidationSchema = Joi.object({
   AUTO_APPROVAL_MIN_SCORE: Joi.number().default(0.75),
   CONTENT_PROMPT_VERSION: Joi.string().default('phase1-v1'),
   CONTENT_DISCLOSURE_VERSION: Joi.string().default('v1'),
+  CONTENT_VARIATION_MAX_ATTEMPTS: Joi.number().integer().min(1).max(10).default(3),
+  CONTENT_MAX_SIMILARITY: Joi.number().min(0.5).max(0.99).default(0.72),
   PUBLISH_COOLDOWN_MINUTES: Joi.number().integer().min(1).default(90),
   PUBLISH_MAX_RETRIES: Joi.number().integer().min(1).max(10).default(3),
   PUBLISH_RETRY_DELAY_SECONDS: Joi.number().integer().min(5).max(600).default(30),

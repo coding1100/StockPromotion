@@ -43,6 +43,7 @@ type RedditRapidApiConfig = {
   limitParam: string;
   timeParam: string;
   timeValue: string;
+  queryParam: string;
   syncTrendWindow: boolean;
   itemsPath: string;
   itemDataPath: string;
@@ -294,23 +295,97 @@ export class IngestionService {
     const fetchLimit =
       this.configService.getOrThrow<number>('REDDIT_FETCH_LIMIT');
     const timeRange = this.resolveRedditTimeRange(rapidConfig);
+    const keywords = this.resolveRedditQueryKeywords();
+    const requireKeywordMatch =
+      this.configService.get<boolean>('REDDIT_REQUIRE_KEYWORD_MATCH') === true;
     let ingested = 0;
+    let successfulRequests = 0;
+    const requestErrors: string[] = [];
 
     for (const subreddit of subreddits) {
+      try {
+        const selectedRows = await this.fetchMeaningfulRedditRows({
+          rapidConfig,
+          subreddit,
+          fetchLimit,
+          primaryTimeRange: timeRange,
+          keywords,
+          requireKeywordMatch,
+        });
+        successfulRequests += 1;
+        const rows = selectedRows.map((item) =>
+          this.mapRedditEvent(item, false),
+        );
+
+        if (rows.length === 0) {
+          continue;
+        }
+
+        const result = await this.prisma.sourceEvent.createMany({
+          data: rows,
+          skipDuplicates: true,
+        });
+        ingested += result.count;
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'reddit_request_failed';
+        requestErrors.push(`${subreddit}: ${message}`);
+      }
+    }
+
+    if (successfulRequests === 0 && requestErrors.length > 0) {
+      throw new Error(
+        `reddit_ingestion_failed (${requestErrors.length} requests): ${requestErrors
+          .slice(0, 3)
+          .join(' | ')}`,
+      );
+    }
+
+    return ingested;
+  }
+
+  private async fetchMeaningfulRedditRows(input: {
+    rapidConfig: RedditRapidApiConfig;
+    subreddit: string;
+    fetchLimit: number;
+    primaryTimeRange: string;
+    keywords: string[];
+    requireKeywordMatch: boolean;
+  }): Promise<Array<Record<string, unknown>>> {
+    const minQualifiedPosts = Math.max(
+      1,
+      this.configService.get<number>('REDDIT_MIN_QUALIFIED_POSTS') ?? 1,
+    );
+    const retryDelayMs = Math.max(
+      0,
+      this.configService.get<number>('REDDIT_EMPTY_RETRY_DELAY_MS') ?? 250,
+    );
+    const plans = this.buildRedditFetchPlans(
+      input.primaryTimeRange,
+      input.keywords,
+    );
+
+    let bestRows: Array<Record<string, unknown>> = [];
+
+    for (let index = 0; index < plans.length; index += 1) {
+      const plan = plans[index];
+      const keywordQuery = plan.keywords.join(' OR ');
       const requestUrl = this.buildRapidApiUrl(
-        rapidConfig.baseUrl,
-        rapidConfig.pathTemplate,
-        subreddit,
-        rapidConfig.timeParam,
-        timeRange,
+        input.rapidConfig.baseUrl,
+        input.rapidConfig.pathTemplate,
+        input.subreddit,
+        input.rapidConfig.timeParam,
+        plan.timeRange,
+        keywordQuery,
+        input.rapidConfig.queryParam,
       );
       const request: AxiosRequestConfig = {
-        method: rapidConfig.method,
+        method: input.rapidConfig.method,
         url: requestUrl,
-        params: { [rapidConfig.limitParam]: fetchLimit },
+        params: { [input.rapidConfig.limitParam]: input.fetchLimit },
         headers: {
-          'X-RapidAPI-Key': rapidConfig.key,
-          'X-RapidAPI-Host': rapidConfig.host,
+          'X-RapidAPI-Key': input.rapidConfig.key,
+          'X-RapidAPI-Host': input.rapidConfig.host,
         },
       };
 
@@ -329,23 +404,38 @@ export class IngestionService {
 
       const payloadRows = this.extractRapidApiItems(
         response.data,
-        rapidConfig.itemsPath,
-        rapidConfig.itemDataPath,
+        input.rapidConfig.itemsPath,
+        input.rapidConfig.itemDataPath,
       );
-      const rows = payloadRows.map((item) => this.mapRedditEvent(item, false));
+      const rankedPayloadRows = this.rankRedditItemsByKeywordRelevance(
+        payloadRows,
+        plan.keywords,
+      );
+      const keywordFilteredRows =
+        input.requireKeywordMatch && plan.keywords.length > 0
+          ? rankedPayloadRows.filter(
+              (item) => this.asNumber(item.keywordMatchCount) > 0,
+            )
+          : rankedPayloadRows;
 
-      if (rows.length === 0) {
-        continue;
+      const meaningfulRows = keywordFilteredRows
+        .filter((item) => this.isMeaningfulRedditPayload(item))
+        .slice(0, input.fetchLimit);
+
+      if (meaningfulRows.length > bestRows.length) {
+        bestRows = meaningfulRows;
       }
 
-      const result = await this.prisma.sourceEvent.createMany({
-        data: rows,
-        skipDuplicates: true,
-      });
-      ingested += result.count;
+      if (meaningfulRows.length >= minQualifiedPosts) {
+        return meaningfulRows;
+      }
+
+      if (index < plans.length - 1 && retryDelayMs > 0) {
+        await this.sleep(retryDelayMs);
+      }
     }
 
-    return ingested;
+    return bestRows;
   }
 
   private async ingestMockReddit(): Promise<number> {
@@ -453,68 +543,89 @@ export class IngestionService {
       .filter(Boolean);
 
     let ingested = 0;
+    let successfulRequests = 0;
+    const requestErrors: string[] = [];
     for (const symbol of symbols) {
-      const requestUrl = this.resolveStocktwitsSignalUrl(apiUrl, symbol);
-      const response = await executeWithRetry(
-        () =>
-          axios.get<{
-            messages?: Array<Record<string, unknown>>;
-          }>(requestUrl, {
-            timeout: this.requestTimeoutMs,
-          }),
-        {
-          maxRetries: this.maxRetries,
-          baseDelayMs: 200,
-          maxDelayMs: 2000,
-        },
-      );
-      const messages = response.data.messages ?? [];
-
-      const rows = messages.slice(0, 20).map((message) => {
-        const body = this.asString(message.body);
-        const joinedSymbols = [
-          symbol,
-          ...extractSymbols(body, {
-            allowedSymbols: this.watchlistSymbols,
-          }).filter((value) => value !== symbol),
-        ];
-        const sourceUrl = this.asString(message.url);
-        const author = this.asString(
-          (message.user as { username?: unknown })?.username,
+      try {
+        const requestUrl = this.resolveStocktwitsSignalUrl(apiUrl, symbol);
+        const response = await executeWithRetry(
+          () =>
+            axios.get<{
+              messages?: Array<Record<string, unknown>>;
+            }>(requestUrl, {
+              timeout: this.requestTimeoutMs,
+              headers: {
+                Accept: 'application/json',
+                'User-Agent': 'stock-promo-bot/1.0',
+              },
+            }),
+          {
+            maxRetries: this.maxRetries,
+            baseDelayMs: 200,
+            maxDelayMs: 2000,
+          },
         );
-        const createdRaw = message.created_at;
-        const occurredAt = this.asDate(createdRaw);
+        successfulRequests += 1;
+        const messages = response.data.messages ?? [];
 
-        return {
-          source: SourceType.STOCKTWITS_SIGNAL,
-          externalId: this.resolveExternalId({
+        const rows = messages.slice(0, 20).map((message) => {
+          const body = this.asString(message.body);
+          const joinedSymbols = [
+            symbol,
+            ...extractSymbols(body, {
+              allowedSymbols: this.watchlistSymbols,
+            }).filter((value) => value !== symbol),
+          ];
+          const sourceUrl = this.asString(message.url);
+          const author = this.asString(
+            (message.user as { username?: unknown })?.username,
+          );
+          const createdRaw = message.created_at;
+          const occurredAt = this.asDate(createdRaw);
+
+          return {
             source: SourceType.STOCKTWITS_SIGNAL,
+            externalId: this.resolveExternalId({
+              source: SourceType.STOCKTWITS_SIGNAL,
+              sourceUrl,
+              title: '',
+              body,
+              author,
+              createdRaw,
+              explicitExternalId: this.asString(message.id),
+            }),
             sourceUrl,
-            title: '',
-            body,
+            title: null,
+            body: body.slice(0, 6000),
+            symbols: joinedSymbols,
+            sentimentScore: null,
+            engagementScore: this.asNumber(message.likes),
             author,
-            createdRaw,
-            explicitExternalId: this.asString(message.id),
-          }),
-          sourceUrl,
-          title: null,
-          body: body.slice(0, 6000),
-          symbols: joinedSymbols,
-          sentimentScore: null,
-          engagementScore: this.asNumber(message.likes),
-          author,
-          rawPayload: message as Prisma.JsonObject,
-          occurredAt,
-        };
-      });
-
-      if (rows.length > 0) {
-        const result = await this.prisma.sourceEvent.createMany({
-          data: rows,
-          skipDuplicates: true,
+            rawPayload: message as Prisma.JsonObject,
+            occurredAt,
+          };
         });
-        ingested += result.count;
+
+        if (rows.length > 0) {
+          const result = await this.prisma.sourceEvent.createMany({
+            data: rows,
+            skipDuplicates: true,
+          });
+          ingested += result.count;
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'stocktwits_request_failed';
+        requestErrors.push(`${symbol}: ${message}`);
       }
+    }
+
+    if (successfulRequests === 0 && requestErrors.length > 0) {
+      throw new Error(
+        `stocktwits_signal_ingestion_failed (${requestErrors.length} requests): ${requestErrors
+          .slice(0, 3)
+          .join(' | ')}`,
+      );
     }
 
     return ingested;
@@ -848,6 +959,9 @@ export class IngestionService {
       timeValue: this.configService
         .getOrThrow<string>('REDDIT_RAPIDAPI_TIME_VALUE')
         .trim(),
+      queryParam:
+        this.configService.get<string>('REDDIT_RAPIDAPI_QUERY_PARAM')?.trim() ||
+        'q',
       syncTrendWindow:
         this.configService.get<boolean>('REDDIT_SYNC_TREND_WINDOW') !== false,
       itemsPath: this.configService
@@ -865,18 +979,259 @@ export class IngestionService {
     subreddit: string,
     timeParam: string,
     timeRange: string,
+    keywordQuery?: string,
+    queryParam?: string,
   ): string {
-    const populatedPath = pathTemplate.replaceAll(
-      '{subreddit}',
-      encodeURIComponent(subreddit),
-    );
+    const hasKeywordPlaceholder =
+      pathTemplate.includes('{keyword}') || /%7Bkeyword%7D/i.test(pathTemplate);
+    let populatedPath = pathTemplate
+      .replaceAll('{subreddit}', encodeURIComponent(subreddit))
+      .replace(/%7Bsubreddit%7D/gi, encodeURIComponent(subreddit));
+
+    if (keywordQuery && hasKeywordPlaceholder) {
+      populatedPath = populatedPath
+        .replaceAll('{keyword}', encodeURIComponent(keywordQuery))
+        .replace(/%7Bkeyword%7D/gi, encodeURIComponent(keywordQuery));
+    }
+
     const url = new URL(populatedPath, baseUrl);
 
     if (timeParam) {
       url.searchParams.set(timeParam, timeRange);
     }
+    if (
+      keywordQuery &&
+      queryParam &&
+      queryParam.trim().length > 0 &&
+      !hasKeywordPlaceholder
+    ) {
+      url.searchParams.set(queryParam, keywordQuery);
+    }
 
     return url.toString();
+  }
+
+  private buildRedditFetchPlans(
+    primaryTimeRange: string,
+    keywords: string[],
+  ): Array<{ timeRange: string; keywords: string[] }> {
+    const maxExtraAttempts = Math.max(
+      0,
+      this.configService.get<number>('REDDIT_EMPTY_RETRY_ATTEMPTS') ?? 2,
+    );
+    const maxAttempts = 1 + maxExtraAttempts;
+    const keywordSliceSize = Math.max(
+      1,
+      this.configService.get<number>('REDDIT_RETRY_KEYWORD_SLICE_SIZE') ?? 8,
+    );
+    const retryTimeValues = (
+      this.configService.get<string>('REDDIT_EMPTY_RETRY_TIME_VALUES') ||
+      'day,week,month'
+    )
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    const timeCandidates = [
+      primaryTimeRange,
+      ...retryTimeValues.filter((value) => value !== primaryTimeRange),
+    ];
+    const keywordSlices = this.sliceKeywords(keywords, keywordSliceSize);
+    const keywordPlans = keywordSlices.length > 0 ? keywordSlices : [[]];
+
+    const plans: Array<{ timeRange: string; keywords: string[] }> = [];
+    const seen = new Set<string>();
+
+    const pushPlan = (timeRange: string, queryKeywords: string[]) => {
+      const signature = `${timeRange}|${queryKeywords.join(',')}`;
+      if (seen.has(signature)) {
+        return;
+      }
+      seen.add(signature);
+      plans.push({
+        timeRange,
+        keywords: queryKeywords,
+      });
+    };
+
+    pushPlan(primaryTimeRange, keywords);
+    for (const slice of keywordPlans) {
+      pushPlan(primaryTimeRange, slice);
+    }
+    pushPlan(primaryTimeRange, []);
+
+    for (const time of timeCandidates) {
+      for (const slice of keywordPlans) {
+        pushPlan(time, slice);
+      }
+      pushPlan(time, []);
+    }
+
+    return plans.slice(0, maxAttempts);
+  }
+
+  private resolveRedditQueryKeywords(): string[] {
+    const explicit = (this.configService.get<string>('REDDIT_QUERY_KEYWORDS') || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    const includeWatchlistKeywords =
+      this.configService.get<boolean>('REDDIT_ENABLE_WATCHLIST_KEYWORDS') !==
+      false;
+    const includeThemeKeywords =
+      this.configService.get<boolean>('REDDIT_ENABLE_THEME_KEYWORDS') !== false;
+
+    const watchlist = includeWatchlistKeywords
+      ? Array.from(this.watchlistSymbols).flatMap((symbol) => [
+          symbol,
+          `$${symbol}`,
+        ])
+      : [];
+
+    const themeKeywords = includeThemeKeywords
+      ? [
+          'earnings',
+          'guidance',
+          'breakout',
+          'options flow',
+          'short interest',
+          'volume spike',
+          'fed',
+          'rate cut',
+          'tariff',
+          'ai',
+          'semiconductor',
+          'crypto',
+        ]
+      : [];
+
+    const maxKeywords = Math.max(
+      1,
+      this.configService.get<number>('REDDIT_QUERY_KEYWORD_LIMIT') ?? 18,
+    );
+
+    const merged: string[] = [];
+    const seen = new Set<string>();
+    for (const keyword of [...explicit, ...watchlist, ...themeKeywords]) {
+      const normalized = keyword.toLowerCase();
+      if (!normalized || seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      merged.push(keyword);
+      if (merged.length >= maxKeywords) {
+        break;
+      }
+    }
+
+    return merged;
+  }
+
+  private rankRedditItemsByKeywordRelevance(
+    rows: Array<Record<string, unknown>>,
+    keywords: string[],
+  ): Array<Record<string, unknown>> {
+    if (keywords.length === 0) {
+      return rows;
+    }
+
+    return rows
+      .map((item) => {
+        const title = this.asString(item.title);
+        const body =
+          this.asString(item.selftext) ||
+          this.asString(item.body) ||
+          this.asString(item.text);
+        const match = this.matchKeywords(`${title}\n${body}`, keywords);
+
+        return {
+          ...item,
+          keywordMatchCount: match.length,
+          keywordMatches: match,
+        };
+      })
+      .sort((left, right) => {
+        const leftRow = left as Record<string, unknown>;
+        const rightRow = right as Record<string, unknown>;
+        const leftMatches = this.asNumber(left.keywordMatchCount);
+        const rightMatches = this.asNumber(right.keywordMatchCount);
+        if (rightMatches !== leftMatches) {
+          return rightMatches - leftMatches;
+        }
+
+        const leftScore =
+          this.asNumber(leftRow.score) ||
+          this.asNumber(leftRow.ups) ||
+          this.asNumber(leftRow.upvotes);
+        const rightScore =
+          this.asNumber(rightRow.score) ||
+          this.asNumber(rightRow.ups) ||
+          this.asNumber(rightRow.upvotes);
+        return rightScore - leftScore;
+      });
+  }
+
+  private matchKeywords(text: string, keywords: string[]): string[] {
+    const normalized = ` ${text.toLowerCase().replace(/[^a-z0-9$]+/g, ' ')} `;
+    const matches: string[] = [];
+
+    for (const keyword of keywords) {
+      const normalizedKeyword = keyword.toLowerCase().trim();
+      if (!normalizedKeyword) {
+        continue;
+      }
+
+      const compactKeyword = normalizedKeyword.replace(/\s+/g, ' ');
+      const keywordHasSpace = compactKeyword.includes(' ');
+      const hasMatch = keywordHasSpace
+        ? normalized.includes(` ${compactKeyword} `)
+        : normalized.includes(` ${compactKeyword} `);
+
+      if (hasMatch) {
+        matches.push(keyword);
+      }
+    }
+
+    return matches;
+  }
+
+  private isMeaningfulRedditPayload(item: Record<string, unknown>): boolean {
+    const title = this.asString(item.title);
+    const body =
+      this.asString(item.selftext) ||
+      this.asString(item.body) ||
+      this.asString(item.text);
+    const combined = `${title}\n${body}`.trim();
+    if (combined.length < 24) {
+      return false;
+    }
+
+    const author = this.asString(item.author).toLowerCase();
+    if (author === '[deleted]' || author === 'automoderator') {
+      return false;
+    }
+
+    const symbols = extractSymbols(combined, {
+      allowedSymbols: this.watchlistSymbols,
+    });
+    return symbols.length > 0;
+  }
+
+  private sliceKeywords(keywords: string[], chunkSize: number): string[][] {
+    if (keywords.length === 0) {
+      return [];
+    }
+
+    const chunks: string[][] = [];
+    for (let index = 0; index < keywords.length; index += chunkSize) {
+      chunks.push(keywords.slice(index, index + chunkSize));
+    }
+    return chunks;
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private resolveRedditTimeRange(config: RedditRapidApiConfig): string {

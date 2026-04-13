@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { LlmService } from '../llm/llm.service';
 import { PolicyService } from '../policy/policy.service';
 import { AuditService } from '../audit/audit.service';
+import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
 
 @Injectable()
 export class ContentService {
@@ -32,6 +33,12 @@ export class ContentService {
     const disclosureVersion = this.configService.getOrThrow<string>(
       'CONTENT_DISCLOSURE_VERSION',
     );
+    const maxVariationAttempts = this.configService.getOrThrow<number>(
+      'CONTENT_VARIATION_MAX_ATTEMPTS',
+    );
+    const maxSimilarity = this.configService.getOrThrow<number>(
+      'CONTENT_MAX_SIMILARITY',
+    );
 
     const prioritizedTrends = [...trends].sort((a, b) => b.score - a.score);
     for (const trend of prioritizedTrends) {
@@ -50,27 +57,73 @@ export class ContentService {
         take: 6,
       });
 
-      const generated = await this.llmService.generateDraft({
-        symbol: trend.symbol,
-        assetClass: trend.assetClass,
-        score: trend.score,
-        mentionCount: trend.mentionCount,
-        evidenceSummary: evidenceEvents.map(
-          (event) => `${event.source}: ${event.body.slice(0, 120)}`,
-        ),
+      const recentDraftBodies = await this.prisma.contentDraft.findMany({
+        where: {
+          trendTopic: {
+            symbol: trend.symbol,
+          },
+        },
+        select: {
+          body: true,
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+        take: 12,
       });
 
-      const policy = this.policyService.evaluateDraft(generated.body);
-      const contentHash = this.hashContent(generated.title, policy.body);
-      const autoApproved =
-        policy.autoApproved && trend.score >= minAutoApprovalScore;
+      const evidenceSummary = evidenceEvents.map(
+        (event) => `${event.source}: ${event.body.slice(0, 120)}`,
+      );
 
-      const existing = await this.prisma.contentDraft.findUnique({
-        where: { contentHash },
-      });
-      if (existing) {
+      let accepted:
+        | {
+            generated: Awaited<ReturnType<LlmService['generateDraft']>>;
+            policy: ReturnType<PolicyService['evaluateDraft']>;
+            contentHash: string;
+          }
+        | null = null;
+
+      for (let attempt = 0; attempt < maxVariationAttempts; attempt += 1) {
+        const generated = await this.llmService.generateDraft({
+          symbol: trend.symbol,
+          assetClass: trend.assetClass,
+          score: trend.score,
+          mentionCount: trend.mentionCount,
+          evidenceSummary,
+        });
+        const policy = this.policyService.evaluateDraft(generated.body);
+        const contentHash = this.hashContent(generated.title, policy.body);
+
+        const exactDuplicate = await this.prisma.contentDraft.findUnique({
+          where: { contentHash },
+        });
+        if (exactDuplicate) {
+          continue;
+        }
+
+        const tooSimilar = recentDraftBodies.some((row) => {
+          return calculateContentSimilarity(row.body, policy.body) >= maxSimilarity;
+        });
+        if (tooSimilar) {
+          continue;
+        }
+
+        accepted = {
+          generated,
+          policy,
+          contentHash,
+        };
+        break;
+      }
+
+      if (!accepted) {
         continue;
       }
+
+      const { generated, policy, contentHash } = accepted;
+      const autoApproved =
+        policy.autoApproved && trend.score >= minAutoApprovalScore;
 
       const row = await this.prisma.contentDraft.create({
         data: {
