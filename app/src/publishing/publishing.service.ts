@@ -30,10 +30,12 @@ import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
 import { TelemetryService } from '../telemetry/telemetry.service';
 import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
+import { MANDATORY_DISCLAIMER } from '../common/constants/policy.constants';
 
 @Injectable()
 export class PublishingService {
   private static readonly PUBLISH_LOCK_KEY_PREFIX = 'publish-job';
+  private static readonly STOCKTWITS_TOP_SYMBOL_LIMIT = 10;
   private readonly logger = new Logger(PublishingService.name);
 
   constructor(
@@ -225,8 +227,12 @@ export class PublishingService {
     const telegramPolicy = await this.accountsService.getRotationPolicy(
       AccountPlatform.TELEGRAM,
     );
+    const stocktwitsTrendingSymbols =
+      await this.resolveStocktwitsTrendingSymbolsForCycle();
 
     let scheduledCount = 0;
+    let stocktwitsScheduledCount = 0;
+    let telegramScheduledCount = 0;
     for (const [draftIndex, draftId] of draftIds.entries()) {
       const draft = await this.prisma.contentDraft.findUnique({
         where: { id: draftId },
@@ -235,22 +241,49 @@ export class PublishingService {
         continue;
       }
 
-      const stocktwitsAccount = await this.accountsService.getEligibleAccount(
-        AccountPlatform.STOCKTWITS,
-        {
-          scheduledAt: this.resolveScheduledTime(stocktwitsPolicy, draftIndex),
-        },
-      );
-      if (stocktwitsAccount) {
-        scheduledCount += await this.createAndQueuePublishJob({
-          draftId,
-          platform: PublishPlatform.STOCKTWITS,
-          accountId: stocktwitsAccount.id,
-          targetRef: stocktwitsAccount.accountHandle,
-          scheduleAt: this.resolveScheduledTime(stocktwitsPolicy, draftIndex),
-          cooldownMinutes: publishCooldown,
-          similarityThreshold: stocktwitsPolicy.duplicateSimilarityThreshold,
-        });
+      if (stocktwitsTrendingSymbols.length > 0) {
+        const stocktwitsOffsetBase = draftIndex * stocktwitsTrendingSymbols.length;
+        for (const [symbolIndex, symbol] of stocktwitsTrendingSymbols.entries()) {
+          const scheduleAt = this.resolveScheduledTime(
+            stocktwitsPolicy,
+            stocktwitsOffsetBase + symbolIndex,
+          );
+          const stocktwitsAccount = await this.accountsService.getEligibleAccount(
+            AccountPlatform.STOCKTWITS,
+            {
+              scheduledAt: scheduleAt,
+            },
+          );
+          if (!stocktwitsAccount) {
+            continue;
+          }
+
+          const createdCount = await this.createAndQueuePublishJob({
+            draftId,
+            platform: PublishPlatform.STOCKTWITS,
+            accountId: stocktwitsAccount.id,
+            targetRef: symbol,
+            scheduleAt,
+            cooldownMinutes: publishCooldown,
+            similarityThreshold: stocktwitsPolicy.duplicateSimilarityThreshold,
+          });
+          scheduledCount += createdCount;
+          stocktwitsScheduledCount += createdCount;
+
+          if (createdCount > 0) {
+            await this.auditService.record(
+              'stocktwits.trending_job.queued',
+              'draft',
+              draftId,
+              {
+                symbol,
+                accountId: stocktwitsAccount.id,
+                scheduleAt: scheduleAt.toISOString(),
+                source: 'trending_all_top10',
+              },
+            );
+          }
+        }
       }
 
       const telegramTargets = await this.resolveTelegramTargets();
@@ -269,7 +302,7 @@ export class PublishingService {
           continue;
         }
 
-        scheduledCount += await this.createAndQueuePublishJob({
+        const createdCount = await this.createAndQueuePublishJob({
           draftId,
           platform: PublishPlatform.TELEGRAM,
           accountId: telegramAccount.id,
@@ -278,8 +311,14 @@ export class PublishingService {
           cooldownMinutes: publishCooldown,
           similarityThreshold: telegramPolicy.duplicateSimilarityThreshold,
         });
+        scheduledCount += createdCount;
+        telegramScheduledCount += createdCount;
       }
     }
+
+    this.logger.log(
+      `Scheduled publish jobs -> stocktwits:${stocktwitsScheduledCount}, telegram:${telegramScheduledCount}, total:${scheduledCount}. StockTwits symbols considered: ${stocktwitsTrendingSymbols.join(', ') || 'none'}`,
+    );
 
     this.telemetryService.increment(
       'pipeline.publish.jobs_scheduled',
@@ -338,6 +377,7 @@ export class PublishingService {
         let evidenceUri = '';
         let responsePayload: unknown = {};
         let resolvedTargetRef = job.targetRef;
+        const sanitizedBody = this.stripMandatoryDisclaimer(job.draft.body);
 
         if (job.platform === PublishPlatform.TELEGRAM) {
           if (!activeAccount) {
@@ -352,7 +392,7 @@ export class PublishingService {
 
           const result = await this.telegramPublisher.sendMessage(
             job.targetRef,
-            job.draft.body,
+            sanitizedBody,
             credentials.botToken,
           );
           externalPostId = result.externalPostId;
@@ -371,14 +411,25 @@ export class PublishingService {
             throw new Error('StockTwits account credentials missing');
           }
 
+          const stocktwitsTargetSymbol = this.normalizeStocktwitsTargetSymbol(
+            job.targetRef,
+          );
+          const stocktwitsMessage = this.buildStocktwitsSymbolMessage(
+            sanitizedBody,
+            stocktwitsTargetSymbol,
+          );
           const result = await this.stocktwitsPublisher.publish(
             credentials,
-            job.draft.body,
+            stocktwitsMessage,
             job.id,
+            stocktwitsTargetSymbol ?? undefined,
           );
           externalPostId = result.externalPostId;
           evidenceUri = result.evidenceUri;
           responsePayload = result;
+          if (stocktwitsTargetSymbol) {
+            resolvedTargetRef = stocktwitsTargetSymbol;
+          }
         }
 
         if (!externalPostId) {
@@ -1105,6 +1156,164 @@ export class PublishingService {
       return null;
     }
     return match[1].trim();
+  }
+
+  private async resolveStocktwitsTrendingSymbolsForCycle(): Promise<string[]> {
+    const limit = PublishingService.STOCKTWITS_TOP_SYMBOL_LIMIT;
+    const discoveryAccount = await this.accountsService.getEligibleAccount(
+      AccountPlatform.STOCKTWITS,
+      {
+        scheduledAt: new Date(),
+      },
+    );
+
+    if (!discoveryAccount) {
+      this.logger.warn(
+        'Skipping StockTwits trending discovery: no eligible account is currently available.',
+      );
+      await this.auditService.record(
+        'stocktwits.trending.discovery_skipped',
+        'stocktwits',
+        'trending_all',
+        {
+          reason: 'no_eligible_account',
+          requestedLimit: limit,
+        },
+      );
+      return [];
+    }
+
+    const credentials = this.accountsService.getStocktwitsCredentials(
+      discoveryAccount.accountHandle,
+    );
+    if (!credentials) {
+      this.logger.warn(
+        `Skipping StockTwits trending discovery: missing credentials for account ${discoveryAccount.accountHandle}.`,
+      );
+      await this.auditService.record(
+        'stocktwits.trending.discovery_skipped',
+        'stocktwits',
+        'trending_all',
+        {
+          reason: 'credentials_missing',
+          accountId: discoveryAccount.id,
+          accountHandle: discoveryAccount.accountHandle,
+          requestedLimit: limit,
+        },
+      );
+      return [];
+    }
+
+    try {
+      const symbols = await this.stocktwitsPublisher.discoverTopTrendingSymbols(
+        {
+          username: credentials.username,
+          password: credentials.password,
+        },
+        limit,
+      );
+
+      if (symbols.length === 0) {
+        this.logger.warn(
+          'StockTwits trending discovery returned no symbols; skipping StockTwits scheduling for this cycle.',
+        );
+        await this.auditService.record(
+          'stocktwits.trending.discovery_failed',
+          'stocktwits',
+          'trending_all',
+          {
+            reason: 'no_symbols_returned',
+            accountId: discoveryAccount.id,
+            accountHandle: discoveryAccount.accountHandle,
+            requestedLimit: limit,
+          },
+        );
+        return [];
+      }
+
+      if (symbols.length < limit) {
+        this.logger.warn(
+          `StockTwits trending discovery returned ${symbols.length}/${limit} symbols.`,
+        );
+      } else {
+        this.logger.log(
+          `StockTwits trending discovery returned ${symbols.length} symbols.`,
+        );
+      }
+
+      await this.auditService.record(
+        'stocktwits.trending.symbols.discovered',
+        'stocktwits',
+        'trending_all',
+        {
+          accountId: discoveryAccount.id,
+          accountHandle: discoveryAccount.accountHandle,
+          requestedLimit: limit,
+          returnedCount: symbols.length,
+          symbols,
+        },
+      );
+
+      return symbols;
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : 'unknown_discovery_error';
+      this.logger.error(
+        `StockTwits trending discovery failed and StockTwits scheduling will be skipped for this cycle: ${reason}`,
+      );
+      await this.auditService.record(
+        'stocktwits.trending.discovery_failed',
+        'stocktwits',
+        'trending_all',
+        {
+          reason,
+          accountId: discoveryAccount.id,
+          accountHandle: discoveryAccount.accountHandle,
+          requestedLimit: limit,
+        },
+      );
+      return [];
+    }
+  }
+
+  private normalizeStocktwitsTargetSymbol(value: string): string | null {
+    const normalized = value.trim().replace(/^\$/, '').toUpperCase();
+    if (!/^[A-Z][A-Z0-9.-]{0,10}$/.test(normalized)) {
+      return null;
+    }
+    if (normalized.length > 6) {
+      return null;
+    }
+    return normalized;
+  }
+
+  private buildStocktwitsSymbolMessage(
+    body: string,
+    symbol: string | null,
+  ): string {
+    const trimmedBody = body.trim();
+    if (!symbol) {
+      return trimmedBody;
+    }
+
+    const cashtag = `$${symbol}`;
+    if (trimmedBody.toUpperCase().startsWith(cashtag)) {
+      return trimmedBody;
+    }
+
+    return `${cashtag}\n\n${trimmedBody}`;
+  }
+
+  private stripMandatoryDisclaimer(body: string): string {
+    const disclaimer = MANDATORY_DISCLAIMER.trim().toLowerCase();
+    const withoutDisclaimer = body
+      .split(/\r?\n/)
+      .filter((line) => line.trim().toLowerCase() !== disclaimer)
+      .join('\n');
+
+    return withoutDisclaimer
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
 
   private resolveScheduledTime(

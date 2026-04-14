@@ -1,0 +1,335 @@
+{
+  "info": {
+    "_postman_id": "d9168896-94ee-45e5-aa83-93f615b8105e",
+    "name": "Stock Promotion Client Demo (Minimum)",
+    "description": "Minimum endpoints for client demo, aligned with current NestJS controllers and auth guard.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      {
+        "key": "key",
+        "value": "x-api-key",
+        "type": "string"
+      },
+      {
+        "key": "value",
+        "value": "{{apiKey}}",
+        "type": "string"
+      },
+      {
+        "key": "in",
+        "value": "header",
+        "type": "string"
+      }
+    ]
+  },
+  "item": [
+    {
+      "name": "Health (Public)",
+      "item": [
+        {
+          "name": "Live",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/live",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "live"
+              ]
+            },
+            "description": "Public liveness probe."
+          }
+        },
+        {
+          "name": "Ready",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/ready",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "ready"
+              ]
+            },
+            "description": "Public readiness probe (returns 503 when dependencies are degraded)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Core Demo Flow (Protected)",
+      "item": [
+        {
+          "name": "Run Pipeline (Sync)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"sync\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/run",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "run"
+              ]
+            },
+            "description": "Runs one full manual pipeline and returns ingestion/trend/draft/publish summary in a single response."
+          }
+        },
+        {
+          "name": "List Trends",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/trends?limit=10",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "trends"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Drafts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "let drafts = [];",
+                  "try { drafts = pm.response.json(); } catch (err) {}",
+                  "pm.test('Drafts response is array', function () {",
+                  "  pm.expect(Array.isArray(drafts)).to.eql(true);",
+                  "});",
+                  "if (Array.isArray(drafts) && drafts.length > 0 && drafts[0].id) {",
+                  "  pm.collectionVariables.set('draftId', drafts[0].id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/drafts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "drafts"
+              ]
+            },
+            "description": "Captures first draft id into collection variable {{draftId}} when available."
+          }
+        },
+        {
+          "name": "List Publish Jobs",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "let jobs = [];",
+                  "try { jobs = pm.response.json(); } catch (err) {}",
+                  "pm.test('Publish jobs response is array', function () {",
+                  "  pm.expect(Array.isArray(jobs)).to.eql(true);",
+                  "});",
+                  "if (Array.isArray(jobs) && jobs.length > 0 && jobs[0].id) {",
+                  "  pm.collectionVariables.set('publishJobId', jobs[0].id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/publish/jobs?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "publish",
+                "jobs"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "Captures first publish job id into collection variable {{publishJobId}}."
+          }
+        },
+        {
+          "name": "Get Publish Job (Captured)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/publish/jobs/{{publishJobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "publish",
+                "jobs",
+                "{{publishJobId}}"
+              ]
+            },
+            "description": "Uses {{publishJobId}} set from List Publish Jobs. Run List Publish Jobs first."
+          }
+        },
+        {
+          "name": "Operations Dashboard",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orchestration/dashboard/operations",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "orchestration",
+                "dashboard",
+                "operations"
+              ]
+            }
+          }
+        },
+        {
+          "name": "List Accounts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "let accounts = [];",
+                  "try { accounts = pm.response.json(); } catch (err) {}",
+                  "pm.test('Accounts response is array', function () {",
+                  "  pm.expect(Array.isArray(accounts)).to.eql(true);",
+                  "});",
+                  "if (Array.isArray(accounts) && accounts.length > 0 && accounts[0].id) {",
+                  "  pm.collectionVariables.set('accountId', accounts[0].id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/accounts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "accounts"
+              ]
+            },
+            "description": "Captures first account id into collection variable {{accountId}}."
+          }
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.request.headers.upsert({ key: 'Accept', value: 'application/json' });"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('HTTP status is not 5xx', function () {",
+          "  pm.expect(pm.response.code).to.be.below(500);",
+          "});"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000/api"
+    },
+    {
+      "key": "apiKey",
+      "value": "my-very-secret-local-key-123",
+      "type": "string"
+    },
+    {
+      "key": "draftId",
+      "value": ""
+    },
+    {
+      "key": "publishJobId",
+      "value": ""
+    },
+    {
+      "key": "accountId",
+      "value": ""
+    }
+  ]
+}
