@@ -2,17 +2,21 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
+import { AxiosError } from 'axios';
 import {
   AccountPlatform,
+  DeadLetterStatus,
   DraftStatus,
   Prisma,
   PublishPlatform,
   PublishStatus,
+  ReviewStatus,
 } from '@prisma/client';
 import { createHash, randomInt } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -25,9 +29,16 @@ import {
 import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
 import { TelemetryService } from '../telemetry/telemetry.service';
+import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
+import { MANDATORY_DISCLAIMER } from '../common/constants/policy.constants';
+import { DiscordUiPublisher } from './discord-ui.publisher';
 
 @Injectable()
 export class PublishingService {
+  private static readonly PUBLISH_LOCK_KEY_PREFIX = 'publish-job';
+  private static readonly STOCKTWITS_TOP_SYMBOL_LIMIT = 10;
+  private readonly logger = new Logger(PublishingService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
@@ -35,6 +46,7 @@ export class PublishingService {
     private readonly auditService: AuditService,
     private readonly telegramPublisher: TelegramPublisher,
     private readonly stocktwitsPublisher: StocktwitsPublisher,
+    private readonly discordUiPublisher: DiscordUiPublisher,
     private readonly telemetryService: TelemetryService,
     @InjectQueue(PUBLISH_QUEUE) private readonly publishQueue: Queue,
   ) {}
@@ -53,19 +65,28 @@ export class PublishingService {
         title: seed,
         chatId: looksLikeChatId ? seed : null,
         inviteLink: looksLikeChatId ? null : seed,
+        reviewStatus: ReviewStatus.PENDING,
+        priorityScore: this.scoreTelegramCandidate(seed),
+        discoveryMetadata: {
+          source: 'seed',
+        },
       };
 
       if (looksLikeChatId) {
         await this.prisma.telegramGroupCandidate.upsert({
           where: { chatId: seed },
           create: data,
-          update: {},
+          update: {
+            priorityScore: this.scoreTelegramCandidate(seed),
+          },
         });
       } else {
         await this.prisma.telegramGroupCandidate.upsert({
           where: { inviteLink: seed },
           create: data,
-          update: {},
+          update: {
+            priorityScore: this.scoreTelegramCandidate(seed),
+          },
         });
       }
     }
@@ -73,8 +94,13 @@ export class PublishingService {
 
   async attemptApprovedTelegramJoins(): Promise<void> {
     const candidates = await this.prisma.telegramGroupCandidate.findMany({
-      where: { approved: true },
-      orderBy: { updatedAt: 'asc' },
+      where: {
+        approved: true,
+        reviewStatus: ReviewStatus.APPROVED,
+        OR: [{ throttleUntil: null }, { throttleUntil: { lte: new Date() } }],
+      },
+      orderBy: [{ priorityScore: 'desc' }, { updatedAt: 'asc' }],
+      take: 100,
     });
 
     for (const candidate of candidates) {
@@ -89,19 +115,35 @@ export class PublishingService {
             lastAttemptAt: now,
             statusNote:
               'No chat identifier resolved. Manual admin add may be required.',
+            throttleUntil: new Date(now.getTime() + 30 * 60_000),
           },
         });
         continue;
       }
 
-      const accessible = await this.telegramPublisher.canAccessChat(chatRef);
+      const account = await this.accountsService.getEligibleAccount(
+        AccountPlatform.TELEGRAM,
+      );
+      const credentials = account
+        ? this.accountsService.getTelegramCredentials(account.accountHandle)
+        : null;
+
+      const accessResult = credentials
+        ? await this.telegramPublisher.inspectChatAccess(
+            chatRef,
+            credentials.botToken,
+          )
+        : { accessible: false, resolvedChatId: chatRef };
       await this.prisma.telegramGroupCandidate.update({
         where: { id: candidate.id },
         data: {
-          chatId: candidate.chatId ?? chatRef,
-          joined: accessible,
+          chatId: accessResult.resolvedChatId,
+          joined: accessResult.accessible,
           lastAttemptAt: now,
-          statusNote: accessible
+          throttleUntil: accessResult.accessible
+            ? null
+            : new Date(now.getTime() + 60 * 60_000),
+          statusNote: accessResult.accessible
             ? 'Bot access verified for this chat.'
             : 'Bot cannot access chat yet. Add bot as admin/member and retry.',
         },
@@ -113,7 +155,9 @@ export class PublishingService {
         candidate.id,
         {
           chatRef,
-          success: accessible,
+          resolvedChatRef: accessResult.resolvedChatId,
+          success: accessResult.accessible,
+          accountHandle: account?.accountHandle ?? null,
         },
       );
     }
@@ -124,33 +168,39 @@ export class PublishingService {
       id: string;
       title: string;
       approved: boolean;
+      reviewStatus: ReviewStatus;
+      priorityScore: number;
       joined: boolean;
       chatId: string | null;
       inviteLink: string | null;
       statusNote: string | null;
       lastAttemptAt: Date | null;
+      throttleUntil: Date | null;
     }>
   > {
     const rows = await this.prisma.telegramGroupCandidate.findMany({
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ priorityScore: 'desc' }, { createdAt: 'desc' }],
       take: 200,
     });
     return rows.map((row) => ({
       id: row.id,
       title: row.title,
       approved: row.approved,
+      reviewStatus: row.reviewStatus,
+      priorityScore: row.priorityScore,
       joined: row.joined,
       chatId: row.chatId,
       inviteLink: row.inviteLink,
       statusNote: row.statusNote,
       lastAttemptAt: row.lastAttemptAt,
+      throttleUntil: row.throttleUntil,
     }));
   }
 
   async approveTelegramCandidate(candidateId: string): Promise<void> {
     await this.prisma.telegramGroupCandidate.update({
       where: { id: candidateId },
-      data: { approved: true },
+      data: { approved: true, reviewStatus: ReviewStatus.APPROVED },
     });
     await this.auditService.record(
       'telegram.candidate.approved',
@@ -173,9 +223,19 @@ export class PublishingService {
     const publishCooldown = this.configService.getOrThrow<number>(
       'PUBLISH_COOLDOWN_MINUTES',
     );
-    let scheduledCount = 0;
+    const stocktwitsPolicy = await this.accountsService.getRotationPolicy(
+      AccountPlatform.STOCKTWITS,
+    );
+    const telegramPolicy = await this.accountsService.getRotationPolicy(
+      AccountPlatform.TELEGRAM,
+    );
+    const stocktwitsTrendingSymbols =
+      await this.resolveStocktwitsTrendingSymbolsForCycle();
 
-    for (const draftId of draftIds) {
+    let scheduledCount = 0;
+    let stocktwitsScheduledCount = 0;
+    let telegramScheduledCount = 0;
+    for (const [draftIndex, draftId] of draftIds.entries()) {
       const draft = await this.prisma.contentDraft.findUnique({
         where: { id: draftId },
       });
@@ -183,35 +243,84 @@ export class PublishingService {
         continue;
       }
 
-      const stocktwitsAccount = await this.accountsService.getActiveAccount(
-        AccountPlatform.STOCKTWITS,
-      );
+      if (stocktwitsTrendingSymbols.length > 0) {
+        const stocktwitsOffsetBase = draftIndex * stocktwitsTrendingSymbols.length;
+        for (const [symbolIndex, symbol] of stocktwitsTrendingSymbols.entries()) {
+          const scheduleAt = this.resolveScheduledTime(
+            stocktwitsPolicy,
+            stocktwitsOffsetBase + symbolIndex,
+          );
+          const stocktwitsAccount = await this.accountsService.getEligibleAccount(
+            AccountPlatform.STOCKTWITS,
+            {
+              scheduledAt: scheduleAt,
+            },
+          );
+          if (!stocktwitsAccount) {
+            continue;
+          }
 
-      if (stocktwitsAccount) {
-        const jitterMinutes = randomInt(5, Math.max(6, publishCooldown));
-        scheduledCount += await this.createAndQueuePublishJob({
-          draftId,
-          platform: PublishPlatform.STOCKTWITS,
-          accountId: stocktwitsAccount.id,
-          targetRef: stocktwitsAccount.accountHandle,
-          scheduleAt: new Date(Date.now() + jitterMinutes * 60_000),
-          cooldownMinutes: publishCooldown,
-        });
+          const createdCount = await this.createAndQueuePublishJob({
+            draftId,
+            platform: PublishPlatform.STOCKTWITS,
+            accountId: stocktwitsAccount.id,
+            targetRef: symbol,
+            scheduleAt,
+            cooldownMinutes: publishCooldown,
+            similarityThreshold: stocktwitsPolicy.duplicateSimilarityThreshold,
+          });
+          scheduledCount += createdCount;
+          stocktwitsScheduledCount += createdCount;
+
+          if (createdCount > 0) {
+            await this.auditService.record(
+              'stocktwits.trending_job.queued',
+              'draft',
+              draftId,
+              {
+                symbol,
+                accountId: stocktwitsAccount.id,
+                scheduleAt: scheduleAt.toISOString(),
+                source: 'trending_all_top10',
+              },
+            );
+          }
+        }
       }
 
       const telegramTargets = await this.resolveTelegramTargets();
-      for (const target of telegramTargets) {
-        const jitterMinutes = randomInt(2, Math.max(3, publishCooldown));
-        scheduledCount += await this.createAndQueuePublishJob({
+      for (const [targetIndex, target] of telegramTargets.entries()) {
+        const scheduleAt = this.resolveScheduledTime(
+          telegramPolicy,
+          draftIndex + targetIndex,
+        );
+        const telegramAccount = await this.accountsService.getEligibleAccount(
+          AccountPlatform.TELEGRAM,
+          {
+            scheduledAt: scheduleAt,
+          },
+        );
+        if (!telegramAccount) {
+          continue;
+        }
+
+        const createdCount = await this.createAndQueuePublishJob({
           draftId,
           platform: PublishPlatform.TELEGRAM,
-          accountId: null,
+          accountId: telegramAccount.id,
           targetRef: target,
-          scheduleAt: new Date(Date.now() + jitterMinutes * 60_000),
+          scheduleAt,
           cooldownMinutes: publishCooldown,
+          similarityThreshold: telegramPolicy.duplicateSimilarityThreshold,
         });
+        scheduledCount += createdCount;
+        telegramScheduledCount += createdCount;
       }
     }
+
+    this.logger.log(
+      `Scheduled publish jobs -> stocktwits:${stocktwitsScheduledCount}, telegram:${telegramScheduledCount}, total:${scheduledCount}. StockTwits symbols considered: ${stocktwitsTrendingSymbols.join(', ') || 'none'}`,
+    );
 
     this.telemetryService.increment(
       'pipeline.publish.jobs_scheduled',
@@ -221,112 +330,261 @@ export class PublishingService {
   }
 
   async executePublishJob(publishJobId: string): Promise<void> {
-    const job = await this.prisma.publishJob.findUnique({
-      where: { id: publishJobId },
-      include: {
-        draft: true,
-        account: true,
-      },
-    });
-    if (!job || job.status !== PublishStatus.PENDING) {
+    const lockKey = `${PublishingService.PUBLISH_LOCK_KEY_PREFIX}:${publishJobId}`;
+    const lockAcquired = await this.acquirePublishJobLock(lockKey);
+    if (!lockAcquired) {
       return;
     }
 
     try {
-      let externalPostId = '';
-      let evidenceUri = '';
-      let responsePayload: unknown = {};
+      const job = await this.prisma.publishJob.findUnique({
+        where: { id: publishJobId },
+        include: {
+          draft: true,
+          account: true,
+        },
+      });
+      if (!job || job.status !== PublishStatus.PENDING) {
+        return;
+      }
+      this.logger.log(
+        `Executing publish job ${job.id} (${job.platform}) -> ${job.targetRef}`,
+      );
 
-      if (job.platform === PublishPlatform.TELEGRAM) {
-        const result = await this.telegramPublisher.sendMessage(
-          job.targetRef,
-          job.draft.body,
-        );
-        externalPostId = result.externalPostId;
-        responsePayload = result.responsePayload;
-      } else {
-        const accountHandle = job.account?.accountHandle || '';
-        const credentials =
-          this.accountsService.getStocktwitsCredentials(accountHandle);
-        if (!credentials) {
-          throw new Error('StockTwits account credentials missing');
+      if (job.platform === PublishPlatform.DISCORD) {
+        await this.prisma.publishJob.update({
+          where: { id: job.id },
+          data: {
+            status: PublishStatus.SKIPPED,
+            attempts: {
+              increment: 1,
+            },
+            lastError:
+              'discord_webhook_publishing_removed_use_manual_discord_ui_mode',
+          },
+        });
+        await this.prisma.publishAttempt.create({
+          data: {
+            publishJobId: job.id,
+            success: false,
+            errorClass: 'platform_removed',
+            errorMessage:
+              'Discord webhook/bot publishing removed. Use manual publish with discord UI mode.',
+          },
+        });
+        await this.reconcileDraftPublishState(job.draftId);
+        await this.auditService.record('publish.skipped', 'publish_job', job.id, {
+          platform: job.platform,
+          reason:
+            'discord_webhook_publishing_removed_use_manual_discord_ui_mode',
+        });
+        return;
+      }
+
+      try {
+        let activeAccount = job.account;
+        if (job.platform === PublishPlatform.TELEGRAM) {
+          activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
+            AccountPlatform.TELEGRAM,
+            job.accountId,
+          );
+        }
+        if (job.platform === PublishPlatform.STOCKTWITS) {
+          activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
+            AccountPlatform.STOCKTWITS,
+            job.accountId,
+          );
         }
 
-        const result = await this.stocktwitsPublisher.publish(
-          credentials,
-          job.draft.body,
+        if (activeAccount && activeAccount.id !== job.accountId) {
+          await this.prisma.publishJob.update({
+            where: { id: job.id },
+            data: {
+              accountId: activeAccount.id,
+            },
+          });
+        }
+
+        let externalPostId = '';
+        let evidenceUri = '';
+        let responsePayload: unknown = {};
+        let resolvedTargetRef = job.targetRef;
+        const sanitizedBody = this.stripMandatoryDisclaimer(job.draft.body);
+
+        if (job.platform === PublishPlatform.TELEGRAM) {
+          if (!activeAccount) {
+            throw new Error('Telegram account is not available');
+          }
+          const credentials = this.accountsService.getTelegramCredentials(
+            activeAccount.accountHandle,
+          );
+          if (!credentials) {
+            throw new Error('Telegram bot credentials missing');
+          }
+
+          const result = await this.telegramPublisher.sendMessage(
+            job.targetRef,
+            sanitizedBody,
+            credentials.botToken,
+          );
+          externalPostId = result.externalPostId;
+          responsePayload = result.responsePayload;
+          if (result.resolvedChatId) {
+            resolvedTargetRef = result.resolvedChatId;
+          }
+        } else {
+          if (!activeAccount) {
+            throw new Error('StockTwits account is not available');
+          }
+          const credentials = this.accountsService.getStocktwitsCredentials(
+            activeAccount.accountHandle,
+          );
+          if (!credentials) {
+            throw new Error('StockTwits account credentials missing');
+          }
+
+          const stocktwitsTargetSymbol = this.normalizeStocktwitsTargetSymbol(
+            job.targetRef,
+          );
+          const stocktwitsMessage = this.buildStocktwitsSymbolMessage(
+            sanitizedBody,
+            stocktwitsTargetSymbol,
+          );
+          const result = await this.stocktwitsPublisher.publish(
+            credentials,
+            stocktwitsMessage,
+            job.id,
+            stocktwitsTargetSymbol ?? undefined,
+          );
+          externalPostId = result.externalPostId;
+          evidenceUri = result.evidenceUri;
+          responsePayload = result;
+          if (stocktwitsTargetSymbol) {
+            resolvedTargetRef = stocktwitsTargetSymbol;
+          }
+        }
+
+        if (!externalPostId) {
+          throw new Error(
+            `${job.platform.toLowerCase()}_publish_not_confirmed`,
+          );
+        }
+
+        await this.prisma.publishJob.update({
+          where: { id: job.id },
+          data: {
+            status: PublishStatus.SUCCESS,
+            attempts: {
+              increment: 1,
+            },
+            targetRef: resolvedTargetRef,
+            externalPostId,
+            evidenceUri: evidenceUri || null,
+          },
+        });
+
+        await this.prisma.publishAttempt.create({
+          data: {
+            publishJobId: job.id,
+            success: true,
+            responsePayload: responsePayload as Prisma.JsonObject,
+            evidenceUri: evidenceUri || null,
+          },
+        });
+        await this.reconcileDraftPublishState(job.draftId);
+
+        if (activeAccount?.id) {
+          await this.accountsService.recordPublishOutcome(activeAccount.id, {
+            success: true,
+            metadata: {
+              platform: job.platform,
+              targetRef: resolvedTargetRef,
+            },
+          });
+        }
+
+        this.telemetryService.increment('pipeline.publish.success');
+        await this.auditService.record(
+          'publish.success',
+          'publish_job',
           job.id,
+          {
+            platform: job.platform,
+            targetRef: resolvedTargetRef,
+            accountHandle: activeAccount?.accountHandle ?? null,
+          },
         );
-        externalPostId = result.externalPostId;
-        evidenceUri = result.evidenceUri;
-        responsePayload = result;
-      }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'Unexpected publish error';
+        const evidenceUri = this.extractEvidenceUriFromError(message);
+        const restricted = isRestrictionError(message);
+        const nextAttempts = job.attempts + 1;
+        const failurePayload = this.extractFailurePayload(error);
 
-      await this.prisma.publishJob.update({
-        where: { id: job.id },
-        data: {
-          status: PublishStatus.SUCCESS,
-          attempts: {
-            increment: 1,
+        if (job.accountId) {
+          await this.accountsService.recordPublishOutcome(job.accountId, {
+            success: false,
+            reason: message,
+            restricted,
+            metadata: {
+              platform: job.platform,
+              targetRef: job.targetRef,
+            },
+          });
+        }
+
+        const rerouted = await this.tryRerouteFailedJob(job.id, message);
+        if (rerouted) {
+          return;
+        }
+
+        await this.prisma.publishJob.update({
+          where: { id: job.id },
+          data: {
+            status: PublishStatus.FAILED,
+            attempts: {
+              increment: 1,
+            },
+            lastError: message,
+            evidenceUri: evidenceUri || null,
           },
-          externalPostId,
-          evidenceUri: evidenceUri || null,
-        },
-      });
+        });
 
-      await this.prisma.publishAttempt.create({
-        data: {
-          publishJobId: job.id,
-          success: true,
-          responsePayload: responsePayload as Prisma.JsonObject,
-          evidenceUri: evidenceUri || null,
-        },
-      });
-      await this.reconcileDraftPublishState(job.draftId);
-
-      this.telemetryService.increment('pipeline.publish.success');
-      await this.auditService.record('publish.success', 'publish_job', job.id, {
-        platform: job.platform,
-        targetRef: job.targetRef,
-      });
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Unexpected publish error';
-      const evidenceUri = this.extractEvidenceUriFromError(message);
-
-      await this.prisma.publishJob.update({
-        where: { id: job.id },
-        data: {
-          status: PublishStatus.FAILED,
-          attempts: {
-            increment: 1,
+        await this.prisma.publishAttempt.create({
+          data: {
+            publishJobId: job.id,
+            success: false,
+            errorClass: restricted ? 'restriction' : 'publish_error',
+            errorMessage: message,
+            responsePayload: failurePayload ?? undefined,
+            evidenceUri: evidenceUri || null,
           },
-          lastError: message,
-          evidenceUri: evidenceUri || null,
-        },
-      });
-
-      await this.prisma.publishAttempt.create({
-        data: {
+        });
+        await this.reconcileDraftPublishState(job.draftId);
+        await this.moveToDeadLetterIfExhausted({
           publishJobId: job.id,
-          success: false,
-          errorClass: 'publish_error',
-          errorMessage: message,
-          evidenceUri: evidenceUri || null,
-        },
-      });
-      await this.reconcileDraftPublishState(job.draftId);
+          attempts: nextAttempts,
+          reason: message,
+          metadata: {
+            platform: job.platform,
+            targetRef: job.targetRef,
+            evidenceUri: evidenceUri ?? null,
+          },
+        });
 
-      if (job.accountId) {
-        await this.accountsService.penalizeAccount(job.accountId, message);
+        this.telemetryService.increment('pipeline.publish.failed');
+        this.logger.error(
+          `Publish failed for job ${job.id} (${job.platform}) -> ${job.targetRef}. ${message}`,
+        );
+        await this.auditService.record('publish.failed', 'publish_job', job.id, {
+          platform: job.platform,
+          message,
+          evidenceUri,
+        });
       }
-
-      this.telemetryService.increment('pipeline.publish.failed');
-      await this.auditService.record('publish.failed', 'publish_job', job.id, {
-        platform: job.platform,
-        message,
-        evidenceUri,
-      });
+    } finally {
+      await this.releasePublishJobLock(lockKey);
     }
   }
 
@@ -345,6 +603,7 @@ export class PublishingService {
       externalPostId: string | null;
       evidenceUri: string | null;
       lastError: string | null;
+      accountId: string | null;
     }>
   > {
     const rows = await this.prisma.publishJob.findMany({
@@ -364,6 +623,7 @@ export class PublishingService {
       externalPostId: row.externalPostId,
       evidenceUri: row.evidenceUri,
       lastError: row.lastError,
+      accountId: row.accountId,
     }));
   }
 
@@ -375,12 +635,267 @@ export class PublishingService {
           orderBy: { attemptedAt: 'desc' },
           take: 20,
         },
+        account: {
+          select: {
+            accountHandle: true,
+            platform: true,
+            status: true,
+            healthScore: true,
+          },
+        },
       },
     });
     if (!row) {
       return null;
     }
     return row;
+  }
+
+  async listDeadLetterJobs(
+    limit = 100,
+    status?: DeadLetterStatus,
+  ): Promise<
+    Array<{
+      id: string;
+      publishJobId: string;
+      status: DeadLetterStatus;
+      reason: string;
+      attempts: number;
+      firstFailedAt: Date;
+      movedAt: Date;
+      replayedAt: Date | null;
+      platform: PublishPlatform;
+      targetRef: string;
+      publishStatus: PublishStatus;
+      draftId: string;
+      accountId: string | null;
+    }>
+  > {
+    const rows = await this.prisma.publishDeadLetter.findMany({
+      where: status ? { status } : undefined,
+      include: {
+        publishJob: {
+          select: {
+            id: true,
+            platform: true,
+            targetRef: true,
+            status: true,
+            draftId: true,
+            accountId: true,
+          },
+        },
+      },
+      orderBy: { movedAt: 'desc' },
+      take: Math.max(1, Math.min(limit, 500)),
+    });
+
+    return rows.map((row) => ({
+      id: row.id,
+      publishJobId: row.publishJobId,
+      status: row.status,
+      reason: row.reason,
+      attempts: row.attempts,
+      firstFailedAt: row.firstFailedAt,
+      movedAt: row.movedAt,
+      replayedAt: row.replayedAt,
+      platform: row.publishJob.platform,
+      targetRef: row.publishJob.targetRef,
+      publishStatus: row.publishJob.status,
+      draftId: row.publishJob.draftId,
+      accountId: row.publishJob.accountId,
+    }));
+  }
+
+  async dismissDeadLetter(
+    deadLetterId: string,
+    note?: string,
+  ): Promise<void> {
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { id: deadLetterId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Dead-letter entry not found');
+    }
+
+    await this.prisma.publishDeadLetter.update({
+      where: { id: deadLetterId },
+      data: {
+        status: DeadLetterStatus.DISMISSED,
+        metadata: this.mergeDeadLetterMetadata(existing.metadata, {
+          dismissedAt: new Date().toISOString(),
+          dismissalNote: note ?? null,
+        }),
+      },
+    });
+
+    await this.auditService.record(
+      'publish.dead_letter.dismissed',
+      'publish_dead_letter',
+      deadLetterId,
+      {
+        publishJobId: existing.publishJobId,
+        note: note ?? null,
+      },
+    );
+  }
+
+  async replayDeadLetter(deadLetterId: string): Promise<void> {
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { id: deadLetterId },
+      include: {
+        publishJob: {
+          select: {
+            id: true,
+            status: true,
+            draftId: true,
+            scheduledAt: true,
+          },
+        },
+      },
+    });
+    if (!existing) {
+      throw new NotFoundException('Dead-letter entry not found');
+    }
+    if (existing.status !== DeadLetterStatus.OPEN) {
+      throw new BadRequestException('Only OPEN dead-letter entries can be replayed');
+    }
+    if (existing.publishJob.status !== PublishStatus.FAILED) {
+      throw new BadRequestException(
+        'Replay requires the linked publish job to be in FAILED status',
+      );
+    }
+
+    const replayAt = new Date();
+    await this.prisma.publishJob.update({
+      where: { id: existing.publishJobId },
+      data: {
+        status: PublishStatus.PENDING,
+        attempts: 0,
+        lastError: null,
+        evidenceUri: null,
+        externalPostId: null,
+        scheduledAt: replayAt,
+      },
+    });
+    await this.reconcileDraftPublishState(existing.publishJob.draftId);
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId: existing.publishJobId },
+      {
+        jobId: `${existing.publishJobId}:dlq-replay:${Date.now()}`,
+        delay: 0,
+      },
+    );
+
+    await this.markDeadLetterAsReplayedIfOpen(existing.publishJobId, 'dlq_replay');
+
+    await this.auditService.record(
+      'publish.dead_letter.replayed',
+      'publish_dead_letter',
+      deadLetterId,
+      {
+        publishJobId: existing.publishJobId,
+      },
+    );
+  }
+
+  async replayFailedWindow(input: {
+    fromIso: string;
+    toIso: string;
+    platform?: PublishPlatform;
+  }): Promise<Record<string, unknown>> {
+    const from = new Date(input.fromIso);
+    const to = new Date(input.toIso);
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+      throw new BadRequestException('fromIso/toIso must be valid ISO timestamps');
+    }
+    if (from > to) {
+      throw new BadRequestException('fromIso cannot be after toIso');
+    }
+
+    const batchSize = this.configService.getOrThrow<number>(
+      'PUBLISH_REPLAY_BATCH_SIZE',
+    );
+    const candidates = await this.prisma.publishJob.findMany({
+      where: {
+        status: PublishStatus.FAILED,
+        scheduledAt: {
+          gte: from,
+          lte: to,
+        },
+        ...(input.platform ? { platform: input.platform } : {}),
+      },
+      select: {
+        id: true,
+        draftId: true,
+      },
+      orderBy: { scheduledAt: 'asc' },
+      take: batchSize,
+    });
+
+    let replayed = 0;
+    const replayedDraftIds = new Set<string>();
+    const replayAnchor = Date.now();
+    for (const [index, candidate] of candidates.entries()) {
+      const replayAt = new Date(replayAnchor + index * 250);
+      const updateResult = await this.prisma.publishJob.updateMany({
+        where: {
+          id: candidate.id,
+          status: PublishStatus.FAILED,
+        },
+        data: {
+          status: PublishStatus.PENDING,
+          attempts: 0,
+          lastError: null,
+          evidenceUri: null,
+          externalPostId: null,
+          scheduledAt: replayAt,
+        },
+      });
+      if (updateResult.count === 0) {
+        continue;
+      }
+
+      await this.publishQueue.add(
+        PUBLISH_JOB_EXECUTE,
+        { publishJobId: candidate.id },
+        {
+          jobId: `${candidate.id}:window-replay:${Date.now()}:${index}`,
+          delay: Math.max(0, replayAt.getTime() - Date.now()),
+        },
+      );
+      await this.markDeadLetterAsReplayedIfOpen(candidate.id, 'window_replay');
+      replayedDraftIds.add(candidate.draftId);
+      replayed += 1;
+    }
+
+    for (const draftId of replayedDraftIds) {
+      await this.reconcileDraftPublishState(draftId);
+    }
+
+    await this.auditService.record(
+      'publish.failed_window.replayed',
+      'system',
+      'publish_window',
+      {
+        fromIso: from.toISOString(),
+        toIso: to.toISOString(),
+        platform: input.platform ?? null,
+        matched: candidates.length,
+        replayed,
+        replayBatchSize: batchSize,
+      },
+    );
+
+    return {
+      fromIso: from.toISOString(),
+      toIso: to.toISOString(),
+      platform: input.platform ?? null,
+      matched: candidates.length,
+      replayed,
+      replayBatchSize: batchSize,
+    };
   }
 
   async retryPublishJob(publishJobId: string): Promise<void> {
@@ -407,12 +922,15 @@ export class PublishingService {
         `Retry limit reached (${maxRetries}) for publish job`,
       );
     }
+    const retryDelayMs =
+      this.configService.getOrThrow<number>('PUBLISH_RETRY_DELAY_SECONDS') *
+      1000;
 
     const job = await this.prisma.publishJob.update({
       where: { id: publishJobId },
       data: {
         status: PublishStatus.PENDING,
-        scheduledAt: new Date(Date.now() + 30_000),
+        scheduledAt: new Date(Date.now() + retryDelayMs),
         lastError: null,
       },
     });
@@ -423,9 +941,10 @@ export class PublishingService {
       { publishJobId },
       {
         jobId: `${job.id}:retry:${Date.now()}`,
-        delay: 30_000,
+        delay: retryDelayMs,
       },
     );
+    await this.markDeadLetterAsReplayedIfOpen(job.id, 'retry');
 
     await this.auditService.record(
       'publish.retry.queued',
@@ -436,6 +955,487 @@ export class PublishingService {
         retryScheduledAt: job.scheduledAt.toISOString(),
       },
     );
+  }
+
+  async dispatchPublishJobNow(publishJobId: string): Promise<void> {
+    const existing = await this.prisma.publishJob.findUnique({
+      where: { id: publishJobId },
+      select: {
+        id: true,
+        status: true,
+        scheduledAt: true,
+      },
+    });
+    if (!existing) {
+      throw new NotFoundException('Publish job not found');
+    }
+    if (existing.status !== PublishStatus.PENDING) {
+      throw new BadRequestException('Only PENDING publish jobs can be dispatched immediately');
+    }
+
+    const now = new Date();
+    const job = await this.prisma.publishJob.update({
+      where: { id: publishJobId },
+      data: {
+        scheduledAt: now,
+      },
+    });
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId },
+      {
+        jobId: `${job.id}:dispatch-now:${Date.now()}`,
+        delay: 0,
+      },
+    );
+
+    await this.auditService.record(
+      'publish.dispatch_now.queued',
+      'publish_job',
+      job.id,
+      {
+        previousScheduledAt: existing.scheduledAt.toISOString(),
+        dispatchedAt: now.toISOString(),
+      },
+    );
+  }
+
+  async rerunFailedPublishJobNow(publishJobId: string): Promise<void> {
+    const existing = await this.prisma.publishJob.findUnique({
+      where: { id: publishJobId },
+      select: {
+        id: true,
+        status: true,
+        scheduledAt: true,
+        draftId: true,
+        attempts: true,
+      },
+    });
+    if (!existing) {
+      throw new NotFoundException('Publish job not found');
+    }
+    if (existing.status !== PublishStatus.FAILED) {
+      throw new BadRequestException('Only FAILED publish jobs can be rerun immediately');
+    }
+
+    const now = new Date();
+    const job = await this.prisma.publishJob.update({
+      where: { id: publishJobId },
+      data: {
+        status: PublishStatus.PENDING,
+        scheduledAt: now,
+        lastError: null,
+        evidenceUri: null,
+        externalPostId: null,
+      },
+    });
+    await this.reconcileDraftPublishState(existing.draftId);
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId },
+      {
+        jobId: `${job.id}:rerun-now:${Date.now()}`,
+        delay: 0,
+      },
+    );
+    await this.markDeadLetterAsReplayedIfOpen(job.id, 'rerun_now');
+
+    await this.auditService.record(
+      'publish.rerun_now.queued',
+      'publish_job',
+      job.id,
+      {
+        previousScheduledAt: existing.scheduledAt.toISOString(),
+        previousAttempts: existing.attempts,
+        rerunAt: now.toISOString(),
+      },
+    );
+  }
+
+  async getOperationsDashboard(): Promise<Record<string, unknown>> {
+    const [accountSummary, pendingCandidates, jobSummary, connectorSummary] =
+      await Promise.all([
+        this.accountsService.listAccountsDashboard(),
+        this.prisma.telegramGroupCandidate.findMany({
+          where: {
+            reviewStatus: ReviewStatus.PENDING,
+          },
+          orderBy: [{ priorityScore: 'desc' }, { createdAt: 'asc' }],
+          take: 25,
+        }),
+        this.prisma.publishJob.groupBy({
+          by: ['status', 'platform'],
+          _count: {
+            _all: true,
+          },
+        }),
+        this.prisma.sourceConnectorState.findMany({
+          orderBy: [{ priority: 'desc' }],
+        }),
+      ]);
+
+    return {
+      accounts: accountSummary,
+      telegramReviewQueue: pendingCandidates,
+      publishJobs: jobSummary,
+      connectors: connectorSummary,
+    };
+  }
+
+  async getStocktwitsSessionStatus(): Promise<Record<string, unknown>> {
+    return this.stocktwitsPublisher.getSessionStatus();
+  }
+
+  async bootstrapStocktwitsSession(): Promise<Record<string, unknown>> {
+    await this.accountsService.syncAccountsFromConfig();
+    const account = await this.accountsService.getEligibleAccount(
+      AccountPlatform.STOCKTWITS,
+    );
+    if (!account) {
+      throw new NotFoundException('No active StockTwits account configured');
+    }
+
+    const credentials = this.accountsService.getStocktwitsCredentials(
+      account.accountHandle,
+    );
+    if (!credentials) {
+      throw new NotFoundException('StockTwits account credentials missing');
+    }
+
+    const result = await this.stocktwitsPublisher.bootstrapSession(credentials);
+    await this.auditService.record(
+      'stocktwits.session.bootstrap',
+      'account',
+      account.id,
+      {
+        accountHandle: account.accountHandle,
+        ...result,
+      },
+    );
+    return {
+      accountHandle: account.accountHandle,
+      ...result,
+    };
+  }
+
+  async publishManualPost(input: {
+    body: string;
+    stocktwitsSymbol?: string;
+    publishToStocktwits?: boolean;
+    publishToDiscord?: boolean;
+    discordServerUrl?: string;
+  }): Promise<{
+    id: string;
+    body: string;
+    success: boolean;
+    stocktwits: {
+      attempted: boolean;
+      success: boolean;
+      accountId: string | null;
+      accountHandle: string | null;
+      targetSymbol: string | null;
+      externalPostId: string | null;
+      evidenceUri: string | null;
+      error: string | null;
+    };
+    discord: {
+      attempted: boolean;
+      targetCount: number;
+      successCount: number;
+      skippedCount: number;
+      failedCount: number;
+      error: string | null;
+      results: Array<{
+        channelId: string;
+        success: boolean;
+        externalPostId: string | null;
+        error: string | null;
+      }>;
+    };
+  }> {
+    const sanitizedBody = this.stripMandatoryDisclaimer(input.body || '').trim();
+    if (!sanitizedBody) {
+      throw new BadRequestException('body is required');
+    }
+
+    const publishToStocktwits = input.publishToStocktwits !== false;
+    const publishToDiscord = input.publishToDiscord !== false;
+    if (!publishToStocktwits && !publishToDiscord) {
+      throw new BadRequestException(
+        'At least one destination must be enabled (StockTwits or Discord).',
+      );
+    }
+
+    const stocktwitsSymbolRaw = (input.stocktwitsSymbol || '').trim();
+    let normalizedStocktwitsSymbol: string | null = null;
+    if (stocktwitsSymbolRaw) {
+      normalizedStocktwitsSymbol =
+        this.normalizeStocktwitsTargetSymbol(stocktwitsSymbolRaw);
+      if (!normalizedStocktwitsSymbol) {
+        throw new BadRequestException(
+          'stocktwitsSymbol is invalid. Use a ticker like AAPL.',
+        );
+      }
+    }
+
+    const manualPublishId = `manual-${Date.now()}-${randomInt(100000, 1_000_000)}`;
+
+    const stocktwitsResult: {
+      attempted: boolean;
+      success: boolean;
+      accountId: string | null;
+      accountHandle: string | null;
+      targetSymbol: string | null;
+      externalPostId: string | null;
+      evidenceUri: string | null;
+      error: string | null;
+    } = {
+      attempted: publishToStocktwits,
+      success: false,
+      accountId: null,
+      accountHandle: null,
+      targetSymbol: normalizedStocktwitsSymbol,
+      externalPostId: null,
+      evidenceUri: null,
+      error: null,
+    };
+
+    const discordResult: {
+      attempted: boolean;
+      targetCount: number;
+      successCount: number;
+      skippedCount: number;
+      failedCount: number;
+      error: string | null;
+      results: Array<{
+        channelId: string;
+        success: boolean;
+        externalPostId: string | null;
+        error: string | null;
+      }>;
+    } = {
+      attempted: publishToDiscord,
+      targetCount: 0,
+      successCount: 0,
+      skippedCount: 0,
+      failedCount: 0,
+      error: null,
+      results: [],
+    };
+
+    await this.accountsService.syncAccountsFromConfig();
+
+    if (publishToStocktwits) {
+      let selectedAccount: {
+        id: string;
+        accountHandle: string;
+      } | null = null;
+      try {
+        selectedAccount = await this.accountsService.getEligibleAccount(
+          AccountPlatform.STOCKTWITS,
+          {
+            scheduledAt: new Date(),
+          },
+        );
+        if (!selectedAccount) {
+          throw new Error('stocktwits_no_eligible_account');
+        }
+
+        const credentialsRaw = this.accountsService.getStocktwitsCredentials(
+          selectedAccount.accountHandle,
+        );
+        if (!credentialsRaw) {
+          throw new Error('stocktwits_credentials_missing');
+        }
+        // Thread the account handle into the credentials object so the
+        // publisher can isolate browser profiles per-account (no cookie
+        // bleed between accounts).
+        const credentials = {
+          ...credentialsRaw,
+          handle: selectedAccount.accountHandle,
+        };
+
+        const stocktwitsMessage = this.buildStocktwitsSymbolMessage(
+          sanitizedBody,
+          normalizedStocktwitsSymbol,
+        );
+        const stocktwitsPublishId = `${manualPublishId}-stocktwits`;
+
+        // If the request didn't specify a symbol, broadcast to every entry
+        // in STOCKTWITS_TARGET_SYMBOLS instead of posting once to the first
+        // one. The env list is the user-managed broadcast target list.
+        const hasExplicitSymbol = Boolean(normalizedStocktwitsSymbol);
+        const envSymbolList =
+          this.configService.get<string>('STOCKTWITS_TARGET_SYMBOLS')?.trim() ?? '';
+        const useBroadcast = !hasExplicitSymbol && envSymbolList.length > 0;
+
+        if (useBroadcast) {
+          const broadcast = await this.stocktwitsPublisher.publishToTargetSymbols(
+            credentials,
+            stocktwitsMessage,
+            stocktwitsPublishId,
+          );
+
+          const successfulIds = broadcast.results
+            .filter((r) => r.success && r.externalPostId)
+            .map((r) => `${r.symbol}:${r.externalPostId}`);
+          const firstSuccess = broadcast.results.find((r) => r.success) ?? null;
+          const failureSummary = broadcast.results
+            .filter((r) => !r.success)
+            .map((r) => `${r.symbol}=${r.error ?? 'unknown'}`)
+            .join('; ');
+
+          stocktwitsResult.success = broadcast.successCount > 0;
+          stocktwitsResult.accountId = selectedAccount.id;
+          stocktwitsResult.accountHandle = selectedAccount.accountHandle;
+          stocktwitsResult.externalPostId = successfulIds.join(',') || null;
+          stocktwitsResult.evidenceUri =
+            firstSuccess?.evidenceUri ??
+            broadcast.results[0]?.evidenceUri ??
+            null;
+          if (broadcast.failedCount > 0) {
+            stocktwitsResult.error =
+              broadcast.successCount === 0
+                ? `stocktwits_broadcast_all_failed: ${failureSummary}`
+                : `stocktwits_broadcast_partial: ${failureSummary}`;
+          }
+
+          await this.recordAccountOutcomeSafe(selectedAccount.id, {
+            success: stocktwitsResult.success,
+            reason: stocktwitsResult.error ?? undefined,
+            metadata: {
+              mode: 'manual_broadcast',
+              platform: PublishPlatform.STOCKTWITS,
+              targetRef: broadcast.results.map((r) => r.symbol).join(','),
+              totalCount: broadcast.totalCount,
+              successCount: broadcast.successCount,
+              failedCount: broadcast.failedCount,
+            },
+          });
+        } else {
+          const publishResult = await this.stocktwitsPublisher.publish(
+            credentials,
+            stocktwitsMessage,
+            stocktwitsPublishId,
+            normalizedStocktwitsSymbol ?? undefined,
+          );
+
+          stocktwitsResult.success = true;
+          stocktwitsResult.accountId = selectedAccount.id;
+          stocktwitsResult.accountHandle = selectedAccount.accountHandle;
+          stocktwitsResult.externalPostId = publishResult.externalPostId;
+          stocktwitsResult.evidenceUri = publishResult.evidenceUri;
+
+          await this.recordAccountOutcomeSafe(selectedAccount.id, {
+            success: true,
+            metadata: {
+              mode: 'manual_direct',
+              platform: PublishPlatform.STOCKTWITS,
+              targetRef: normalizedStocktwitsSymbol ?? 'home',
+            },
+          });
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'stocktwits_publish_failed';
+        stocktwitsResult.success = false;
+        stocktwitsResult.accountId = selectedAccount?.id ?? null;
+        stocktwitsResult.accountHandle = selectedAccount?.accountHandle ?? null;
+        stocktwitsResult.error = message;
+
+        if (selectedAccount?.id) {
+          await this.recordAccountOutcomeSafe(selectedAccount.id, {
+            success: false,
+            reason: message,
+            restricted: isRestrictionError(message),
+            metadata: {
+              mode: 'manual_direct',
+              platform: PublishPlatform.STOCKTWITS,
+              targetRef: normalizedStocktwitsSymbol ?? 'home',
+            },
+          });
+        }
+      }
+    }
+
+    if (publishToDiscord) {
+      const serverUrl =
+        input.discordServerUrl?.trim() ||
+        this.configService.get<string>('DISCORD_UI_SERVER_URL')?.trim() ||
+        '';
+      if (!serverUrl) {
+        discordResult.error =
+          'discord_ui_server_url_missing (provide discordServerUrl)';
+      } else {
+        try {
+          const uiResult = await this.discordUiPublisher.broadcastToWritableChannels(
+            {
+              serverUrl,
+              message: sanitizedBody,
+            },
+          );
+
+          discordResult.targetCount = uiResult.channelCount;
+          discordResult.successCount = uiResult.postedCount;
+          discordResult.skippedCount = uiResult.skippedCount;
+          discordResult.failedCount = uiResult.failedCount;
+          discordResult.results = uiResult.channels.map((row) => ({
+            channelId: row.channelId,
+            success: row.posted,
+            externalPostId: null,
+            error: row.reason,
+          }));
+        } catch (error) {
+          discordResult.error =
+            error instanceof Error ? error.message : 'discord_ui_publish_failed';
+        }
+      }
+    }
+
+    const stocktwitsSucceeded = !publishToStocktwits || stocktwitsResult.success;
+    const discordSucceeded =
+      !publishToDiscord ||
+      (discordResult.error === null &&
+        discordResult.failedCount === 0 &&
+        discordResult.successCount > 0);
+    const success = stocktwitsSucceeded && discordSucceeded;
+
+    this.telemetryService.increment(
+      success
+        ? 'pipeline.publish.manual.success'
+        : 'pipeline.publish.manual.partial_or_failed',
+    );
+
+    await this.auditService.record('publish.manual.direct', 'manual_post', manualPublishId, {
+      success,
+      publishToStocktwits,
+      publishToDiscord,
+      discordMode: 'ui',
+      stocktwits: {
+        success: stocktwitsResult.success,
+        accountHandle: stocktwitsResult.accountHandle,
+        targetSymbol: stocktwitsResult.targetSymbol,
+        externalPostId: stocktwitsResult.externalPostId,
+        error: stocktwitsResult.error,
+      },
+      discord: {
+        targetCount: discordResult.targetCount,
+        successCount: discordResult.successCount,
+        skippedCount: discordResult.skippedCount,
+        failedCount: discordResult.failedCount,
+        error: discordResult.error,
+      },
+    });
+
+    return {
+      id: manualPublishId,
+      body: sanitizedBody,
+      success,
+      stocktwits: stocktwitsResult,
+      discord: discordResult,
+    };
   }
 
   private async resolveTelegramTargets(): Promise<string[]> {
@@ -449,6 +1449,7 @@ export class PublishingService {
     const approvedJoined = await this.prisma.telegramGroupCandidate.findMany({
       where: {
         approved: true,
+        reviewStatus: ReviewStatus.APPROVED,
         joined: true,
         chatId: {
           not: null,
@@ -457,6 +1458,8 @@ export class PublishingService {
       select: {
         chatId: true,
       },
+      orderBy: [{ priorityScore: 'desc' }],
+      take: 50,
     });
 
     const merged = new Set<string>(defaults);
@@ -505,6 +1508,178 @@ export class PublishingService {
     return match[1].trim();
   }
 
+  private async resolveStocktwitsTrendingSymbolsForCycle(): Promise<string[]> {
+    const limit = PublishingService.STOCKTWITS_TOP_SYMBOL_LIMIT;
+    const discoveryAccount = await this.accountsService.getEligibleAccount(
+      AccountPlatform.STOCKTWITS,
+      {
+        scheduledAt: new Date(),
+      },
+    );
+
+    if (!discoveryAccount) {
+      this.logger.warn(
+        'Skipping StockTwits trending discovery: no eligible account is currently available.',
+      );
+      await this.auditService.record(
+        'stocktwits.trending.discovery_skipped',
+        'stocktwits',
+        'trending_all',
+        {
+          reason: 'no_eligible_account',
+          requestedLimit: limit,
+        },
+      );
+      return [];
+    }
+
+    const credentials = this.accountsService.getStocktwitsCredentials(
+      discoveryAccount.accountHandle,
+    );
+    if (!credentials) {
+      this.logger.warn(
+        `Skipping StockTwits trending discovery: missing credentials for account ${discoveryAccount.accountHandle}.`,
+      );
+      await this.auditService.record(
+        'stocktwits.trending.discovery_skipped',
+        'stocktwits',
+        'trending_all',
+        {
+          reason: 'credentials_missing',
+          accountId: discoveryAccount.id,
+          accountHandle: discoveryAccount.accountHandle,
+          requestedLimit: limit,
+        },
+      );
+      return [];
+    }
+
+    try {
+      const symbols = await this.stocktwitsPublisher.discoverTopTrendingSymbols(
+        {
+          username: credentials.username,
+          password: credentials.password,
+        },
+        limit,
+      );
+
+      if (symbols.length === 0) {
+        this.logger.warn(
+          'StockTwits trending discovery returned no symbols; skipping StockTwits scheduling for this cycle.',
+        );
+        await this.auditService.record(
+          'stocktwits.trending.discovery_failed',
+          'stocktwits',
+          'trending_all',
+          {
+            reason: 'no_symbols_returned',
+            accountId: discoveryAccount.id,
+            accountHandle: discoveryAccount.accountHandle,
+            requestedLimit: limit,
+          },
+        );
+        return [];
+      }
+
+      if (symbols.length < limit) {
+        this.logger.warn(
+          `StockTwits trending discovery returned ${symbols.length}/${limit} symbols.`,
+        );
+      } else {
+        this.logger.log(
+          `StockTwits trending discovery returned ${symbols.length} symbols.`,
+        );
+      }
+
+      await this.auditService.record(
+        'stocktwits.trending.symbols.discovered',
+        'stocktwits',
+        'trending_all',
+        {
+          accountId: discoveryAccount.id,
+          accountHandle: discoveryAccount.accountHandle,
+          requestedLimit: limit,
+          returnedCount: symbols.length,
+          symbols,
+        },
+      );
+
+      return symbols;
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : 'unknown_discovery_error';
+      this.logger.error(
+        `StockTwits trending discovery failed and StockTwits scheduling will be skipped for this cycle: ${reason}`,
+      );
+      await this.auditService.record(
+        'stocktwits.trending.discovery_failed',
+        'stocktwits',
+        'trending_all',
+        {
+          reason,
+          accountId: discoveryAccount.id,
+          accountHandle: discoveryAccount.accountHandle,
+          requestedLimit: limit,
+        },
+      );
+      return [];
+    }
+  }
+
+  private normalizeStocktwitsTargetSymbol(value: string): string | null {
+    const normalized = value.trim().replace(/^\$/, '').toUpperCase();
+    if (!/^[A-Z][A-Z0-9.-]{0,10}$/.test(normalized)) {
+      return null;
+    }
+    if (normalized.length > 6) {
+      return null;
+    }
+    return normalized;
+  }
+
+  private buildStocktwitsSymbolMessage(
+    body: string,
+    symbol: string | null,
+  ): string {
+    const trimmedBody = body.trim();
+    if (!symbol) {
+      return trimmedBody;
+    }
+
+    const cashtag = `$${symbol}`;
+    if (trimmedBody.toUpperCase().startsWith(cashtag)) {
+      return trimmedBody;
+    }
+
+    return `${cashtag}\n\n${trimmedBody}`;
+  }
+
+  private stripMandatoryDisclaimer(body: string): string {
+    const disclaimer = MANDATORY_DISCLAIMER.trim().toLowerCase();
+    const withoutDisclaimer = body
+      .split(/\r?\n/)
+      .filter((line) => line.trim().toLowerCase() !== disclaimer)
+      .join('\n');
+
+    return withoutDisclaimer
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  private resolveScheduledTime(
+    policy: {
+      minDelayMinutes: number;
+      maxDelayMinutes: number;
+    },
+    offsetSeed = 0,
+  ): Date {
+    const jitterMinutes = randomInt(
+      policy.minDelayMinutes,
+      Math.max(policy.minDelayMinutes + 1, policy.maxDelayMinutes + 1),
+    );
+    return new Date(Date.now() + (jitterMinutes + offsetSeed * 2) * 60_000);
+  }
+
   private async createAndQueuePublishJob(input: {
     draftId: string;
     platform: PublishPlatform;
@@ -512,6 +1687,7 @@ export class PublishingService {
     targetRef: string;
     scheduleAt: Date;
     cooldownMinutes: number;
+    similarityThreshold: number;
   }): Promise<number> {
     const duplicateExists = await this.hasRecentDuplicateWithinCooldown(
       input.draftId,
@@ -519,6 +1695,7 @@ export class PublishingService {
       input.targetRef,
       input.scheduleAt,
       input.cooldownMinutes,
+      input.similarityThreshold,
     );
     if (duplicateExists) {
       await this.auditService.record(
@@ -539,7 +1716,7 @@ export class PublishingService {
     );
     const idempotencyKey = createHash('sha256')
       .update(
-        `${input.draftId}:${input.platform}:${input.targetRef}:${cooldownBucket}`,
+        `${input.draftId}:${input.platform}:${input.targetRef}:${input.accountId ?? 'unassigned'}:${cooldownBucket}`,
       )
       .digest('hex');
 
@@ -647,10 +1824,11 @@ export class PublishingService {
     targetRef: string,
     scheduleAt: Date,
     cooldownMinutes: number,
+    similarityThreshold: number,
   ): Promise<boolean> {
     const draft = await this.prisma.contentDraft.findUnique({
       where: { id: draftId },
-      select: { contentHash: true },
+      select: { contentHash: true, body: true },
     });
     if (!draft) {
       return false;
@@ -674,6 +1852,306 @@ export class PublishingService {
       },
       select: { id: true },
     });
-    return Boolean(existing);
+    if (existing) {
+      return true;
+    }
+
+    const recentBodies = await this.prisma.publishJob.findMany({
+      where: {
+        platform,
+        targetRef,
+        status: {
+          in: [PublishStatus.PENDING, PublishStatus.SUCCESS],
+        },
+        scheduledAt: {
+          gte: cutoff,
+          lte: scheduleAt,
+        },
+      },
+      include: {
+        draft: {
+          select: {
+            body: true,
+          },
+        },
+      },
+      take: 20,
+      orderBy: {
+        scheduledAt: 'desc',
+      },
+    });
+
+    return recentBodies.some(
+      (row) =>
+        calculateContentSimilarity(row.draft.body, draft.body) >=
+        similarityThreshold,
+    );
   }
+
+  private async tryRerouteFailedJob(
+    publishJobId: string,
+    errorMessage: string,
+  ): Promise<boolean> {
+    const job = await this.prisma.publishJob.findUnique({
+      where: { id: publishJobId },
+      include: {
+        account: true,
+      },
+    });
+    if (!job || !job.accountId || !isReroutableFailure(errorMessage)) {
+      return false;
+    }
+
+    const platform =
+      job.platform === PublishPlatform.TELEGRAM
+        ? AccountPlatform.TELEGRAM
+        : job.platform === PublishPlatform.STOCKTWITS
+          ? AccountPlatform.STOCKTWITS
+          : null;
+    if (!platform) {
+      return false;
+    }
+    const fallback = await this.accountsService.getEligibleAccount(platform, {
+      excludeAccountId: job.accountId,
+      scheduledAt: new Date(
+        Date.now() +
+          this.configService.getOrThrow<number>('PHASE2_ADAPTIVE_COOLDOWN_MINUTES') *
+            60_000,
+      ),
+    });
+    if (!fallback) {
+      return false;
+    }
+
+    const rescheduleAt = new Date(
+      Date.now() +
+        this.configService.getOrThrow<number>('PHASE2_ADAPTIVE_COOLDOWN_MINUTES') *
+          60_000,
+    );
+    await this.prisma.publishJob.update({
+      where: { id: publishJobId },
+      data: {
+        accountId: fallback.id,
+        status: PublishStatus.PENDING,
+        scheduledAt: rescheduleAt,
+        lastError: `Rerouted after failure: ${errorMessage}`,
+        attempts: {
+          increment: 1,
+        },
+      },
+    });
+    await this.prisma.publishAttempt.create({
+      data: {
+        publishJobId,
+        success: false,
+        errorClass: 'rerouted',
+        errorMessage,
+      },
+    });
+
+    await this.publishQueue.add(
+      PUBLISH_JOB_EXECUTE,
+      { publishJobId },
+      {
+        jobId: `${publishJobId}:reroute:${Date.now()}`,
+        delay: Math.max(0, rescheduleAt.getTime() - Date.now()),
+      },
+    );
+
+    await this.auditService.record('publish.rerouted', 'publish_job', publishJobId, {
+      fromAccountId: job.accountId,
+      toAccountId: fallback.id,
+      reason: errorMessage,
+      retryAt: rescheduleAt.toISOString(),
+    });
+    return true;
+  }
+
+  private async moveToDeadLetterIfExhausted(input: {
+    publishJobId: string;
+    attempts: number;
+    reason: string;
+    metadata?: Prisma.JsonObject;
+  }): Promise<void> {
+    const deadLetterEnabled = this.configService.getOrThrow<boolean>(
+      'PUBLISH_DEAD_LETTER_ENABLED',
+    );
+    if (!deadLetterEnabled) {
+      return;
+    }
+
+    const maxRetries = this.configService.getOrThrow<number>('PUBLISH_MAX_RETRIES');
+    if (input.attempts < maxRetries) {
+      return;
+    }
+
+    const now = new Date();
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { publishJobId: input.publishJobId },
+      select: {
+        metadata: true,
+        firstFailedAt: true,
+      },
+    });
+
+    await this.prisma.publishDeadLetter.upsert({
+      where: { publishJobId: input.publishJobId },
+      update: {
+        status: DeadLetterStatus.OPEN,
+        reason: input.reason,
+        attempts: input.attempts,
+        movedAt: now,
+        replayedAt: null,
+        metadata: this.mergeDeadLetterMetadata(existing?.metadata, input.metadata),
+      },
+      create: {
+        publishJobId: input.publishJobId,
+        status: DeadLetterStatus.OPEN,
+        reason: input.reason,
+        attempts: input.attempts,
+        firstFailedAt: existing?.firstFailedAt ?? now,
+        movedAt: now,
+        metadata: input.metadata ?? {},
+      },
+    });
+
+    this.telemetryService.increment('pipeline.publish.dead_lettered');
+    await this.auditService.record(
+      'publish.dead_lettered',
+      'publish_job',
+      input.publishJobId,
+      {
+        attempts: input.attempts,
+        reason: input.reason,
+      },
+    );
+  }
+
+  private async markDeadLetterAsReplayedIfOpen(
+    publishJobId: string,
+    replaySource: 'retry' | 'rerun_now' | 'dlq_replay' | 'window_replay',
+  ): Promise<void> {
+    const existing = await this.prisma.publishDeadLetter.findUnique({
+      where: { publishJobId },
+      select: {
+        id: true,
+        status: true,
+        metadata: true,
+      },
+    });
+    if (!existing || existing.status !== DeadLetterStatus.OPEN) {
+      return;
+    }
+
+    await this.prisma.publishDeadLetter.update({
+      where: { publishJobId },
+      data: {
+        status: DeadLetterStatus.REPLAYED,
+        replayedAt: new Date(),
+        metadata: this.mergeDeadLetterMetadata(existing.metadata, {
+          replaySource,
+        }),
+      },
+    });
+  }
+
+  private mergeDeadLetterMetadata(
+    existing: Prisma.JsonValue | null | undefined,
+    patch: Prisma.JsonObject | undefined,
+  ): Prisma.JsonObject {
+    const base =
+      existing && typeof existing === 'object' && !Array.isArray(existing)
+        ? (existing as Prisma.JsonObject)
+        : {};
+    return {
+      ...base,
+      ...(patch ?? {}),
+    };
+  }
+
+  private extractFailurePayload(error: unknown): Prisma.JsonObject | null {
+    if (error instanceof AxiosError) {
+      const status = error.response?.status ?? null;
+      const data = error.response?.data;
+      return {
+        provider: 'http',
+        status,
+        data:
+          data && typeof data === 'object'
+            ? (data as Prisma.JsonObject)
+            : data !== undefined
+              ? { raw: String(data) }
+              : null,
+      };
+    }
+
+    if (error instanceof Error) {
+      return {
+        provider: 'runtime',
+        message: error.message,
+        name: error.name,
+      };
+    }
+
+    return null;
+  }
+
+  private scoreTelegramCandidate(seed: string): number {
+    let score = 0.4;
+    if (/stocks?|crypto|invest|trade|alpha/i.test(seed)) {
+      score += 0.35;
+    }
+    if (/t\.me\/|^@/.test(seed)) {
+      score += 0.15;
+    }
+    if (/vip|signals?|pump/i.test(seed)) {
+      score -= 0.2;
+    }
+    return Math.max(0, Math.min(1, score));
+  }
+
+  private async recordAccountOutcomeSafe(
+    accountId: string,
+    outcome: {
+      success: boolean;
+      reason?: string;
+      restricted?: boolean;
+      metadata?: Prisma.JsonObject;
+    },
+  ): Promise<void> {
+    try {
+      await this.accountsService.recordPublishOutcome(accountId, outcome);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'record_outcome_failed';
+      this.logger.warn(
+        `Failed to record account outcome for ${accountId}: ${message}`,
+      );
+    }
+  }
+
+  private async acquirePublishJobLock(lockKey: string): Promise<boolean> {
+    const result = await this.prisma.$queryRaw<Array<{ locked: boolean }>>`
+      SELECT pg_try_advisory_lock(hashtext(${lockKey})::bigint) AS locked
+    `;
+    return result[0]?.locked === true;
+  }
+
+  private async releasePublishJobLock(lockKey: string): Promise<void> {
+    await this.prisma.$queryRaw`
+      SELECT pg_advisory_unlock(hashtext(${lockKey})::bigint)
+    `;
+  }
+}
+
+function isRestrictionError(message: string): boolean {
+  return /(ban|blocked|restricted|suspended|captcha|locked|challenge)/i.test(
+    message,
+  );
+}
+
+function isReroutableFailure(message: string): boolean {
+  return /(timeout|429|5\d\d|captcha|challenge|blocked|restricted|network)/i.test(
+    message,
+  );
 }

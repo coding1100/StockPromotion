@@ -1,7 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import {
   HIGH_RISK_PATTERNS,
-  MANDATORY_DISCLAIMER,
   MEDIUM_RISK_PATTERNS,
 } from '../common/constants/policy.constants';
 import { RiskLevel } from '@prisma/client';
@@ -35,12 +34,8 @@ export class PolicyService {
       }
     }
 
-    const withDisclaimer = body.includes(MANDATORY_DISCLAIMER)
-      ? body
-      : `${body}\n\n${MANDATORY_DISCLAIMER}`;
-
     return {
-      body: withDisclaimer,
+      body,
       riskLevel,
       flags,
       autoApproved: riskLevel === RiskLevel.LOW,

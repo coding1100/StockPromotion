@@ -6,6 +6,12 @@
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
+    "postinstall": "npm run prisma:generate",
+    "prestart": "npm run prisma:generate",
+    "prestart:dev": "npm run prisma:generate",
+    "prestart:prod": "npm run prisma:generate",
+    "prebuild": "npm run prisma:generate",
+    "pretest": "npm run prisma:generate",
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
@@ -20,7 +26,11 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy"
+    "prisma:deploy": "prisma migrate deploy",
+    "ops:backup-db": "powershell -ExecutionPolicy Bypass -File ./scripts/backup-postgres.ps1",
+    "ops:restore-db": "powershell -ExecutionPolicy Bypass -File ./scripts/restore-postgres.ps1",
+    "ops:verify-restore": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-restore.ps1",
+    "ops:replay-window": "powershell -ExecutionPolicy Bypass -File ./scripts/replay-failed-window.ps1"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
@@ -40,8 +50,10 @@
     "ioredis": "^5.10.1",
     "joi": "^18.1.1",
     "openai": "^6.33.0",
-    "playwright": "^1.58.2",
+    "playwright": "^1.59.0",
+    "playwright-extra": "^4.3.6",
     "prisma": "^6.16.2",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "swagger-ui-express": "^5.0.1",
@@ -82,6 +94,9 @@
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
+    },
+    "moduleNameMapper": {
+      "^@prisma/client$": "<rootDir>/../node_modules/@prisma/client/default.js"
     },
     "collectCoverageFrom": [
       "**/*.(t|j)s"

@@ -14,4 +14,13 @@ describe('extractSymbols', () => {
 
     expect(symbols).toEqual([]);
   });
+
+  it('uses allowlist to suppress uppercase noise', () => {
+    const text = 'MARKET TODAY AAPL CEOS TALK ABOUT GDP';
+    const symbols = extractSymbols(text, {
+      allowedSymbols: new Set(['AAPL']),
+    });
+
+    expect(symbols).toEqual(['AAPL']);
+  });
 });

@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { randomUUID } from 'crypto';
+import { ConfigService } from '@nestjs/config';
 import { DraftStatus } from '@prisma/client';
 import {
   PIPELINE_JOB_RUN,
@@ -20,6 +21,7 @@ export class OrchestrationService {
   private static readonly PIPELINE_LOCK_KEY = 900_410_037;
 
   constructor(
+    private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly ingestionService: IngestionService,
     private readonly trendsService: TrendsService,
@@ -78,19 +80,31 @@ export class OrchestrationService {
 
     try {
       const ingestion = await this.ingestionService.runIngestionCycle();
-      if (ingestion.activeSources.length < 2) {
+      const minActiveSources = Math.max(
+        1,
+        this.configService.get<number>('PIPELINE_MIN_ACTIVE_SOURCES') ?? 2,
+      );
+
+      if (ingestion.activeSources.length < minActiveSources) {
         await this.auditService.record(
           'pipeline.run.blocked',
           'system',
           'pipeline',
           {
             reason: 'minimum_active_sources_not_met',
+            minActiveSources,
             activeSources: ingestion.activeSources,
             connectors: ingestion.connectors,
           },
         );
+        const connectorDiagnostics = Object.entries(ingestion.connectors)
+          .map(([name, value]) => {
+            return `${name}(configured=${value.configured}, healthy=${value.healthy}, fresh=${value.fresh}, error=${value.error ?? 'none'})`;
+          })
+          .join('; ');
+
         throw new Error(
-          `Pipeline requires at least 2 active sources. Active: ${ingestion.activeSources.join(', ') || 'none'}`,
+          `Pipeline requires at least ${minActiveSources} active sources. Active: ${ingestion.activeSources.join(', ') || 'none'}. Connectors: ${connectorDiagnostics}`,
         );
       }
 

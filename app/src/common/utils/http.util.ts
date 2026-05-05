@@ -6,6 +6,13 @@ type RetryOptions = {
   maxDelayMs: number;
 };
 
+type RetryAfterPayload = {
+  retry_after?: unknown;
+  parameters?: {
+    retry_after?: unknown;
+  };
+};
+
 export async function executeWithRetry<T>(
   operation: () => Promise<T>,
   options: RetryOptions,
@@ -22,9 +29,14 @@ export async function executeWithRetry<T>(
         throw error;
       }
 
+      const retryAfterDelayMs = getRetryAfterDelayMs(error);
       const exponentialDelay = options.baseDelayMs * 2 ** attempt;
       const jitter = Math.floor(Math.random() * 100);
-      const delayMs = Math.min(options.maxDelayMs, exponentialDelay + jitter);
+      const computedDelay = Math.min(
+        options.maxDelayMs,
+        exponentialDelay + jitter,
+      );
+      const delayMs = Math.max(computedDelay, retryAfterDelayMs ?? 0);
       await sleep(delayMs);
       attempt += 1;
     }
@@ -44,6 +56,56 @@ function isRetryableHttpError(error: unknown): boolean {
 
   const status = error.response.status;
   return status === 408 || status === 429 || status >= 500;
+}
+
+function getRetryAfterDelayMs(error: unknown): number | null {
+  if (!(error instanceof AxiosError)) {
+    return null;
+  }
+
+  const retryAfterFromHeader = parseRetryAfterHeader(error.response?.headers);
+  if (retryAfterFromHeader !== null) {
+    return retryAfterFromHeader;
+  }
+
+  if (!error.response?.data || typeof error.response.data !== 'object') {
+    return null;
+  }
+
+  const payload = error.response.data as RetryAfterPayload;
+  const retryAfterRaw = payload.retry_after ?? payload.parameters?.retry_after;
+  if (typeof retryAfterRaw !== 'number' || !Number.isFinite(retryAfterRaw)) {
+    return null;
+  }
+
+  const seconds = Math.max(0, retryAfterRaw);
+  return Math.floor(seconds * 1000);
+}
+
+function parseRetryAfterHeader(headers: unknown): number | null {
+  if (!headers || typeof headers !== 'object') {
+    return null;
+  }
+
+  const headerMap = headers as Record<string, unknown>;
+  const headerValue =
+    headerMap['retry-after'] ?? headerMap['Retry-After'] ?? null;
+  if (headerValue === null || headerValue === undefined) {
+    return null;
+  }
+
+  const normalizedHeaderValue = Array.isArray(headerValue)
+    ? headerValue[0]
+    : headerValue;
+  const parsedSeconds =
+    typeof normalizedHeaderValue === 'number'
+      ? normalizedHeaderValue
+      : Number(normalizedHeaderValue);
+
+  if (!Number.isFinite(parsedSeconds)) {
+    return null;
+  }
+  return Math.floor(Math.max(0, parsedSeconds) * 1000);
 }
 
 function sleep(ms: number): Promise<void> {

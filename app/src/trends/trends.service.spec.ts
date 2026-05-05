@@ -6,6 +6,9 @@ describe('TrendsService', () => {
     const createdRows: Array<{ windowType: TrendWindow }> = [];
 
     const prisma = {
+      sourceConnectorState: {
+        findMany: jest.fn().mockResolvedValue([]),
+      },
       sourceEvent: {
         findMany: jest.fn().mockResolvedValue([
           {
@@ -17,6 +20,7 @@ describe('TrendsService', () => {
         ]),
       },
       trendTopic: {
+        findMany: jest.fn().mockResolvedValue([]),
         create: jest
           .fn()
           .mockImplementation((args: { data: { windowType: TrendWindow } }) => {
@@ -31,6 +35,7 @@ describe('TrendsService', () => {
     };
 
     const configService = {
+      get: jest.fn().mockReturnValue('1,6,24'),
       getOrThrow: jest.fn().mockReturnValue(1),
     };
     const auditService = {
@@ -55,6 +60,6 @@ describe('TrendsService', () => {
       TrendWindow.H6,
       TrendWindow.H24,
     ]);
-    expect(prisma.sourceEvent.findMany).toHaveBeenCalledTimes(3);
+    expect(prisma.sourceEvent.findMany).toHaveBeenCalledTimes(1);
   });
 });

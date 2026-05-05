@@ -12,6 +12,7 @@ import { PipelineProcessor } from './pipeline.processor';
 import { OrchestrationScheduler } from './orchestration.scheduler';
 import { TelemetryModule } from '../telemetry/telemetry.module';
 import { PrismaModule } from '../prisma/prisma.module';
+import { RetentionModule } from '../retention/retention.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { PrismaModule } from '../prisma/prisma.module';
     AuditModule,
     TelemetryModule,
     PrismaModule,
+    RetentionModule,
   ],
   providers: [OrchestrationService, PipelineProcessor, OrchestrationScheduler],
   controllers: [OrchestrationController],
