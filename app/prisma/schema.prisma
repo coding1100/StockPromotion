@@ -43,6 +43,7 @@ enum DraftStatus {
 enum PublishPlatform {
   STOCKTWITS
   TELEGRAM
+  DISCORD
 }
 
 enum PublishStatus {

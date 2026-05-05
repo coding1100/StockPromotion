@@ -18,8 +18,10 @@ import { LlmModule } from './llm/llm.module';
 import { TelemetryModule } from './telemetry/telemetry.module';
 import { envValidationSchema } from './config/environment.validation';
 import { ApiKeyGuard } from './auth/api-key.guard';
+import { ManualUiController } from './manual-ui/manual-ui.controller';
 
 @Module({
+  controllers: [ManualUiController],
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,

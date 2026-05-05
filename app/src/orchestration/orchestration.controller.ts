@@ -88,6 +88,26 @@ export class OrchestrationController {
     return { synced: true };
   }
 
+  @Post('publish/manual')
+  async publishManualPost(
+    @Body()
+    body: {
+      body?: string;
+      stocktwitsSymbol?: string;
+      publishToStocktwits?: boolean;
+      publishToDiscord?: boolean;
+      discordServerUrl?: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    return this.publishingService.publishManualPost({
+      body: body.body ?? '',
+      stocktwitsSymbol: body.stocktwitsSymbol,
+      publishToStocktwits: body.publishToStocktwits,
+      publishToDiscord: body.publishToDiscord,
+      discordServerUrl: body.discordServerUrl,
+    });
+  }
+
   @Get('publish/jobs')
   async listPublishJobs(
     @Query('limit') limit?: string,

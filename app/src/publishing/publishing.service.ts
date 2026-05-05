@@ -31,6 +31,7 @@ import { StocktwitsPublisher } from './stocktwits.publisher';
 import { TelemetryService } from '../telemetry/telemetry.service';
 import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
 import { MANDATORY_DISCLAIMER } from '../common/constants/policy.constants';
+import { DiscordUiPublisher } from './discord-ui.publisher';
 
 @Injectable()
 export class PublishingService {
@@ -45,6 +46,7 @@ export class PublishingService {
     private readonly auditService: AuditService,
     private readonly telegramPublisher: TelegramPublisher,
     private readonly stocktwitsPublisher: StocktwitsPublisher,
+    private readonly discordUiPublisher: DiscordUiPublisher,
     private readonly telemetryService: TelemetryService,
     @InjectQueue(PUBLISH_QUEUE) private readonly publishQueue: Queue,
   ) {}
@@ -348,6 +350,36 @@ export class PublishingService {
       this.logger.log(
         `Executing publish job ${job.id} (${job.platform}) -> ${job.targetRef}`,
       );
+
+      if (job.platform === PublishPlatform.DISCORD) {
+        await this.prisma.publishJob.update({
+          where: { id: job.id },
+          data: {
+            status: PublishStatus.SKIPPED,
+            attempts: {
+              increment: 1,
+            },
+            lastError:
+              'discord_webhook_publishing_removed_use_manual_discord_ui_mode',
+          },
+        });
+        await this.prisma.publishAttempt.create({
+          data: {
+            publishJobId: job.id,
+            success: false,
+            errorClass: 'platform_removed',
+            errorMessage:
+              'Discord webhook/bot publishing removed. Use manual publish with discord UI mode.',
+          },
+        });
+        await this.reconcileDraftPublishState(job.draftId);
+        await this.auditService.record('publish.skipped', 'publish_job', job.id, {
+          platform: job.platform,
+          reason:
+            'discord_webhook_publishing_removed_use_manual_discord_ui_mode',
+        });
+        return;
+      }
 
       try {
         let activeAccount = job.account;
@@ -1088,6 +1120,324 @@ export class PublishingService {
     };
   }
 
+  async publishManualPost(input: {
+    body: string;
+    stocktwitsSymbol?: string;
+    publishToStocktwits?: boolean;
+    publishToDiscord?: boolean;
+    discordServerUrl?: string;
+  }): Promise<{
+    id: string;
+    body: string;
+    success: boolean;
+    stocktwits: {
+      attempted: boolean;
+      success: boolean;
+      accountId: string | null;
+      accountHandle: string | null;
+      targetSymbol: string | null;
+      externalPostId: string | null;
+      evidenceUri: string | null;
+      error: string | null;
+    };
+    discord: {
+      attempted: boolean;
+      targetCount: number;
+      successCount: number;
+      skippedCount: number;
+      failedCount: number;
+      error: string | null;
+      results: Array<{
+        channelId: string;
+        success: boolean;
+        externalPostId: string | null;
+        error: string | null;
+      }>;
+    };
+  }> {
+    const sanitizedBody = this.stripMandatoryDisclaimer(input.body || '').trim();
+    if (!sanitizedBody) {
+      throw new BadRequestException('body is required');
+    }
+
+    const publishToStocktwits = input.publishToStocktwits !== false;
+    const publishToDiscord = input.publishToDiscord !== false;
+    if (!publishToStocktwits && !publishToDiscord) {
+      throw new BadRequestException(
+        'At least one destination must be enabled (StockTwits or Discord).',
+      );
+    }
+
+    const stocktwitsSymbolRaw = (input.stocktwitsSymbol || '').trim();
+    let normalizedStocktwitsSymbol: string | null = null;
+    if (stocktwitsSymbolRaw) {
+      normalizedStocktwitsSymbol =
+        this.normalizeStocktwitsTargetSymbol(stocktwitsSymbolRaw);
+      if (!normalizedStocktwitsSymbol) {
+        throw new BadRequestException(
+          'stocktwitsSymbol is invalid. Use a ticker like AAPL.',
+        );
+      }
+    }
+
+    const manualPublishId = `manual-${Date.now()}-${randomInt(100000, 1_000_000)}`;
+
+    const stocktwitsResult: {
+      attempted: boolean;
+      success: boolean;
+      accountId: string | null;
+      accountHandle: string | null;
+      targetSymbol: string | null;
+      externalPostId: string | null;
+      evidenceUri: string | null;
+      error: string | null;
+    } = {
+      attempted: publishToStocktwits,
+      success: false,
+      accountId: null,
+      accountHandle: null,
+      targetSymbol: normalizedStocktwitsSymbol,
+      externalPostId: null,
+      evidenceUri: null,
+      error: null,
+    };
+
+    const discordResult: {
+      attempted: boolean;
+      targetCount: number;
+      successCount: number;
+      skippedCount: number;
+      failedCount: number;
+      error: string | null;
+      results: Array<{
+        channelId: string;
+        success: boolean;
+        externalPostId: string | null;
+        error: string | null;
+      }>;
+    } = {
+      attempted: publishToDiscord,
+      targetCount: 0,
+      successCount: 0,
+      skippedCount: 0,
+      failedCount: 0,
+      error: null,
+      results: [],
+    };
+
+    await this.accountsService.syncAccountsFromConfig();
+
+    if (publishToStocktwits) {
+      let selectedAccount: {
+        id: string;
+        accountHandle: string;
+      } | null = null;
+      try {
+        selectedAccount = await this.accountsService.getEligibleAccount(
+          AccountPlatform.STOCKTWITS,
+          {
+            scheduledAt: new Date(),
+          },
+        );
+        if (!selectedAccount) {
+          throw new Error('stocktwits_no_eligible_account');
+        }
+
+        const credentialsRaw = this.accountsService.getStocktwitsCredentials(
+          selectedAccount.accountHandle,
+        );
+        if (!credentialsRaw) {
+          throw new Error('stocktwits_credentials_missing');
+        }
+        // Thread the account handle into the credentials object so the
+        // publisher can isolate browser profiles per-account (no cookie
+        // bleed between accounts).
+        const credentials = {
+          ...credentialsRaw,
+          handle: selectedAccount.accountHandle,
+        };
+
+        const stocktwitsMessage = this.buildStocktwitsSymbolMessage(
+          sanitizedBody,
+          normalizedStocktwitsSymbol,
+        );
+        const stocktwitsPublishId = `${manualPublishId}-stocktwits`;
+
+        // If the request didn't specify a symbol, broadcast to every entry
+        // in STOCKTWITS_TARGET_SYMBOLS instead of posting once to the first
+        // one. The env list is the user-managed broadcast target list.
+        const hasExplicitSymbol = Boolean(normalizedStocktwitsSymbol);
+        const envSymbolList =
+          this.configService.get<string>('STOCKTWITS_TARGET_SYMBOLS')?.trim() ?? '';
+        const useBroadcast = !hasExplicitSymbol && envSymbolList.length > 0;
+
+        if (useBroadcast) {
+          const broadcast = await this.stocktwitsPublisher.publishToTargetSymbols(
+            credentials,
+            stocktwitsMessage,
+            stocktwitsPublishId,
+          );
+
+          const successfulIds = broadcast.results
+            .filter((r) => r.success && r.externalPostId)
+            .map((r) => `${r.symbol}:${r.externalPostId}`);
+          const firstSuccess = broadcast.results.find((r) => r.success) ?? null;
+          const failureSummary = broadcast.results
+            .filter((r) => !r.success)
+            .map((r) => `${r.symbol}=${r.error ?? 'unknown'}`)
+            .join('; ');
+
+          stocktwitsResult.success = broadcast.successCount > 0;
+          stocktwitsResult.accountId = selectedAccount.id;
+          stocktwitsResult.accountHandle = selectedAccount.accountHandle;
+          stocktwitsResult.externalPostId = successfulIds.join(',') || null;
+          stocktwitsResult.evidenceUri =
+            firstSuccess?.evidenceUri ??
+            broadcast.results[0]?.evidenceUri ??
+            null;
+          if (broadcast.failedCount > 0) {
+            stocktwitsResult.error =
+              broadcast.successCount === 0
+                ? `stocktwits_broadcast_all_failed: ${failureSummary}`
+                : `stocktwits_broadcast_partial: ${failureSummary}`;
+          }
+
+          await this.recordAccountOutcomeSafe(selectedAccount.id, {
+            success: stocktwitsResult.success,
+            reason: stocktwitsResult.error ?? undefined,
+            metadata: {
+              mode: 'manual_broadcast',
+              platform: PublishPlatform.STOCKTWITS,
+              targetRef: broadcast.results.map((r) => r.symbol).join(','),
+              totalCount: broadcast.totalCount,
+              successCount: broadcast.successCount,
+              failedCount: broadcast.failedCount,
+            },
+          });
+        } else {
+          const publishResult = await this.stocktwitsPublisher.publish(
+            credentials,
+            stocktwitsMessage,
+            stocktwitsPublishId,
+            normalizedStocktwitsSymbol ?? undefined,
+          );
+
+          stocktwitsResult.success = true;
+          stocktwitsResult.accountId = selectedAccount.id;
+          stocktwitsResult.accountHandle = selectedAccount.accountHandle;
+          stocktwitsResult.externalPostId = publishResult.externalPostId;
+          stocktwitsResult.evidenceUri = publishResult.evidenceUri;
+
+          await this.recordAccountOutcomeSafe(selectedAccount.id, {
+            success: true,
+            metadata: {
+              mode: 'manual_direct',
+              platform: PublishPlatform.STOCKTWITS,
+              targetRef: normalizedStocktwitsSymbol ?? 'home',
+            },
+          });
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'stocktwits_publish_failed';
+        stocktwitsResult.success = false;
+        stocktwitsResult.accountId = selectedAccount?.id ?? null;
+        stocktwitsResult.accountHandle = selectedAccount?.accountHandle ?? null;
+        stocktwitsResult.error = message;
+
+        if (selectedAccount?.id) {
+          await this.recordAccountOutcomeSafe(selectedAccount.id, {
+            success: false,
+            reason: message,
+            restricted: isRestrictionError(message),
+            metadata: {
+              mode: 'manual_direct',
+              platform: PublishPlatform.STOCKTWITS,
+              targetRef: normalizedStocktwitsSymbol ?? 'home',
+            },
+          });
+        }
+      }
+    }
+
+    if (publishToDiscord) {
+      const serverUrl =
+        input.discordServerUrl?.trim() ||
+        this.configService.get<string>('DISCORD_UI_SERVER_URL')?.trim() ||
+        '';
+      if (!serverUrl) {
+        discordResult.error =
+          'discord_ui_server_url_missing (provide discordServerUrl)';
+      } else {
+        try {
+          const uiResult = await this.discordUiPublisher.broadcastToWritableChannels(
+            {
+              serverUrl,
+              message: sanitizedBody,
+            },
+          );
+
+          discordResult.targetCount = uiResult.channelCount;
+          discordResult.successCount = uiResult.postedCount;
+          discordResult.skippedCount = uiResult.skippedCount;
+          discordResult.failedCount = uiResult.failedCount;
+          discordResult.results = uiResult.channels.map((row) => ({
+            channelId: row.channelId,
+            success: row.posted,
+            externalPostId: null,
+            error: row.reason,
+          }));
+        } catch (error) {
+          discordResult.error =
+            error instanceof Error ? error.message : 'discord_ui_publish_failed';
+        }
+      }
+    }
+
+    const stocktwitsSucceeded = !publishToStocktwits || stocktwitsResult.success;
+    const discordSucceeded =
+      !publishToDiscord ||
+      (discordResult.error === null &&
+        discordResult.failedCount === 0 &&
+        discordResult.successCount > 0);
+    const success = stocktwitsSucceeded && discordSucceeded;
+
+    this.telemetryService.increment(
+      success
+        ? 'pipeline.publish.manual.success'
+        : 'pipeline.publish.manual.partial_or_failed',
+    );
+
+    await this.auditService.record('publish.manual.direct', 'manual_post', manualPublishId, {
+      success,
+      publishToStocktwits,
+      publishToDiscord,
+      discordMode: 'ui',
+      stocktwits: {
+        success: stocktwitsResult.success,
+        accountHandle: stocktwitsResult.accountHandle,
+        targetSymbol: stocktwitsResult.targetSymbol,
+        externalPostId: stocktwitsResult.externalPostId,
+        error: stocktwitsResult.error,
+      },
+      discord: {
+        targetCount: discordResult.targetCount,
+        successCount: discordResult.successCount,
+        skippedCount: discordResult.skippedCount,
+        failedCount: discordResult.failedCount,
+        error: discordResult.error,
+      },
+    });
+
+    return {
+      id: manualPublishId,
+      body: sanitizedBody,
+      success,
+      stocktwits: stocktwitsResult,
+      discord: discordResult,
+    };
+  }
+
   private async resolveTelegramTargets(): Promise<string[]> {
     const defaults = (
       this.configService.get<string>('TELEGRAM_DEFAULT_CHAT_IDS') || ''
@@ -1555,7 +1905,12 @@ export class PublishingService {
     const platform =
       job.platform === PublishPlatform.TELEGRAM
         ? AccountPlatform.TELEGRAM
-        : AccountPlatform.STOCKTWITS;
+        : job.platform === PublishPlatform.STOCKTWITS
+          ? AccountPlatform.STOCKTWITS
+          : null;
+    if (!platform) {
+      return false;
+    }
     const fallback = await this.accountsService.getEligibleAccount(platform, {
       excludeAccountId: job.accountId,
       scheduledAt: new Date(
@@ -1753,6 +2108,26 @@ export class PublishingService {
       score -= 0.2;
     }
     return Math.max(0, Math.min(1, score));
+  }
+
+  private async recordAccountOutcomeSafe(
+    accountId: string,
+    outcome: {
+      success: boolean;
+      reason?: string;
+      restricted?: boolean;
+      metadata?: Prisma.JsonObject;
+    },
+  ): Promise<void> {
+    try {
+      await this.accountsService.recordPublishOutcome(accountId, outcome);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'record_outcome_failed';
+      this.logger.warn(
+        `Failed to record account outcome for ${accountId}: ${message}`,
+      );
+    }
   }
 
   private async acquirePublishJobLock(lockKey: string): Promise<boolean> {

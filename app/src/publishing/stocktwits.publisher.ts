@@ -11,12 +11,37 @@ chromium.use(StealthPlugin());
 type StocktwitsAccountConfig = {
   username: string;
   password: string;
+  handle?: string;
 };
 
 type RankedSymbolCandidate = {
   rank: number;
   symbol: string;
 };
+
+type CapSolverCreateTaskResponse = {
+  errorId: number;
+  errorCode?: string;
+  errorDescription?: string;
+  status?: 'idle' | 'processing' | 'ready' | 'failed';
+  taskId?: string;
+};
+
+type CapSolverTaskResult = {
+  errorId: number;
+  errorCode?: string;
+  errorDescription?: string;
+  status?: 'idle' | 'processing' | 'ready' | 'failed';
+  taskId?: string;
+  solution?: {
+    token?: string;
+    userAgent?: string;
+    type?: string;
+  };
+};
+
+const CAPSOLVER_CREATE_TASK_URL = 'https://api.capsolver.com/createTask';
+const CAPSOLVER_GET_TASK_RESULT_URL = 'https://api.capsolver.com/getTaskResult';
 
 const DEFAULT_TRENDING_SYMBOL_LIMIT = 10;
 
@@ -26,6 +51,13 @@ export class StocktwitsPublisher {
 
   constructor(private readonly configService: ConfigService) {}
 
+  private get publishConfirmTimeoutMs(): number {
+    return (
+      this.configService.get<number>('STOCKTWITS_PUBLISH_CONFIRM_TIMEOUT_MS') ??
+      30_000
+    );
+  }
+
   async bootstrapSession(account: StocktwitsAccountConfig): Promise<{
     authenticated: boolean;
     challengeVisible: boolean;
@@ -34,7 +66,9 @@ export class StocktwitsPublisher {
     const loginUrl = this.configService.getOrThrow<string>('STOCKTWITS_LOGIN_URL');
     const manualLoginTimeoutMs =
       this.configService.getOrThrow<number>('STOCKTWITS_MANUAL_LOGIN_TIMEOUT_MS');
-    const { context, page, userDataDir } = await this.createBrowserSession();
+    const { context, page, userDataDir } = await this.createBrowserSession(
+      account.handle,
+    );
 
     try {
       await page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
@@ -99,7 +133,7 @@ export class StocktwitsPublisher {
     const manualLoginTimeoutMs =
       this.configService.getOrThrow<number>('STOCKTWITS_MANUAL_LOGIN_TIMEOUT_MS');
 
-    const { context, page } = await this.createBrowserSession();
+    const { context, page } = await this.createBrowserSession(account.handle);
     try {
       await page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
       await this.dismissCookieBanner(page);
@@ -128,6 +162,151 @@ export class StocktwitsPublisher {
     }
   }
 
+  async publishToTargetSymbols(
+    account: StocktwitsAccountConfig,
+    message: string,
+    jobId: string,
+  ): Promise<{
+    totalCount: number;
+    successCount: number;
+    failedCount: number;
+    results: Array<{
+      symbol: string;
+      success: boolean;
+      externalPostId: string | null;
+      evidenceUri: string | null;
+      error: string | null;
+    }>;
+  }> {
+    const symbols = this.parseTargetSymbolsFromEnv();
+    if (symbols.length === 0) {
+      throw new Error(
+        'stocktwits_no_target_symbols_configured: set STOCKTWITS_TARGET_SYMBOLS to a comma-separated list (e.g. GME,AAPL,TSLA).',
+      );
+    }
+
+    const loginUrl = this.configService.getOrThrow<string>('STOCKTWITS_LOGIN_URL');
+    const postUrl = this.configService.getOrThrow<string>('STOCKTWITS_POST_URL');
+    const manualLoginTimeoutMs =
+      this.configService.getOrThrow<number>(
+        'STOCKTWITS_MANUAL_LOGIN_TIMEOUT_MS',
+      );
+
+    const artifactsDir = join(process.cwd(), 'artifacts', 'stocktwits');
+    await mkdir(artifactsDir, { recursive: true });
+
+    const { context, page } = await this.createBrowserSession(account.handle);
+    const results: Array<{
+      symbol: string;
+      success: boolean;
+      externalPostId: string | null;
+      evidenceUri: string | null;
+      error: string | null;
+    }> = [];
+
+    try {
+      await page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
+      await this.dismissCookieBanner(page);
+      await this.handlePossibleChallenge(page, manualLoginTimeoutMs);
+      await this.performLoginIfNeeded(page, account, manualLoginTimeoutMs);
+
+      if (!(await this.isAuthenticated(page))) {
+        throw new Error('stocktwits_session_refresh_required');
+      }
+
+      await page.goto(postUrl, { waitUntil: 'domcontentloaded' });
+      await this.dismissCookieBanner(page);
+      await this.handlePossibleChallenge(page, manualLoginTimeoutMs);
+
+      for (let i = 0; i < symbols.length; i += 1) {
+        const symbol = symbols[i];
+        const successImg = join(
+          artifactsDir,
+          `${jobId}-${symbol}.png`,
+        );
+        const errorImg = join(
+          artifactsDir,
+          `${jobId}-${symbol}-error.png`,
+        );
+
+        try {
+          this.logger.log(
+            `Stocktwits target symbol ${i + 1}/${symbols.length}: $${symbol}`,
+          );
+          const externalPostId = await this.postOnSymbolFeed(
+            page,
+            postUrl,
+            symbol,
+            message,
+          );
+          if (!externalPostId) {
+            throw new Error(
+              'stocktwits_publish_not_confirmed. Submit was clicked but no post confirmation/message ID was detected.',
+            );
+          }
+
+          await page.screenshot({ path: successImg, fullPage: true }).catch(() => undefined);
+          results.push({
+            symbol,
+            success: true,
+            externalPostId,
+            evidenceUri: successImg,
+            error: null,
+          });
+        } catch (error) {
+          const reason =
+            error instanceof Error ? error.message : 'stocktwits_publish_failed';
+          await page
+            .screenshot({ path: errorImg, fullPage: true })
+            .catch(() => undefined);
+          this.logger.warn(
+            `Stocktwits publish failed for $${symbol}: ${reason}`,
+          );
+          results.push({
+            symbol,
+            success: false,
+            externalPostId: null,
+            evidenceUri: errorImg,
+            error: `${reason} | evidence:${errorImg}`,
+          });
+        }
+
+        if (i < symbols.length - 1) {
+          const interSymbolDelay = 2_000 + Math.floor(Math.random() * 3_000);
+          this.logger.debug(
+            `Waiting ${interSymbolDelay}ms before next symbol`,
+          );
+          await this.delay(interSymbolDelay);
+        }
+      }
+
+      return {
+        totalCount: results.length,
+        successCount: results.filter((r) => r.success).length,
+        failedCount: results.filter((r) => !r.success).length,
+        results,
+      };
+    } finally {
+      await context.close();
+    }
+  }
+
+  private parseTargetSymbolsFromEnv(): string[] {
+    const raw =
+      this.configService.get<string>('STOCKTWITS_TARGET_SYMBOLS')?.trim() ?? '';
+    if (!raw) {
+      return [];
+    }
+    const out: string[] = [];
+    for (const token of raw.split(',')) {
+      const normalized = normalizeStocktwitsSymbol(token.trim());
+      if (normalized && !out.includes(normalized)) {
+        out.push(normalized);
+      }
+    }
+    return out;
+  }
+
   async publish(
     account: StocktwitsAccountConfig,
     message: string,
@@ -144,8 +323,25 @@ export class StocktwitsPublisher {
     const successImg = join(artifactsDir, `${jobId}.png`);
     const errorImg = join(artifactsDir, `${jobId}-error.png`);
 
-    const { context, page } = await this.createBrowserSession();
-    const normalizedTarget = normalizeStocktwitsSymbol(targetSymbol ?? '');
+    // Resolve the symbol: explicit param wins, otherwise fall back to the
+    // first entry in STOCKTWITS_TARGET_SYMBOLS. The homepage composer flow is
+    // intentionally NOT a fallback — every post must land on a /symbol/{X}
+    // page. If neither source provides a symbol, fail loudly.
+    let normalizedTarget = normalizeStocktwitsSymbol(targetSymbol ?? '');
+    if (!normalizedTarget) {
+      const envSymbols = this.parseTargetSymbolsFromEnv();
+      if (envSymbols.length === 0) {
+        throw new Error(
+          'stocktwits_no_target_symbol: pass `targetSymbol` to publish() or set STOCKTWITS_TARGET_SYMBOLS in .env. The homepage composer flow has been removed.',
+        );
+      }
+      normalizedTarget = envSymbols[0];
+      this.logger.warn(
+        `Stocktwits publish() called without targetSymbol — using "${normalizedTarget}" from STOCKTWITS_TARGET_SYMBOLS. For multi-symbol broadcast, call publishToTargetSymbols() instead.`,
+      );
+    }
+
+    const { context, page } = await this.createBrowserSession(account.handle);
 
     try {
       await page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
@@ -157,27 +353,16 @@ export class StocktwitsPublisher {
         throw new Error('stocktwits_session_refresh_required');
       }
 
-      await page.goto(postUrl, { waitUntil: 'domcontentloaded' });
-      await this.dismissCookieBanner(page);
-      await this.handlePossibleChallenge(page, manualLoginTimeoutMs);
-
-      let externalPostId: string | null = null;
-      if (normalizedTarget) {
-        externalPostId = await this.postOnSymbolFeed(
-          page,
-          postUrl,
-          normalizedTarget,
-          message,
-        );
-      } else {
-        await this.openPostDialog(page);
-        const composer = await this.resolveComposer(page);
-        await this.fillComposer(composer, message);
-        await this.submitPost(page);
-        await this.handlePostConfirmationModal(page);
-        await this.finalizeDialogPost(page);
-        externalPostId = await this.waitForPublishConfirmation(page, 15_000);
-      }
+      // Note: we used to land on STOCKTWITS_POST_URL (the home feed) here and
+      // then navigate to the symbol page. That intermediate stop is what
+      // exposed the homepage Post button. Skip it — postOnSymbolFeed will
+      // page.goto() the /symbol/{X} URL directly.
+      const externalPostId = await this.postOnSymbolFeed(
+        page,
+        postUrl,
+        normalizedTarget,
+        message,
+      );
 
       if (!externalPostId) {
         throw new Error(
@@ -203,7 +388,287 @@ export class StocktwitsPublisher {
     }
   }
 
-  private async createBrowserSession(): Promise<{
+  // ============ CAPSOLVER INTEGRATION ============
+
+  private async extractTurnstileParams(page: Page): Promise<{
+    sitekey: string | null;
+    cData: string | null;
+    chlPageData: string | null;
+    action: string | null;
+    userAgent: string;
+  }> {
+    const userAgent = await page.evaluate(() => navigator.userAgent);
+
+    // Prefer reading widget attributes directly — when the challenge is already
+    // rendered, the render() hook below misses the params and returns nulls.
+    const fromDom = await page
+      .evaluate(() => {
+        const el =
+          document.querySelector('.cf-turnstile') ||
+          document.querySelector('[data-sitekey]');
+        if (!el) {
+          return null;
+        }
+        return {
+          sitekey: el.getAttribute('data-sitekey'),
+          cData: el.getAttribute('data-cdata'),
+          action: el.getAttribute('data-action'),
+        };
+      })
+      .catch(() => null);
+
+    let sitekey: string | null = fromDom?.sitekey ?? null;
+
+    if (!sitekey) {
+      sitekey = await page
+        .locator('[data-sitekey]')
+        .first()
+        .getAttribute('data-sitekey')
+        .catch(() => null);
+    }
+
+    if (!sitekey) {
+      const content = await page.content();
+      const match = content.match(/data-sitekey=["']([^"']+)["']/);
+      sitekey = match?.[1] ?? null;
+    }
+
+    const intercepted = await page.evaluate(() => {
+      return new Promise<{
+        cData: string | null;
+        chlPageData: string | null;
+        action: string | null;
+      }>((resolve) => {
+        const result = { cData: null as string | null, chlPageData: null as string | null, action: null as string | null };
+
+        const checkTurnstile = () => {
+          if ((window as any).turnstile) {
+            const originalRender = (window as any).turnstile.render;
+            (window as any).turnstile.render = function(a: any, b: any) {
+              result.cData = b?.cData ?? null;
+              result.chlPageData = b?.chlPageData ?? null;
+              result.action = b?.action ?? null;
+              if (b?.callback) {
+                (window as any).__turnstileCallback = b.callback;
+              }
+              return originalRender?.apply(this, arguments);
+            };
+            resolve(result);
+            return true;
+          }
+          return false;
+        };
+
+        if (checkTurnstile()) return;
+
+        const interval = setInterval(() => {
+          if (checkTurnstile()) {
+            clearInterval(interval);
+          }
+        }, 50);
+
+        setTimeout(() => {
+          clearInterval(interval);
+          resolve(result);
+        }, 3000);
+      });
+    });
+
+    return {
+      sitekey,
+      cData: fromDom?.cData ?? intercepted.cData,
+      chlPageData: intercepted.chlPageData,
+      action: fromDom?.action ?? intercepted.action,
+      userAgent,
+    };
+  }
+
+  private async createCapSolverTask(params: {
+    sitekey: string;
+    pageUrl: string;
+    cData?: string | null;
+    action?: string | null;
+  }): Promise<string> {
+    const apiKey = this.configService.getOrThrow<string>('CAPSOLVER_API_KEY');
+
+    const taskPayload: Record<string, unknown> = {
+      type: 'AntiTurnstileTaskProxyLess',
+      websiteURL: params.pageUrl,
+      websiteKey: params.sitekey,
+    };
+
+    const metadata: Record<string, string> = {};
+    if (params.action) {
+      metadata.action = params.action;
+    }
+    if (params.cData) {
+      metadata.cdata = params.cData;
+    }
+    if (Object.keys(metadata).length > 0) {
+      taskPayload.metadata = metadata;
+    }
+
+    const response = await fetch(CAPSOLVER_CREATE_TASK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientKey: apiKey,
+        task: taskPayload,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`capsolver createTask failed: HTTP ${response.status}`);
+    }
+
+    const data = (await response.json()) as CapSolverCreateTaskResponse;
+
+    if (data.errorId !== 0) {
+      throw new Error(
+        `capsolver createTask error: ${data.errorCode} - ${data.errorDescription}`,
+      );
+    }
+
+    if (!data.taskId) {
+      throw new Error('capsolver createTask returned no taskId');
+    }
+
+    this.logger.log(`capsolver task created: ${data.taskId}`);
+    return data.taskId;
+  }
+
+  private async getCapSolverResult(
+    taskId: string,
+    maxWaitMs = 120_000,
+  ): Promise<CapSolverTaskResult> {
+    const apiKey = this.configService.getOrThrow<string>('CAPSOLVER_API_KEY');
+    const startedAt = Date.now();
+    const pollInterval = 1_000;
+
+    while (Date.now() - startedAt < maxWaitMs) {
+      const response = await fetch(CAPSOLVER_GET_TASK_RESULT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientKey: apiKey,
+          taskId,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`capsolver getTaskResult failed: HTTP ${response.status}`);
+      }
+
+      const data = (await response.json()) as CapSolverTaskResult;
+
+      if (data.errorId !== 0) {
+        throw new Error(
+          `capsolver getTaskResult error: ${data.errorCode} - ${data.errorDescription}`,
+        );
+      }
+
+      if (data.status === 'ready') {
+        this.logger.log(`capsolver task ${taskId} solved`);
+        return data;
+      }
+
+      if (data.status === 'failed') {
+        throw new Error(
+          `capsolver task ${taskId} failed: ${data.errorCode} - ${data.errorDescription}`,
+        );
+      }
+
+      this.logger.debug(
+        `capsolver task ${taskId} status=${data.status ?? 'unknown'}, retrying in ${pollInterval}ms...`,
+      );
+      await this.delay(pollInterval);
+    }
+
+    throw new Error(`capsolver task ${taskId} timed out after ${maxWaitMs}ms`);
+  }
+
+  private async solveChallengeWithCapSolver(page: Page): Promise<void> {
+    this.logger.log('Attempting to solve Cloudflare challenge via CapSolver...');
+
+    const params = await this.extractTurnstileParams(page);
+    const pageUrl = page.url();
+
+    if (!params.sitekey) {
+      throw new Error('capsolver_turnstile_sitekey_not_found');
+    }
+
+    this.logger.debug(
+      `Turnstile params - sitekey: ${params.sitekey}, action: ${params.action ?? 'none'}, cData: ${params.cData ? 'present' : 'missing'}`,
+    );
+
+    const taskId = await this.createCapSolverTask({
+      sitekey: params.sitekey,
+      pageUrl,
+      cData: params.cData,
+      action: params.action,
+    });
+
+    const result = await this.getCapSolverResult(taskId);
+
+    if (!result.solution?.token) {
+      throw new Error('capsolver_turnstile_token_missing_in_response');
+    }
+
+    await this.injectTurnstileToken(
+      page,
+      result.solution.token,
+      result.solution.userAgent,
+    );
+
+    this.logger.log('Cloudflare challenge solved via CapSolver');
+  }
+
+  private async injectTurnstileToken(
+    page: Page,
+    token: string,
+    returnedUserAgent?: string,
+  ): Promise<void> {
+    await page.evaluate((t) => {
+      const setValue = (name: string) => {
+        const input = document.querySelector(`input[name="${name}"]`) as HTMLInputElement | null;
+        if (input) {
+          input.value = t;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      };
+      setValue('cf-turnstile-response');
+      setValue('g-recaptcha-response');
+
+      const textareas = document.querySelectorAll('textarea.g-recaptcha-response');
+      textareas.forEach((ta) => {
+        (ta as HTMLTextAreaElement).value = t;
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        ta.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    }, token);
+
+    await page.evaluate((t) => {
+      const callback = (window as any).__turnstileCallback;
+      if (typeof callback === 'function') {
+        callback(t);
+      }
+    }, token);
+
+    if (returnedUserAgent) {
+      this.logger.debug(`CapSolver returned userAgent: ${returnedUserAgent}`);
+    }
+
+    await page.waitForTimeout(2_000);
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // ============ BROWSER SESSION ============
+
+  private async createBrowserSession(accountHandle?: string): Promise<{
     context: BrowserContext;
     page: Page;
     userDataDir: string;
@@ -211,9 +676,17 @@ export class StocktwitsPublisher {
     const rawHeadless = this.configService.get('STOCKTWITS_HEADLESS');
     const isHeadless = rawHeadless === true || rawHeadless === 'true';
 
-    const userDataDir =
+    const baseUserDataDir =
       this.configService.get<string>('STOCKTWITS_USER_DATA_DIR')?.trim() ||
       join(process.cwd(), '.pw-stocktwits');
+    // Per-account profile so the cookies for one Stocktwits account never
+    // leak into another. A shared profile silently re-uses a stale session
+    // (skipping login because isAuthenticated() returns true on the cached
+    // cookies) — even when a different account's credentials are supplied.
+    const safeHandle = accountHandle
+      ? accountHandle.replace(/[^a-zA-Z0-9_-]/g, '_')
+      : '_default';
+    const userDataDir = join(baseUserDataDir, safeHandle);
     const browserBinary =
       this.configService.get<string>('STOCKTWITS_BROWSER_BINARY')?.trim() || '';
 
@@ -232,12 +705,20 @@ export class StocktwitsPublisher {
         '--window-position=0,0',
       ],
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     });
 
+    const navTimeoutMs =
+      this.configService.get<number>('STOCKTWITS_NAV_TIMEOUT_MS') ?? 45_000;
     const page = context.pages()[0] ?? (await context.newPage());
+    // Only override navigation timeout — leave per-action timeouts at their
+    // shorter default so a stuck click fails fast and we can recover, instead
+    // of blocking the whole submit for 45s.
+    page.setDefaultNavigationTimeout(navTimeoutMs);
     return { context, page, userDataDir };
   }
+
+  // ============ LOGIN & AUTH ============
 
   private async performLoginIfNeeded(
     page: Page,
@@ -245,7 +726,18 @@ export class StocktwitsPublisher {
     timeout: number,
   ): Promise<void> {
     if (await this.isAuthenticated(page)) {
-      return;
+      // Cached session — verify it belongs to the expected account before
+      // trusting it. A shared user-data dir between runs can keep cookies
+      // from a *different* Stocktwits account, and isAuthenticated() would
+      // happily return true on those.
+      const mismatched = await this.detectAccountMismatch(page, account);
+      if (!mismatched) {
+        return;
+      }
+      this.logger.warn(
+        `Stocktwits cached session belongs to "${mismatched}" but request is for "${account.handle ?? account.username}". Forcing logout + re-login.`,
+      );
+      await this.forceLogoutAndReload(page);
     }
 
     let loginField = await this.findLoginField(page);
@@ -293,6 +785,122 @@ export class StocktwitsPublisher {
     }
   }
 
+  /**
+   * Returns the *other* account's handle if the current session belongs to
+   * someone other than the expected account. Returns null if the session
+   * belongs to the expected account or if the handle can't be read (in which
+   * case we trust isAuthenticated()'s yes/no answer).
+   */
+  private async detectAccountMismatch(
+    page: Page,
+    account: StocktwitsAccountConfig,
+  ): Promise<string | null> {
+    const expectedTokens = [
+      account.handle,
+      account.username,
+    ]
+      .filter((v): v is string => Boolean(v && v.trim()))
+      .map((v) => v.replace(/^@/, '').toLowerCase());
+
+    if (expectedTokens.length === 0) {
+      return null;
+    }
+
+    const sessionHandle = await this.readLoggedInHandle(page);
+    if (!sessionHandle) {
+      return null;
+    }
+
+    const normalized = sessionHandle.replace(/^@/, '').toLowerCase();
+    if (expectedTokens.includes(normalized)) {
+      return null;
+    }
+    return sessionHandle;
+  }
+
+  /**
+   * Reads the logged-in user's handle from the Stocktwits page chrome.
+   * Returns null if it can't be determined.
+   */
+  private async readLoggedInHandle(page: Page): Promise<string | null> {
+    return page
+      .evaluate(() => {
+        // Profile / settings links carry the handle in their href.
+        const candidates = Array.from(
+          document.querySelectorAll<HTMLAnchorElement>('a[href]'),
+        );
+        for (const anchor of candidates) {
+          const href = anchor.getAttribute('href') || '';
+          const profileMatch = href.match(/^\/([A-Za-z0-9_]{2,30})$/);
+          if (!profileMatch) continue;
+          const slug = profileMatch[1];
+          // Skip non-profile slugs that share the same shape.
+          const reserved = new Set([
+            'home',
+            'signin',
+            'signup',
+            'symbol',
+            'sentiment',
+            'trending',
+            'news',
+            'earnings',
+            'about',
+            'help',
+            'privacy',
+            'rules',
+            'careers',
+            'terms',
+            'disclaimer',
+            'shop',
+            'disclosures',
+            'enterprise',
+            'subscriptions',
+            'widgets',
+            'advertise',
+            'newsletters',
+          ]);
+          if (reserved.has(slug.toLowerCase())) continue;
+
+          const text = (anchor.textContent || '').trim();
+          // Prefer anchors that look like a profile link (small visible text
+          // or a settings menu entry).
+          if (text.length === 0 || text.length > 30) continue;
+          return slug;
+        }
+        return null;
+      })
+      .catch(() => null);
+  }
+
+  private async forceLogoutAndReload(page: Page): Promise<void> {
+    const context = page.context();
+    try {
+      await context.clearCookies();
+    } catch {
+      // ignore — clearing cookies isn't always permitted on persistent
+      // contexts, but the next step will still log us in fresh.
+    }
+    try {
+      await page.evaluate(() => {
+        try {
+          window.localStorage.clear();
+          window.sessionStorage.clear();
+        } catch {
+          /* ignore */
+        }
+      });
+    } catch {
+      /* ignore */
+    }
+    const loginUrl = this.configService.getOrThrow<string>(
+      'STOCKTWITS_LOGIN_URL',
+    );
+    await page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
+    await this.dismissCookieBanner(page);
+  }
+
+  // ============ CHALLENGE HANDLING (UPDATED WITH CAPSOLVER) ============
+
   private async handlePossibleChallenge(page: Page, timeout: number): Promise<void> {
     if (!(await this.isChallengeVisible(page))) {
       return;
@@ -301,9 +909,36 @@ export class StocktwitsPublisher {
     const headlessEnv = this.configService.get('STOCKTWITS_HEADLESS');
     const isHeadless = headlessEnv === true || headlessEnv === 'true';
 
+    const capSolverKey = this.configService.get<string>('CAPSOLVER_API_KEY')?.trim();
+
+    if (capSolverKey) {
+      const maxAttempts = 2;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          await this.solveChallengeWithCapSolver(page);
+          await page.waitForTimeout(3_000);
+          if (!(await this.isChallengeVisible(page))) {
+            return;
+          }
+          this.logger.warn(
+            `CapSolver attempt ${attempt}/${maxAttempts}: token injected but challenge still visible`,
+          );
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : 'unknown';
+          this.logger.error(
+            `CapSolver attempt ${attempt}/${maxAttempts} failed: ${msg}`,
+          );
+        }
+        if (attempt < maxAttempts) {
+          await page.waitForTimeout(1_500);
+        }
+      }
+      this.logger.warn('CapSolver attempts exhausted; falling back to manual flow.');
+    }
+
     if (isHeadless) {
       throw new Error(
-        'Cloudflare challenge detected in Headless mode. Set STOCKTWITS_HEADLESS=false to solve manually.',
+        'Cloudflare challenge detected in Headless mode. Set STOCKTWITS_HEADLESS=false to solve manually, or configure CAPSOLVER_API_KEY.',
       );
     }
 
@@ -331,12 +966,41 @@ export class StocktwitsPublisher {
   }
 
   private async isChallengeVisible(page: Page): Promise<boolean> {
-    const content = (await page.content()).toLowerCase();
-    return (
-      content.includes('verify you are human') ||
-      content.includes('cf-challenge') ||
-      content.includes('security verification')
+    const challengeIframeSelectors = [
+      'iframe[src*="challenges.cloudflare.com"]',
+      'iframe[src*="turnstile"]',
+      'iframe[title*="challenge" i]',
+      'iframe[title*="Cloudflare" i]',
+    ];
+    for (const selector of challengeIframeSelectors) {
+      const visible = await page
+        .locator(selector)
+        .first()
+        .isVisible({ timeout: 250 })
+        .catch(() => false);
+      if (visible) {
+        return true;
+      }
+    }
+
+    const widgetVisible = await page
+      .locator('.cf-turnstile, #cf-challenge, #challenge-running')
+      .first()
+      .isVisible({ timeout: 250 })
+      .catch(() => false);
+    if (widgetVisible) {
+      return true;
+    }
+
+    const interstitialTitle = await page.title().catch(() => '');
+    if (/just a moment|attention required/i.test(interstitialTitle)) {
+      return true;
+    }
+
+    const challengeCopy = page.getByText(
+      /verify (you are|that you are) (a )?human|checking your browser/i,
     );
+    return challengeCopy.first().isVisible({ timeout: 250 }).catch(() => false);
   }
 
   private async isAuthenticated(page: Page): Promise<boolean> {
@@ -413,6 +1077,8 @@ export class StocktwitsPublisher {
       }
     }
   }
+
+  // ============ TRENDING SYMBOLS ============
 
   private async ensureTrendingAllView(page: Page): Promise<void> {
     await this.clickFirstVisibleSelector(page, [
@@ -612,6 +1278,8 @@ export class StocktwitsPublisher {
     return parseTrendingSymbolsFromHtml(html, limit);
   }
 
+  // ============ PUBLISHING ============
+
   private async postOnSymbolFeed(
     page: Page,
     postUrl: string,
@@ -626,10 +1294,16 @@ export class StocktwitsPublisher {
       symbolMessage,
     );
     await page.waitForTimeout?.(250);
-    await this.submitInlineSymbolPost(page, composerScope);
+    const beforeIds = await this.snapshotMessageIds(page);
+    await this.submitInlineSymbolPost(page, composerScope, symbol);
     await this.handlePostConfirmationModal(page);
     await this.finalizeDialogPost(page);
-    return this.waitForPublishConfirmation(page, 15_000);
+    return this.waitForPublishConfirmation(
+      page,
+      this.publishConfirmTimeoutMs,
+      beforeIds,
+      symbolMessage,
+    );
   }
 
   private async executeStrictSymbolComposerFlow(
@@ -649,11 +1323,18 @@ export class StocktwitsPublisher {
     await container
       .click({ position: { x: 140, y: 40 }, timeout: 2_500 })
       .catch(() => undefined);
+    await page.waitForTimeout?.(180);
+
+    // Stocktwits auto-prefixes the inline composer with "$SYMBOL " when it
+    // expands. Clear that pre-fill so the post body is exactly what the
+    // caller provided (which may already include its own cashtag).
+    await page.keyboard.press('Control+A').catch(() => undefined);
+    await page.keyboard.press('Backspace').catch(() => undefined);
     await page.waitForTimeout?.(120);
 
     const normalizedMessage = message.replace(/\r\n/g, '\n').trim();
-    await page.keyboard.type(` ${normalizedMessage}`, { delay: 8 });
-    await page.waitForTimeout?.(120);
+    await page.keyboard.type(normalizedMessage, { delay: 8 });
+    await page.waitForTimeout?.(150);
 
     return container;
   }
@@ -675,9 +1356,9 @@ export class StocktwitsPublisher {
       return this.resolveSymbolComposer(page, symbol);
     }
 
-    const dialog = page.locator('[role="dialog"]').last();
-    if (await dialog.isVisible().catch(() => false)) {
-      const dialogArea = await this.findFirstVisibleIn(dialog, [
+    const scope = await this.findOpenDialogScope(page);
+    if (scope) {
+      const dialogArea = await this.findFirstVisibleIn(scope, [
         '[contenteditable="true"][role="combobox"][aria-describedby^="placeholder-"]',
         'textarea',
         '[contenteditable="true"]',
@@ -785,8 +1466,12 @@ export class StocktwitsPublisher {
     page: Page,
     symbol: string,
   ): Promise<Locator | null> {
+    // String.raw preserves the literal `\s` and `\$` so they reach the regex
+    // engine — a plain template literal silently drops backslashes before
+    // non-escape characters, which produced `Shares+yours+ideas+ons+$?GME`
+    // and the "Nothing to repeat" parse error.
     const symbolPattern = new RegExp(
-      `Share\\s+your\\s+idea\\s+on\\s+\\$?${escapeRegExp(symbol)}`,
+      String.raw`Share\s+your\s+idea\s+on\s+\$?` + escapeRegExp(symbol),
       'i',
     );
     const pageWithGetByText = page as Page & {
@@ -997,14 +1682,329 @@ export class StocktwitsPublisher {
   private async submitInlineSymbolPost(
     page: Page,
     composer: Locator,
+    symbol: string,
   ): Promise<void> {
-    const clickedContainerButton =
-      await this.clickPostButtonWithinComposerContainer(page, composer);
-    if (clickedContainerButton) {
+    // Primary strategy: walk the DOM inside the page, find the textarea that
+    // matches this symbol, walk up to the nearest ancestor containing an
+    // enabled "Post" button, and tag that button with a unique data attribute.
+    // Then click via the tag. This is invariant to CSS-module class hashing
+    // and to placeholder text disappearing after user input.
+    const tagged = await this.tagInlinePostButton(page, symbol, 12_000);
+    if (tagged) {
+      const taggedButton = page
+        .locator('[data-pw-inline-post-target="true"]')
+        .first();
+      await this.clickWithFallbacks(
+        page,
+        taggedButton,
+        'submitInlineSymbolPost.tagged',
+      );
       return;
     }
 
-    throw new Error('stocktwits_inline_post_button_not_found_or_disabled');
+    // Fallback: re-resolve the composer via aria-label/placeholder, then use
+    // proximity-based selection. Used only if the DOM-tag walk above couldn't
+    // find a textarea matching the symbol — e.g. if Stocktwits ever stops
+    // setting the aria-label/placeholder we're keying off.
+    const liveComposer =
+      (await this.findInlineComposerByAttributes(page, symbol)) ?? composer;
+    const button = await this.waitForEnabledInlinePostButton(
+      liveComposer,
+      6_000,
+    );
+    if (!button) {
+      throw new Error(
+        'stocktwits_inline_post_button_not_found_or_disabled',
+      );
+    }
+    await this.clickWithFallbacks(
+      page,
+      button,
+      'submitInlineSymbolPost.fallback',
+    );
+  }
+
+  private async tagInlinePostButton(
+    page: Page,
+    symbol: string,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const startedAt = Date.now();
+    let lastReason = '';
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const result = await page
+        .evaluate((sym: string) => {
+          // Clear any previous tags so we don't click a stale one.
+          document
+            .querySelectorAll('[data-pw-inline-post-target]')
+            .forEach((el) => el.removeAttribute('data-pw-inline-post-target'));
+
+          const symbolUpper = sym.toUpperCase();
+
+          const editableNodes = Array.from(
+            document.querySelectorAll(
+              'textarea, [contenteditable="true"], [role="textbox"]',
+            ),
+          ) as HTMLElement[];
+
+          // Step 1: find the composer textarea/contenteditable bound to this
+          // symbol. Prefer aria-label / placeholder containing the cashtag,
+          // then fall back to "Share your idea on" generically, then to any
+          // editable that has user-typed content.
+          const matches = (label: string, expected: string[]): boolean => {
+            const upper = label.toUpperCase();
+            return expected.every((part) => upper.includes(part.toUpperCase()));
+          };
+
+          const findEditable = (
+            predicate: (label: string) => boolean,
+          ): HTMLElement | null => {
+            for (const el of editableNodes) {
+              const label =
+                (el.getAttribute('aria-label') || '') +
+                ' ' +
+                (el.getAttribute('placeholder') || '');
+              if (predicate(label)) {
+                return el;
+              }
+            }
+            return null;
+          };
+
+          let composer =
+            findEditable((label) =>
+              matches(label, ['Share your idea on $' + symbolUpper]),
+            ) ||
+            findEditable((label) =>
+              matches(label, ['Share your idea on', symbolUpper]),
+            ) ||
+            findEditable((label) =>
+              matches(label, ['Share your idea on']),
+            );
+
+          if (!composer) {
+            for (const el of editableNodes) {
+              const value =
+                (el as HTMLTextAreaElement).value ||
+                el.textContent ||
+                '';
+              if (value.replace(/\s+/g, '').length > 10) {
+                composer = el;
+                break;
+              }
+            }
+          }
+
+          if (!composer) {
+            return { tagged: false, reason: 'composer_textarea_not_found' };
+          }
+
+          // Step 2: walk up through ancestors. The first ancestor that
+          // contains an enabled "Post" button as a descendant IS the inline
+          // composer card — by DOM topology, the sidebar Post button is in a
+          // sibling subtree, not an ancestor of the symbol composer.
+          let node: Element | null = composer;
+          let depth = 0;
+          let firstDisabledMatch: HTMLButtonElement | null = null;
+
+          while (node && node !== document.body && depth < 20) {
+            const buttons = Array.from(
+              node.querySelectorAll('button'),
+            ) as HTMLButtonElement[];
+            for (const btn of buttons) {
+              const text = (btn.textContent || '').trim().toLowerCase();
+              if (text !== 'post') continue;
+
+              const isDisabled =
+                btn.disabled ||
+                btn.getAttribute('aria-disabled') === 'true';
+
+              if (!isDisabled) {
+                btn.setAttribute('data-pw-inline-post-target', 'true');
+                return { tagged: true, enabled: true };
+              }
+              if (!firstDisabledMatch) {
+                firstDisabledMatch = btn;
+              }
+            }
+            node = node.parentElement;
+            depth += 1;
+          }
+
+          if (firstDisabledMatch) {
+            return {
+              tagged: false,
+              reason: 'inline_post_button_present_but_disabled',
+            };
+          }
+          return {
+            tagged: false,
+            reason: 'no_post_button_in_composer_ancestors',
+          };
+        }, symbol)
+        .catch(() => null);
+
+      if (result && 'tagged' in result && result.tagged) {
+        return true;
+      }
+      if (result && 'reason' in result) {
+        lastReason = result.reason ?? '';
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    if (lastReason) {
+      this.logger.warn(
+        `tagInlinePostButton timed out after ${timeoutMs}ms: ${lastReason}`,
+      );
+    }
+    return false;
+  }
+
+  private async findInlineComposerByAttributes(
+    page: Page,
+    symbol: string,
+  ): Promise<Locator | null> {
+    // Attribute-based anchors persist after the user types — placeholder text
+    // does not. Try the most specific anchors first.
+    const cashtag = `$${symbol}`;
+    const selectors = [
+      `textarea[aria-label*="Share your idea on ${cashtag}"]`,
+      `textarea[placeholder*="Share your idea on ${cashtag}"]`,
+      `[contenteditable="true"][aria-label*="Share your idea on ${cashtag}"]`,
+      `textarea[aria-label*="${cashtag}"]`,
+      `textarea[placeholder*="${cashtag}"]`,
+      `[contenteditable="true"][aria-label*="${cashtag}"]`,
+      'textarea[aria-label*="Share your idea on"]',
+      'textarea[placeholder*="Share your idea on"]',
+      '[contenteditable="true"][aria-label*="Share your idea on"]',
+    ];
+
+    for (const selector of selectors) {
+      const candidate = page.locator(selector).first();
+      const visible = await candidate.isVisible({ timeout: 250 }).catch(() => false);
+      if (!visible) {
+        continue;
+      }
+      // Walk up to the closest form/section/article/div ancestor that
+      // contains a Post button — that's the composer card whose center we
+      // want to use as the proximity anchor for the inline Post button.
+      const card = candidate
+        .locator(
+          'xpath=ancestor::*[self::form or self::section or self::article or self::div][.//button[contains(normalize-space(.), "Post") or @type="submit"]][1]',
+        )
+        .first();
+      if (await card.isVisible({ timeout: 250 }).catch(() => false)) {
+        return card;
+      }
+      return candidate;
+    }
+    return null;
+  }
+
+  private async waitForEnabledInlinePostButton(
+    composer: Locator,
+    timeoutMs: number,
+  ): Promise<Locator | null> {
+    // Pick the Post button geometrically nearest to the composer. On the
+    // /symbol/{X} layout the inline Post button sits in the action row right
+    // below the textarea (same card), while the sidebar Post CTA is far away
+    // in the left column — proximity reliably distinguishes them and matches
+    // the user-facing "nearest post button" rule.
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const button = await this.findClosestEnabledPostButton(composer);
+      if (button) {
+        return button;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return null;
+  }
+
+  private async findClosestEnabledPostButton(
+    composer: Locator,
+  ): Promise<Locator | null> {
+    const composerBox = await composer.boundingBox().catch(() => null);
+    if (!composerBox) {
+      return null;
+    }
+    const composerCenterX = composerBox.x + composerBox.width / 2;
+    const composerCenterY = composerBox.y + composerBox.height / 2;
+
+    const page = composer.page();
+    const buttons = page.locator(
+      'button:has-text("Post"), button[type="submit"], button[class*="ButtonPost_"]',
+    );
+    const count = await buttons.count().catch(() => 0);
+
+    let bestButton: Locator | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < count; i += 1) {
+      const candidate = buttons.nth(i);
+      const visible = await candidate.isVisible().catch(() => false);
+      if (!visible) {
+        continue;
+      }
+      const disabled = await candidate
+        .evaluate(
+          (el) =>
+            (el as HTMLButtonElement).disabled ||
+            el.getAttribute('aria-disabled') === 'true',
+        )
+        .catch(() => true);
+      if (disabled) {
+        continue;
+      }
+      const box = await candidate.boundingBox().catch(() => null);
+      if (!box) {
+        continue;
+      }
+      const buttonCenterX = box.x + box.width / 2;
+      const buttonCenterY = box.y + box.height / 2;
+      const distance = Math.hypot(
+        buttonCenterX - composerCenterX,
+        buttonCenterY - composerCenterY,
+      );
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestButton = candidate;
+      }
+    }
+
+    return bestButton;
+  }
+
+  private async findEnabledButtonInScope(
+    scope: Locator,
+    selectors: string[],
+  ): Promise<Locator | null> {
+    for (const selector of selectors) {
+      const candidates = scope.locator(selector);
+      const count = await candidates.count().catch(() => 0);
+      for (let i = 0; i < count; i += 1) {
+        const button = candidates.nth(i);
+        const visible = await button.isVisible().catch(() => false);
+        if (!visible) {
+          continue;
+        }
+        const disabled = await button
+          .evaluate(
+            (el) =>
+              (el as HTMLButtonElement).disabled ||
+              el.getAttribute('aria-disabled') === 'true',
+          )
+          .catch(() => true);
+        if (disabled) {
+          continue;
+        }
+        return button;
+      }
+    }
+    return null;
   }
 
   private prepareSymbolFeedMessage(symbol: string, message: string): string {
@@ -1082,249 +2082,17 @@ export class StocktwitsPublisher {
     throw new Error(`stocktwits_symbol_body_not_applied:${symbol}`);
   }
 
-  private async clickPostButtonWithinComposerContainer(
-    page: Page,
-    composer: Locator,
-  ): Promise<boolean> {
-    const postButtonSelectors = [
-      'button[class*="ButtonPost_desktop__"]',
-      'button[class*="ButtonPost_mobile__"]',
-      'button[class*="STButton_black-primary__"]',
-      'button:has-text("Post")',
-      'button[type="submit"]',
-    ];
-
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < 8_000) {
-      const clickedDirect = await this.clickEnabledButtonInScope(
-        composer,
-        postButtonSelectors,
-      );
-      if (clickedDirect) {
-        return true;
-      }
-
-      const container = composer
-        .locator(
-          'xpath=ancestor::*[self::form or self::section or self::article or self::div][.//button[contains(normalize-space(.), "Post") or @type="submit"]][1]',
-        )
-        .first();
-
-      if (await container.isVisible().catch(() => false)) {
-        const clickedInContainer = await this.clickEnabledButtonInScope(
-          container,
-          postButtonSelectors,
-        );
-        if (clickedInContainer) {
-          return true;
-        }
-      }
-
-      const clickedOnPage = await this.clickEnabledButtonOnPage(
-        page,
-        postButtonSelectors,
-      );
-      if (clickedOnPage) {
-        return true;
-      }
-
-      const shortcutClicked = await this.tryKeyboardPostShortcut(page);
-      if (shortcutClicked) {
-        return true;
-      }
-
-      await page.waitForTimeout?.(250);
-    }
-
-    return false;
-  }
-
   private async readLocatorText(locator: Locator): Promise<string> {
     return locator
       .evaluate((el) => (el as HTMLElement).innerText || el.textContent || '')
       .catch(() => '');
   }
 
-  private async clickEnabledButtonInScope(
-    scope: Locator,
-    selectors: string[],
-  ): Promise<boolean> {
-    for (const selector of selectors) {
-      const candidates = scope.locator(selector);
-      const count = await candidates.count().catch(() => 0);
-      for (let i = 0; i < count; i += 1) {
-        const button = candidates.nth(i);
-        const visible = await button.isVisible().catch(() => false);
-        if (!visible) {
-          continue;
-        }
-
-        const disabled = await button
-          .evaluate(
-            (el) =>
-              (el as HTMLButtonElement).disabled ||
-              el.getAttribute('aria-disabled') === 'true',
-          )
-          .catch(() => true);
-        if (disabled) {
-          continue;
-        }
-
-        try {
-          await button.click({ timeout: 2_000 });
-          return true;
-        } catch {
-          try {
-            await button.click({ timeout: 2_000, force: true });
-            return true;
-          } catch {
-            continue;
-          }
-        }
-      }
-    }
-    return false;
-  }
-
-  private async clickEnabledButtonOnPage(
-    page: Page,
-    selectors: string[],
-  ): Promise<boolean> {
-    for (const selector of selectors) {
-      const candidates = page.locator(selector);
-      const count = await candidates.count().catch(() => 0);
-      for (let i = count - 1; i >= 0; i -= 1) {
-        const button = candidates.nth(i);
-        const visible = await button.isVisible().catch(() => false);
-        if (!visible) {
-          continue;
-        }
-
-        const disabled = await button
-          .evaluate(
-            (el) =>
-              (el as HTMLButtonElement).disabled ||
-              el.getAttribute('aria-disabled') === 'true',
-          )
-          .catch(() => true);
-        if (disabled) {
-          continue;
-        }
-
-        try {
-          await button.click({ timeout: 2_000 });
-          return true;
-        } catch {
-          try {
-            await button.click({ timeout: 2_000, force: true });
-            return true;
-          } catch {
-            continue;
-          }
-        }
-      }
-    }
-    return false;
-  }
-
-  private async tryKeyboardPostShortcut(page: Page): Promise<boolean> {
-    try {
-      await page.keyboard.press('Control+Enter');
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async clickClosestEnabledPostButton(
-    page: Page,
-    composer: Locator,
-  ): Promise<boolean> {
-    const composerBox = await composer.boundingBox().catch(() => null);
-    if (!composerBox) {
-      return false;
-    }
-
-    const composerCenterX = composerBox.x + composerBox.width / 2;
-    const composerCenterY = composerBox.y + composerBox.height / 2;
-
-    const buttons = page.locator('button:has-text("Post"), button[type="submit"]');
-    const count = await buttons.count().catch(() => 0);
-
-    let bestButton: Locator | null = null;
-    let bestDistance = Number.POSITIVE_INFINITY;
-
-    for (let i = 0; i < count; i += 1) {
-      const candidate = buttons.nth(i);
-      const visible = await candidate.isVisible().catch(() => false);
-      if (!visible) {
-        continue;
-      }
-
-      const disabled = await candidate
-        .evaluate(
-          (el) =>
-            (el as HTMLButtonElement).disabled ||
-            el.getAttribute('aria-disabled') === 'true',
-        )
-        .catch(() => false);
-      if (disabled) {
-        continue;
-      }
-
-      const box = await candidate.boundingBox().catch(() => null);
-      if (!box) {
-        continue;
-      }
-
-      const centerX = box.x + box.width / 2;
-      const centerY = box.y + box.height / 2;
-      const distance = Math.hypot(centerX - composerCenterX, centerY - composerCenterY);
-
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestButton = candidate;
-      }
-    }
-
-    if (!bestButton) {
-      return false;
-    }
-
-    await bestButton.click();
-    return true;
-  }
-
-  private async submitPost(page: Page): Promise<void> {
-    const dialog = page.locator('[role="dialog"]').last();
-    if (await dialog.isVisible().catch(() => false)) {
-      const dialogSubmit = await this.findFirstVisibleIn(dialog, [
-        'button:has-text("Post")',
-        'button[type="submit"]',
-      ]);
-      if (dialogSubmit) {
-        await dialogSubmit.click();
-        return;
-      }
-    }
-
-    const button = await this.findFirstVisible(page, [
-      'button:has-text("Post")',
-      'button[type="submit"]',
-    ]);
-    if (!button) {
-      throw new Error('Submit button not found.');
-    }
-    await button.click();
-  }
 
   private async handlePostConfirmationModal(page: Page): Promise<void> {
-    const modal = page
-      .locator('[role="dialog"]')
-      .filter({ hasText: 'Did you forget to use a $Cashtag?' })
-      .first();
-
-    if (!(await modal.isVisible().catch(() => false))) {
+    const cashtagPattern = /Did you forget to use a \$Cashtag\?/i;
+    const modal = await this.findCashtagModal(page, cashtagPattern);
+    if (!modal) {
       return;
     }
 
@@ -1332,65 +2100,202 @@ export class StocktwitsPublisher {
       .locator('button:has-text("Post without cashtag")')
       .first();
     if (await postWithoutCashtag.isVisible().catch(() => false)) {
-      await postWithoutCashtag.click();
+      await this.clickWithFallbacks(page, postWithoutCashtag, 'cashtag_modal');
       return;
     }
 
     const fallback = page.locator('button:has-text("Post without cashtag")').first();
     if (await fallback.isVisible().catch(() => false)) {
-      await fallback.click();
+      await this.clickWithFallbacks(page, fallback, 'cashtag_modal_fallback');
       return;
     }
 
     throw new Error('stocktwits_cashtag_modal_detected_but_action_button_not_found');
   }
 
-  private async resolvePostId(page: Page): Promise<string | null> {
-    const match = page.url().match(/\/message\/(\d+)/);
-    if (match?.[1]) {
-      return match[1];
+  private async findCashtagModal(
+    page: Page,
+    pattern: RegExp,
+  ): Promise<Locator | null> {
+    const selectors = [
+      '.ReactModal__Content',
+      '[class*="ReactModal__Content"]',
+      '[role="dialog"]',
+      '[aria-modal="true"]',
+    ];
+    for (const selector of selectors) {
+      const candidate = page
+        .locator(selector)
+        .filter({ hasText: pattern })
+        .last();
+      if (await candidate.isVisible().catch(() => false)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  private async snapshotMessageIds(page: Page): Promise<Set<string>> {
+    const ids = await page
+      .evaluate(() => {
+        return Array.from(
+          document.querySelectorAll('a[href*="/message/"]'),
+        )
+          .map((a) => {
+            const href = a.getAttribute('href') ?? '';
+            const match = href.match(/\/message\/(\d+)/);
+            return match?.[1] ?? '';
+          })
+          .filter((id) => id.length > 0);
+      })
+      .catch(() => [] as string[]);
+    return new Set(ids);
+  }
+
+  private async resolvePostId(
+    page: Page,
+    excludeIds: Set<string>,
+    contentProbe?: string,
+  ): Promise<string | null> {
+    const urlMatch = page.url().match(/\/message\/(\d+)/);
+    if (urlMatch?.[1] && !excludeIds.has(urlMatch[1])) {
+      return urlMatch[1];
     }
 
-    const messageLink = page.locator('a[href*="/message/"]').first();
-    if (await messageLink.isVisible().catch(() => false)) {
-      const href = await messageLink.getAttribute('href');
-      const hrefMatch = href?.match(/\/message\/(\d+)/);
-      if (hrefMatch?.[1]) {
-        return hrefMatch[1];
+    const ids = await page
+      .evaluate(() => {
+        return Array.from(
+          document.querySelectorAll('a[href*="/message/"]'),
+        )
+          .map((a) => {
+            const href = a.getAttribute('href') ?? '';
+            const match = href.match(/\/message\/(\d+)/);
+            return match?.[1] ?? '';
+          })
+          .filter((id) => id.length > 0);
+      })
+      .catch(() => [] as string[]);
+
+    for (const id of ids) {
+      if (!excludeIds.has(id)) {
+        return id;
       }
     }
 
+    if (contentProbe && contentProbe.length >= 12) {
+      const idByContent = await page
+        .evaluate((needle) => {
+          const links = Array.from(
+            document.querySelectorAll('a[href*="/message/"]'),
+          ) as HTMLAnchorElement[];
+          for (const link of links) {
+            // Walk up from the link looking for an ancestor whose visible text
+            // contains the typed message body.
+            let node: Element | null = link;
+            for (let depth = 0; depth < 10 && node; depth += 1) {
+              const text =
+                (node as HTMLElement).innerText || node.textContent || '';
+              if (text.includes(needle)) {
+                const href = link.getAttribute('href') ?? '';
+                const match = href.match(/\/message\/(\d+)/);
+                if (match) {
+                  return match[1];
+                }
+                break;
+              }
+              node = node.parentElement;
+            }
+          }
+          return null;
+        }, contentProbe)
+        .catch(() => null);
+
+      if (idByContent && !excludeIds.has(idByContent)) {
+        return idByContent;
+      }
+    }
+
+    return null;
+  }
+
+  private extractStocktwitsContentProbe(message: string): string {
+    // Strip surrogates/emoji so the probe matches innerText reliably across
+    // Chromium font fallbacks; collapse whitespace; cap length.
+    return message
+      .replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
+      .replace(/[\u{2600}-\u{27BF}]/gu, '')
+      .replace(/[\u{1F000}-\u{1F2FF}]/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 50);
+  }
+
+  private async detectPublishErrorToast(page: Page): Promise<string | null> {
+    const errorPatterns = [
+      /failed to post/i,
+      /something went wrong/i,
+      /please try again/i,
+      /you are posting too quickly/i,
+      /unable to (post|submit)/i,
+      /violat(es|ed) our (community|content) guidelines/i,
+      /spam/i,
+    ];
+    for (const pattern of errorPatterns) {
+      const visible = await page
+        .getByText(pattern)
+        .first()
+        .isVisible({ timeout: 200 })
+        .catch(() => false);
+      if (visible) {
+        const text = await page
+          .getByText(pattern)
+          .first()
+          .innerText()
+          .catch(() => '');
+        return text.trim().slice(0, 200) || pattern.source;
+      }
+    }
     return null;
   }
 
   private async waitForPublishConfirmation(
     page: Page,
     timeoutMs: number,
+    excludeIds: Set<string>,
+    messageBody?: string,
   ): Promise<string | null> {
     const startedAt = Date.now();
+    const probe = messageBody
+      ? this.extractStocktwitsContentProbe(messageBody)
+      : '';
+
     while (Date.now() - startedAt < timeoutMs) {
       await this.clickPostInDialogIfVisible(page);
-      const messageId = await this.resolvePostId(page);
+
+      const errorToast = await this.detectPublishErrorToast(page);
+      if (errorToast) {
+        throw new Error(
+          `stocktwits_post_rejected_by_site: "${errorToast.replace(/\s+/g, ' ')}"`,
+        );
+      }
+
+      const messageId = await this.resolvePostId(page, excludeIds, probe);
       if (messageId) {
         return messageId;
       }
       await page.waitForTimeout(500);
     }
+
+    // Final diagnostic before giving up: distinguish "submit didn't fire"
+    // from "submit fired but we couldn't locate the new post".
+    const stillOpen = await this.findOpenDialogScope(page);
+    if (stillOpen) {
+      throw new Error(
+        'stocktwits_publish_submit_did_not_fire: composer modal is still open after submit.',
+      );
+    }
+
     return null;
-  }
-
-  private async openPostDialog(page: Page): Promise<void> {
-    const dialog = page.locator('[role="dialog"]').last();
-    if (await dialog.isVisible().catch(() => false)) {
-      return;
-    }
-
-    const openPostButton = await this.findFirstVisible(page, ['button:has-text("Post")']);
-    if (!openPostButton) {
-      return;
-    }
-    await openPostButton.click();
-    await page.waitForTimeout(1_200);
   }
 
   private async finalizeDialogPost(page: Page): Promise<void> {
@@ -1400,20 +2305,20 @@ export class StocktwitsPublisher {
         return;
       }
       await page.waitForTimeout(700);
-      const dialog = page.locator('[role="dialog"]').last();
-      if (!(await dialog.isVisible().catch(() => false))) {
+      const stillOpen = await this.findOpenDialogScope(page);
+      if (!stillOpen) {
         return;
       }
     }
   }
 
   private async clickPostInDialogIfVisible(page: Page): Promise<boolean> {
-    const dialog = page.locator('[role="dialog"]').last();
-    if (!(await dialog.isVisible().catch(() => false))) {
+    const scope = await this.findOpenDialogScope(page);
+    if (!scope) {
       return false;
     }
 
-    const postButton = await this.findFirstVisibleIn(dialog, [
+    const postButton = await this.findFirstVisibleIn(scope, [
       'button:has-text("Post")',
       'button[type="submit"]',
     ]);
@@ -1432,8 +2337,67 @@ export class StocktwitsPublisher {
       return false;
     }
 
-    await postButton.click();
+    await this.clickWithFallbacks(page, postButton, 'clickPostInDialogIfVisible');
     return true;
+  }
+
+  private async findOpenDialogScope(page: Page): Promise<Locator | null> {
+    // Stocktwits uses react-modal: ReactModalPortal > ReactModal__Overlay >
+    // ReactModal__Content. The content container does not always carry
+    // role="dialog" (CSS-module hashed classes), so we try several selectors
+    // and return the topmost (last-in-DOM) visible one.
+    const contentSelectors = [
+      '.ReactModal__Content',
+      '[class*="ReactModal__Content"]',
+      '[role="dialog"]',
+      '[aria-modal="true"]',
+    ];
+
+    for (const selector of contentSelectors) {
+      const matches = page.locator(selector);
+      const count = await matches.count().catch(() => 0);
+      for (let i = count - 1; i >= 0; i -= 1) {
+        const candidate = matches.nth(i);
+        if (await candidate.isVisible({ timeout: 250 }).catch(() => false)) {
+          return candidate;
+        }
+      }
+    }
+    return null;
+  }
+
+  private async clickWithFallbacks(
+    page: Page,
+    target: Locator,
+    context: string,
+    timeoutMs = 6_000,
+  ): Promise<void> {
+    let firstReason = '';
+    try {
+      await target.click({ timeout: timeoutMs });
+      return;
+    } catch (firstError) {
+      firstReason =
+        firstError instanceof Error ? firstError.message.split('\n')[0] : 'unknown';
+      this.logger.warn(
+        `Click failed [${context}]: ${firstReason}. Retrying with force=true.`,
+      );
+    }
+
+    try {
+      await target.click({ timeout: 4_000, force: true });
+      return;
+    } catch (secondError) {
+      const reason =
+        secondError instanceof Error
+          ? secondError.message.split('\n')[0]
+          : 'unknown';
+      this.logger.warn(
+        `Force click failed [${context}]: ${reason}. Trying Ctrl+Enter shortcut.`,
+      );
+    }
+
+    await page.keyboard.press('Control+Enter').catch(() => undefined);
   }
 
   private async findFirstVisible(
@@ -1485,6 +2449,8 @@ export class StocktwitsPublisher {
     return null;
   }
 }
+
+// ============ STANDALONE UTILITIES ============
 
 export function parseTrendingSymbolsFromHtml(
   html: string,

@@ -9,6 +9,7 @@ import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
 import { PublishProcessor } from './publish.processor';
 import { TelemetryModule } from '../telemetry/telemetry.module';
+import { DiscordUiPublisher } from './discord-ui.publisher';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { TelemetryModule } from '../telemetry/telemetry.module';
     PublishingService,
     TelegramPublisher,
     StocktwitsPublisher,
+    DiscordUiPublisher,
     PublishProcessor,
   ],
   exports: [PublishingService],

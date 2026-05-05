@@ -7,6 +7,7 @@ Production-oriented NestJS backend implementing the client-directed Phase 1 pipe
 - LLM draft generation with strict structured outputs (OpenAI + Anthropic),
 - StockTwits browser automation publishing via Playwright,
 - Telegram publishing with discovery candidate approval flow,
+- Discord publishing via Playwright UI automation,
 - multi-account routing, health scoring, quarantine, and replacement workflow,
 - connector health, weighting, and fallback-aware trend inputs,
 - duplicate and near-duplicate suppression before publish,
@@ -57,6 +58,7 @@ Metrics: `GET /api/health/metrics`
 - `GET /api/orchestration/telegram/candidates`
 - `POST /api/orchestration/telegram/candidates/:id/approve`
 - `POST /api/orchestration/telegram/candidates/sync-join`
+- `POST /api/orchestration/publish/manual`
 - `GET /api/orchestration/publish/jobs`
 - `GET /api/orchestration/publish/jobs/:id`
 - `POST /api/orchestration/publish/jobs/:id/retry`
@@ -70,6 +72,21 @@ Metrics: `GET /api/health/metrics`
 - `PATCH /api/accounts/:id/quarantine`
 - `POST /api/accounts/:id/replacement-request`
 - `POST /api/accounts/replacement`
+- `GET /api/manual-ui` (basic manual post UI)
+
+### Manual Publish Example
+`POST /api/orchestration/publish/manual`
+```json
+{
+  "body": "Market recap for today...",
+  "stocktwitsSymbol": "AAPL",
+  "publishToStocktwits": true,
+  "publishToDiscord": true,
+  "discordServerUrl": "https://discord.com/channels/<guildId>/<channelId>"
+}
+```
+`publishToStocktwits` and `publishToDiscord` default to `true` when omitted.  
+`discordServerUrl` is optional if `DISCORD_UI_SERVER_URL` is configured in env.
 
 ## Development Mock Data Mode
 - When `NODE_ENV=development`, ingestion uses mock payload envs automatically:
@@ -95,6 +112,13 @@ Example:
 
 ## Phase 2 Configuration
 - `TELEGRAM_BOT_ACCOUNTS_JSON` supports multiple Telegram bot identities.
+- `DISCORD_UI_SERVER_URL` sets the default Discord server URL for UI-mode manual publish.
+- `DISCORD_UI_LOGIN_EMAIL` and `DISCORD_UI_LOGIN_PASSWORD` allow auto-login when session cookies are missing.
+- `DISCORD_UI_HEADLESS` controls whether Discord UI automation runs headless.
+- `DISCORD_UI_USER_DATA_DIR` stores/reuses browser profile state for Discord login sessions.
+- `DISCORD_UI_BROWSER_BINARY` sets a custom browser executable for UI automation.
+- `DISCORD_UI_NAV_TIMEOUT_MS` and `DISCORD_UI_POST_DELAY_MS` tune automation timing.
+- `DISCORD_UI_MANUAL_LOGIN_TIMEOUT_MS` controls how long a headful run waits for you to complete manual login/challenge if Discord blocks automated login.
 - `PUBLISH_RETRY_DELAY_SECONDS` controls retry delay after manual retry.
 - `PUBLISH_DEAD_LETTER_ENABLED` toggles dead-letter recording after retry exhaustion.
 - `PUBLISH_REPLAY_BATCH_SIZE` caps failed-window replay size.

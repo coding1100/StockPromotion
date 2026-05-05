@@ -76,6 +76,42 @@ export const envValidationSchema = Joi.object({
   TELEGRAM_BOT_ACCOUNTS_JSON: Joi.string().allow('').optional(),
   TELEGRAM_DEFAULT_CHAT_IDS: Joi.string().allow('').optional(),
   TELEGRAM_DISCOVERY_SEEDS: Joi.string().allow('').optional(),
+  DISCORD_UI_SERVER_URL: Joi.string().uri().allow('').optional(),
+  DISCORD_UI_LOGIN_EMAIL: Joi.string().allow('').optional(),
+  DISCORD_UI_LOGIN_PASSWORD: Joi.string().allow('').optional(),
+  DISCORD_UI_HEADLESS: Joi.boolean().default(false),
+  DISCORD_UI_USER_DATA_DIR: Joi.string().allow('').optional(),
+  DISCORD_UI_BROWSER_BINARY: Joi.string().allow('').optional(),
+  DISCORD_UI_NAV_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(5000)
+    .max(180000)
+    .default(30000),
+  DISCORD_UI_MANUAL_LOGIN_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .max(600000)
+    .default(120000),
+  DISCORD_UI_POST_DELAY_MS: Joi.number()
+    .integer()
+    .min(0)
+    .max(10000)
+    .default(800),
+  DISCORD_UI_INTER_CHANNEL_DELAY_MIN_MS: Joi.number()
+    .integer()
+    .min(0)
+    .max(60000)
+    .default(2000),
+  DISCORD_UI_INTER_CHANNEL_DELAY_MAX_MS: Joi.number()
+    .integer()
+    .min(0)
+    .max(120000)
+    .default(5000),
+  DISCORD_UI_POST_CONFIRM_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .max(60000)
+    .default(8000),
 
   // --- STOCKTWITS PUBLISHER ---
   STOCKTWITS_LOGIN_URL: Joi.string()
@@ -91,6 +127,18 @@ export const envValidationSchema = Joi.object({
     .min(1000)
     .max(600000)
     .default(120000),
+  STOCKTWITS_NAV_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(5000)
+    .max(180000)
+    .default(45000),
+  STOCKTWITS_PUBLISH_CONFIRM_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(5000)
+    .max(120000)
+    .default(30000),
+  STOCKTWITS_TARGET_SYMBOLS: Joi.string().allow('').optional(),
+  CAPSOLVER_API_KEY: Joi.string().allow('').optional(),
 
   // --- PIPELINE & QUOTAS ---
   PIPELINE_CRON: Joi.string().default('*/5 * * * *'),
