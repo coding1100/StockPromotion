@@ -2783,6 +2783,10 @@ export class PublishingService {
   async setDlvritAccountStatus(accountId: string, status: AccountStatus) {
     return this.accountsService.setDlvritAccountStatus(accountId, status);
   }
+
+  async deleteDlvritAccounts(ids: string[]): Promise<number> {
+    return this.accountsService.deleteStocktwitsAccounts(ids);
+  }
 }
 
 function isRestrictionError(message: string): boolean {
