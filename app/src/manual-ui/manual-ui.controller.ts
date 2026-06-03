@@ -78,17 +78,17 @@ export class ManualUiController {
   @Header('Content-Type', 'text/html; charset=utf-8')
   render(): string {
     return `<!doctype html>
-<html lang=”en”>
+<html lang="en">
   <head>
-    <meta charset=”utf-8” />
-    <meta name=”viewport” content=”width=device-width, initial-scale=1” />
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Manual Publisher</title>
     <style>
       *, *::before, *::after { box-sizing: border-box; }
       :root { color-scheme: light; }
       body {
         margin: 0;
-        font-family: “Segoe UI”, Tahoma, Geneva, Verdana, sans-serif;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
         background: #f5f7fb;
         color: #111827;
       }
@@ -122,8 +122,8 @@ export class ManualUiController {
         font-weight: 600;
         color: #374151;
       }
-      input[type=”text”],
-      input[type=”number”],
+      input[type="text"],
+      input[type="number"],
       select,
       textarea {
         width: 100%;
@@ -137,8 +137,8 @@ export class ManualUiController {
         transition: border-color .15s;
         outline: none;
       }
-      input[type=”text”]:focus,
-      input[type=”number”]:focus,
+      input[type="text"]:focus,
+      input[type="number"]:focus,
       select:focus,
       textarea:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.1); }
       textarea { min-height: 130px; resize: vertical; }
@@ -150,7 +150,7 @@ export class ManualUiController {
         display: inline-flex; align-items: center; gap: 8px;
         font-size: 14px; font-weight: 500; cursor: pointer;
       }
-      .check input[type=”checkbox”] { width: 16px; height: 16px; cursor: pointer; }
+      .check input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
 
       /* Buttons */
       .btn {
@@ -240,73 +240,73 @@ export class ManualUiController {
     </style>
   </head>
   <body>
-    <div class=”wrap”>
+    <div class="wrap">
 
       <!-- ── Publish Card ─────────────────────────────────────────────────── -->
-      <div class=”card”>
-        <div class=”card-header”>
+      <div class="card">
+        <div class="card-header">
           <div>
             <h1>Manual Post Publisher</h1>
             <p>Publish directly to StockTwits symbol streams and Discord.</p>
           </div>
         </div>
 
-        <form id=”publish-form”>
-          <div class=”field”>
-            <label for=”post-body”>Post Body <span style=”font-weight:400;color:#9ca3af;”>(required for Discord; optional when using batch below)</span></label>
-            <textarea id=”post-body” placeholder=”Write your post...”></textarea>
+        <form id="publish-form">
+          <div class="field">
+            <label for="post-body">Post Body <span style="font-weight:400;color:#9ca3af;">(required for Discord; optional when using batch below)</span></label>
+            <textarea id="post-body" placeholder="Write your post..."></textarea>
           </div>
 
-          <div class=”platforms”>
-            <label class=”check”><input type=”checkbox” name=”platform” value=”stocktwits” checked /> StockTwits</label>
-            <label class=”check”><input type=”checkbox” name=”platform” value=”discord” checked /> Discord</label>
+          <div class="platforms">
+            <label class="check"><input type="checkbox" name="platform" value="stocktwits" checked /> StockTwits</label>
+            <label class="check"><input type="checkbox" name="platform" value="discord" checked /> Discord</label>
           </div>
 
-          <div class=”field”>
-            <label for=”stocktwits-symbol”>StockTwits Symbol</label>
-            <input id=”stocktwits-symbol” type=”text” placeholder=”e.g. AAPL” />
+          <div class="field">
+            <label for="stocktwits-symbol">StockTwits Symbol</label>
+            <input id="stocktwits-symbol" type="text" placeholder="e.g. AAPL" />
           </div>
 
-          <div class=”field”>
-            <label for=”stocktwits-account”>StockTwits Account</label>
-            <select id=”stocktwits-account”>
-              <option value=””>— Auto-select eligible account —</option>
+          <div class="field">
+            <label for="stocktwits-account">StockTwits Account</label>
+            <select id="stocktwits-account">
+              <option value="">— Auto-select eligible account —</option>
             </select>
-            <div class=”hint”>Leave on auto to rotate through healthy accounts. Manage accounts below.</div>
+            <div class="hint">Leave on auto to rotate through healthy accounts. Manage accounts below.</div>
           </div>
 
-          <div class=”field”>
-            <label for=”stocktwits-batch”>Multi-Symbol Batch <span style=”font-weight:400;color:#9ca3af;”>(optional — overrides symbol field)</span></label>
-            <textarea id=”stocktwits-batch” style=”min-height:90px;” placeholder=”AAPL | Apple looking strong today&#10;TSLA | Tesla breaking out”></textarea>
-            <div class=”hint”>One post per line. Format: <code style=”background:#f3f4f6;padding:1px 5px;border-radius:4px;”>SYMBOL | post text</code></div>
+          <div class="field">
+            <label for="stocktwits-batch">Multi-Symbol Batch <span style="font-weight:400;color:#9ca3af;">(optional — overrides symbol field)</span></label>
+            <textarea id="stocktwits-batch" style="min-height:90px;" placeholder="AAPL | Apple looking strong today&#10;TSLA | Tesla breaking out"></textarea>
+            <div class="hint">One post per line. Format: <code style="background:#f3f4f6;padding:1px 5px;border-radius:4px;">SYMBOL | post text</code></div>
           </div>
 
-          <div class=”field”>
-            <label for=”discord-server-url”>Discord Server URL <span style=”font-weight:400;color:#9ca3af;”>(optional)</span></label>
-            <input id=”discord-server-url” type=”text” placeholder=”https://discord.com/channels/...” />
+          <div class="field">
+            <label for="discord-server-url">Discord Server URL <span style="font-weight:400;color:#9ca3af;">(optional)</span></label>
+            <input id="discord-server-url" type="text" placeholder="https://discord.com/channels/..." />
           </div>
 
-          <hr class=”divider” />
+          <hr class="divider" />
 
-          <div style=”display:flex;gap:10px;align-items:center;”>
-            <button type=”submit” id=”submit-btn” class=”btn btn-primary”>Publish</button>
-            <span id=”publish-status” style=”font-size:13px;color:#6b7280;”></span>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button type="submit" id="submit-btn" class="btn btn-primary">Publish</button>
+            <span id="publish-status" style="font-size:13px;color:#6b7280;"></span>
           </div>
-          <pre id=”result” class=”result” style=”display:none;”></pre>
+          <pre id="result" class="result" style="display:none;"></pre>
         </form>
       </div>
 
       <!-- ── Account Management Card ──────────────────────────────────────── -->
-      <div class=”card”>
-        <div class=”card-header”>
+      <div class="card">
+        <div class="card-header">
           <div>
             <h1>Account Management</h1>
             <p>Configure Stocktwits accounts linked to dlvr.it for posting.</p>
           </div>
-          <button class=”btn btn-primary” onclick=”openModal()”>+ Add Account</button>
+          <button class="btn btn-primary" onclick="openModal()">+ Add Account</button>
         </div>
 
-        <table class=”acc-table”>
+        <table class="acc-table">
           <thead>
             <tr>
               <th>Handle</th>
@@ -315,38 +315,38 @@ export class ManualUiController {
               <th>Actions</th>
             </tr>
           </thead>
-          <tbody id=”accounts-body”>
-            <tr><td colspan=”4”><div class=”empty-state”>Loading...</div></td></tr>
+          <tbody id="accounts-body">
+            <tr><td colspan="4"><div class="empty-state">Loading...</div></td></tr>
           </tbody>
         </table>
 
-        <p style=”margin:16px 0 0;font-size:12px;color:#9ca3af;”>
+        <p style="margin:16px 0 0;font-size:12px;color:#9ca3af;">
           Get the dlvr.it Account ID from <strong>dlvrit.com → Profile → Connected Accounts</strong> after linking each Stocktwits account.
         </p>
       </div>
     </div>
 
     <!-- ── Modal ──────────────────────────────────────────────────────────── -->
-    <div class=”modal-overlay” id=”modal-overlay” onclick=”handleOverlayClick(event)”>
-      <div class=”modal”>
-        <h2 id=”modal-title”>Add Account</h2>
+    <div class="modal-overlay" id="modal-overlay" onclick="handleOverlayClick(event)">
+      <div class="modal">
+        <h2 id="modal-title">Add Account</h2>
 
-        <div class=”field”>
-          <label for=”modal-handle”>Stocktwits Handle</label>
-          <input id=”modal-handle” type=”text” placeholder=”e.g. myaccount” autocomplete=”off” />
+        <div class="field">
+          <label for="modal-handle">Stocktwits Handle</label>
+          <input id="modal-handle" type="text" placeholder="e.g. myaccount" autocomplete="off" />
         </div>
 
-        <div class=”field”>
-          <label for=”modal-dlvrit-id”>dlvr.it Account ID</label>
-          <input id=”modal-dlvrit-id” type=”number” placeholder=”e.g. 12345” autocomplete=”off” />
-          <div class=”hint”>Found in dlvrit.com → Profile → Connected Accounts after linking Stocktwits.</div>
+        <div class="field">
+          <label for="modal-dlvrit-id">dlvr.it Account ID</label>
+          <input id="modal-dlvrit-id" type="number" placeholder="e.g. 12345" autocomplete="off" />
+          <div class="hint">Found in dlvrit.com → Profile → Connected Accounts after linking Stocktwits.</div>
         </div>
 
-        <div class=”modal-error” id=”modal-error”></div>
+        <div class="modal-error" id="modal-error"></div>
 
-        <div class=”modal-footer”>
-          <button class=”btn btn-ghost” onclick=”closeModal()”>Cancel</button>
-          <button class=”btn btn-success” id=”modal-save-btn” onclick=”saveAccount()”>Save Account</button>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-success" id="modal-save-btn" onclick="saveAccount()">Save Account</button>
         </div>
       </div>
     </div>
@@ -441,7 +441,7 @@ export class ManualUiController {
 
           // Refresh dropdown
           const prev = stocktwitsAccount.value;
-          stocktwitsAccount.innerHTML = '<option value=””>— Auto-select eligible account —</option>';
+          stocktwitsAccount.innerHTML = '<option value="">— Auto-select eligible account —</option>';
           accounts.filter(a => a.status === 'ACTIVE' && a.dlvritAccountId).forEach(a => {
             const opt = document.createElement('option');
             opt.value       = a.accountHandle;
@@ -453,10 +453,10 @@ export class ManualUiController {
           // Render table
           if (!accounts.length) {
             accountsBody.innerHTML = \`
-              <tr><td colspan=”4”>
-                <div class=”empty-state”>
-                  <svg width=”32” height=”32” fill=”none” viewBox=”0 0 24 24” stroke=”currentColor”>
-                    <path stroke-linecap=”round” stroke-linejoin=”round” stroke-width=”1.5” d=”M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z”/>
+              <tr><td colspan="4">
+                <div class="empty-state">
+                  <svg width="32" height="32" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>
                   </svg>
                   No accounts yet. Click <strong>+ Add Account</strong> to get started.
                 </div>
@@ -472,26 +472,26 @@ export class ManualUiController {
               ? (a.status === 'ACTIVE' ? 'Active' : 'Disabled')
               : 'Not configured';
             const idCell = a.dlvritAccountId
-              ? \`<code style=”background:#f3f4f6;padding:2px 7px;border-radius:5px;font-size:12px;”>\${a.dlvritAccountId}</code>\`
-              : \`<span style=”color:#9ca3af;font-style:italic;”>—</span>\`;
+              ? \`<code style="background:#f3f4f6;padding:2px 7px;border-radius:5px;font-size:12px;">\${a.dlvritAccountId}</code>\`
+              : \`<span style="color:#9ca3af;font-style:italic;">—</span>\`;
             const toggleBtn = a.status === 'ACTIVE'
-              ? \`<button class=”btn btn-sm btn-danger” onclick=”toggleAccount('\${a.id}','disable')”>Disable</button>\`
-              : \`<button class=”btn btn-sm btn-success” onclick=”toggleAccount('\${a.id}','enable')”>Enable</button>\`;
+              ? \`<button class="btn btn-sm btn-danger" onclick="toggleAccount('\${a.id}','disable')">Disable</button>\`
+              : \`<button class="btn btn-sm btn-success" onclick="toggleAccount('\${a.id}','enable')">Enable</button>\`;
             return \`
               <tr>
-                <td><strong style=”font-size:13px;”>\${a.accountHandle}</strong></td>
+                <td><strong style="font-size:13px;">\${a.accountHandle}</strong></td>
                 <td>\${idCell}</td>
-                <td><span class=”badge \${badgeClass}”>\${badgeLabel}</span></td>
+                <td><span class="badge \${badgeClass}">\${badgeLabel}</span></td>
                 <td>
-                  <div class=”actions”>
-                    <button class=”btn btn-sm btn-blue” onclick=”openModal('\${a.accountHandle}', \${a.dlvritAccountId || ''})”>Edit</button>
+                  <div class="actions">
+                    <button class="btn btn-sm btn-blue" onclick="openModal('\${a.accountHandle}', \${a.dlvritAccountId || ''})">Edit</button>
                     \${toggleBtn}
                   </div>
                 </td>
               </tr>\`;
           }).join('');
         } catch {
-          accountsBody.innerHTML = '<tr><td colspan=”4” style=”padding:16px;color:#ef4444;font-size:13px;”>Failed to load accounts.</td></tr>';
+          accountsBody.innerHTML = '<tr><td colspan="4" style="padding:16px;color:#ef4444;font-size:13px;">Failed to load accounts.</td></tr>';
         }
       }
 
@@ -518,7 +518,7 @@ export class ManualUiController {
         publishStatus.textContent = '';
 
         try {
-          const platforms = Array.from(document.querySelectorAll('input[name=”platform”]:checked')).map(i => i.value);
+          const platforms = Array.from(document.querySelectorAll('input[name="platform"]:checked')).map(i => i.value);
 
           const batchLines = batchEl.value.split('\\n').map(l => l.trim()).filter(Boolean);
           const stocktwitsItems = [];
