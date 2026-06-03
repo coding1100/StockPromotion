@@ -5,6 +5,8 @@ export const envValidationSchema = Joi.object({
     .valid('development', 'test', 'production')
     .default('development'),
   PORT: Joi.number().port().default(3000),
+  // Bind all interfaces so Docker port publishing works (127.0.0.1-only breaks host access).
+  LISTEN_HOST: Joi.string().default('0.0.0.0'),
   SWAGGER_ENABLED: Joi.boolean().default(false),
   ADMIN_API_KEY: Joi.string().allow('').optional(),
 
@@ -27,8 +29,7 @@ export const envValidationSchema = Joi.object({
     .custom((value: string, helpers) => {
       if (!value.includes('{subreddit}')) {
         return helpers.error('any.custom', {
-          message:
-            'REDDIT_RAPIDAPI_PATH_TEMPLATE must include {subreddit}.',
+          message: 'REDDIT_RAPIDAPI_PATH_TEMPLATE must include {subreddit}.',
         });
       }
       return value;
@@ -41,13 +42,25 @@ export const envValidationSchema = Joi.object({
     .default('day'),
   REDDIT_RAPIDAPI_QUERY_PARAM: Joi.string().default('q'),
   REDDIT_QUERY_KEYWORDS: Joi.string().allow('').optional(),
-  REDDIT_QUERY_KEYWORD_LIMIT: Joi.number().integer().min(1).max(100).default(18),
+  REDDIT_QUERY_KEYWORD_LIMIT: Joi.number()
+    .integer()
+    .min(1)
+    .max(100)
+    .default(18),
   REDDIT_REQUIRE_KEYWORD_MATCH: Joi.boolean().default(false),
   REDDIT_ENABLE_WATCHLIST_KEYWORDS: Joi.boolean().default(true),
   REDDIT_ENABLE_THEME_KEYWORDS: Joi.boolean().default(true),
   REDDIT_EMPTY_RETRY_ATTEMPTS: Joi.number().integer().min(0).max(10).default(2),
-  REDDIT_EMPTY_RETRY_DELAY_MS: Joi.number().integer().min(0).max(10000).default(250),
-  REDDIT_RETRY_KEYWORD_SLICE_SIZE: Joi.number().integer().min(1).max(50).default(8),
+  REDDIT_EMPTY_RETRY_DELAY_MS: Joi.number()
+    .integer()
+    .min(0)
+    .max(10000)
+    .default(250),
+  REDDIT_RETRY_KEYWORD_SLICE_SIZE: Joi.number()
+    .integer()
+    .min(1)
+    .max(50)
+    .default(8),
   REDDIT_EMPTY_RETRY_TIME_VALUES: Joi.string().default('day,week,month'),
   REDDIT_MIN_QUALIFIED_POSTS: Joi.number().integer().min(1).max(100).default(1),
   REDDIT_SYNC_TREND_WINDOW: Joi.boolean().default(true),
@@ -122,6 +135,82 @@ export const envValidationSchema = Joi.object({
   STOCKTWITS_HEADLESS: Joi.boolean().default(true),
   STOCKTWITS_USER_DATA_DIR: Joi.string().allow('').optional(),
   STOCKTWITS_BROWSER_BINARY: Joi.string().allow('').optional(),
+  // Optional proxy support (browser-level). Use either the single proxy vars
+  // below OR the rotating pool JSON. If both are set, the pool wins.
+  // Single-line proxy: user:pass@host:port (e.g. DataImpulse). Parsed before
+  // STOCKTWITS_PROXY_SERVER when set. Pool JSON still wins if present.
+  STOCKTWITS_PROXY: Joi.string().allow('').optional(),
+  STOCKTWITS_PROXY_SERVER: Joi.string().allow('').optional(), // e.g. http://host:port
+  STOCKTWITS_PROXY_USERNAME: Joi.string().allow('').optional(),
+  STOCKTWITS_PROXY_PASSWORD: Joi.string().allow('').optional(),
+  STOCKTWITS_PROXY_BYPASS: Joi.string().allow('').optional(), // comma-separated hosts
+  STOCKTWITS_PROXIES_JSON: Joi.string().allow('').optional(), // JSON array of proxy objects
+  STOCKTWITS_PROXY_TEST_URL: Joi.string()
+    .uri()
+    .default('https://whoer.net'),
+  // When true/false, forces headed vs headless for the manual "test proxy" button.
+  // Unset = auto: headless on Linux with no $DISPLAY (Docker/CI).
+  STOCKTWITS_PROXY_TEST_HEADLESS: Joi.boolean().optional(),
+
+  // ── Residential proxy geo-alignment ──────────────────────────────────────
+  // Stocktwits/Cloudflare compare the browser's JS timezone and locale against
+  // the IP geolocation. A mismatch (e.g. proxy IP in UK, timezone = New_York)
+  // is a high-entropy bot signal. Set these to match wherever your residential
+  // proxy provider routes traffic (check the proxy test page for IP location).
+  //
+  // Examples (US proxies — default):
+  //   STOCKTWITS_PROXY_GEO_TIMEZONE=America/New_York
+  //   STOCKTWITS_PROXY_GEO_LOCALE=en-US
+  // Examples (UK residential):
+  //   STOCKTWITS_PROXY_GEO_TIMEZONE=Europe/London
+  //   STOCKTWITS_PROXY_GEO_LOCALE=en-GB
+  STOCKTWITS_PROXY_GEO_TIMEZONE: Joi.string().allow('').optional(),
+  STOCKTWITS_PROXY_GEO_LOCALE:   Joi.string().allow('').optional(),
+
+  // ── Sticky session support for rotating residential proxies ──────────────
+  // Rotating proxies change IPs between requests by default. A session change
+  // mid-flow (login on IP A, POST on IP B) immediately flags the Stocktwits
+  // session as suspicious. Most residential proxy providers support sticky
+  // sessions by appending a session ID to the username.
+  //
+  // Set STOCKTWITS_PROXY_STICKY_SUFFIX to the separator your provider uses.
+  // The system will append it + a per-account deterministic token to lock one
+  // IP for the entire session.
+  //
+  // Provider examples:
+  //   DataImpulse:  STOCKTWITS_PROXY_STICKY_SUFFIX=_session-
+  //     → username becomes: f076_xxxxx__cr.us_session-abc123
+  //   Bright Data:  STOCKTWITS_PROXY_STICKY_SUFFIX=-session-
+  //     → username becomes: user-session-abc123
+  //   Oxylabs:      STOCKTWITS_PROXY_STICKY_SUFFIX=-sessid-
+  //   IPRoyal:      STOCKTWITS_PROXY_STICKY_SUFFIX=_session_
+  STOCKTWITS_PROXY_STICKY_SUFFIX: Joi.string().allow('').optional(),
+
+  // How many minutes a sticky session ID is held before rotating to a new one.
+  // Shorter = more IP changes but lower re-use risk. 60 min is a safe default.
+  STOCKTWITS_PROXY_SESSION_ROTATION_MINUTES: Joi.number()
+    .integer()
+    .min(5)
+    .max(480)
+    .default(60),
+
+  // Set true if your residential proxy provider uses self-signed or MITM TLS
+  // certificates (some Bright Data, Oxylabs, Smartproxy setups do). Without
+  // this, Chromium shows a certificate error and the page never loads.
+  STOCKTWITS_PROXY_ACCEPT_INSECURE_CERTS: Joi.boolean().default(false),
+  // URL used for the proxy test when running headless (JSON IP is easiest to parse).
+  STOCKTWITS_PROXY_TEST_URL_HEADLESS: Joi.string()
+    .uri()
+    .default('https://api.ipify.org?format=json'),
+  // After ipify (headless), open this page and capture a screenshot for the manual UI (default whoer).
+  STOCKTWITS_PROXY_TEST_VISUAL_URL: Joi.string()
+    .uri()
+    .default('https://whoer.net'),
+  STOCKTWITS_PROXY_TEST_VISUAL_WAIT_MS: Joi.number()
+    .integer()
+    .min(0)
+    .max(120_000)
+    .default(5_000),
   STOCKTWITS_MANUAL_LOGIN_TIMEOUT_MS: Joi.number()
     .integer()
     .min(1000)
@@ -138,7 +227,73 @@ export const envValidationSchema = Joi.object({
     .max(120000)
     .default(30000),
   STOCKTWITS_TARGET_SYMBOLS: Joi.string().allow('').optional(),
+  // Stocktwits raised the limit to 1,000 characters for all accounts in Dec 2021.
+  STOCKTWITS_MAX_MESSAGE_LENGTH: Joi.number().integer().min(10).max(1000).default(1000),
+  // When true, the full pipeline runs (compliance, policy checks) but NO actual
+  // post is sent to dlvr.it or Playwright. Use for integration testing.
+  STOCKTWITS_DRY_RUN: Joi.boolean().default(false),
   CAPSOLVER_API_KEY: Joi.string().allow('').optional(),
+
+  // --- DLVR.IT INTEGRATION (PRIMARY POSTING CHANNEL) ---
+  // dlvr.it is an official StockTwits API partner. Posts originate from
+  // dlvr.it's servers using their vetted OAuth token — no browser, no proxy,
+  // no fingerprinting, zero muting risk.
+  //
+  // Setup:
+  //   1. Create an account at dlvrit.com
+  //   2. Go to Account Settings → API Key and copy your key
+  //   3. Go to Connect Accounts → StockTwits and connect each posting account
+  //   4. Set DLVRIT_API_KEY below
+  //
+  // The automated pipeline uses dlvr.it by default. Set
+  // STOCKTWITS_USE_LEGACY_POSTER=true only as a temporary rollback to Playwright.
+  DLVRIT_API_KEY: Joi.string().allow('').optional(),
+
+  // ── Account warm-up gate ─────────────────────────────────────────────────
+  // New accounts that immediately post promotional content get muted fastest.
+  // StockTwits requires the first 50 posts to be non-promotional.
+  // Set this to 50 (or higher) and let accounts build post history first.
+  // Default 0 = gate disabled (backward compatible — flip to 50 once you have
+  // a warm-up content flow running for new accounts).
+  STOCKTWITS_MIN_WARMUP_POSTS: Joi.number().integer().min(0).max(500).default(0),
+
+  // ── Market hours enforcement ──────────────────────────────────────────────
+  // When true, promotional posts are only executed Mon–Fri 8 AM–6 PM ET.
+  // Off-hours posting from automated accounts raises the spam-signal score.
+  STOCKTWITS_ENFORCE_MARKET_HOURS: Joi.boolean().default(false),
+
+  // ── Transport selection ───────────────────────────────────────────────────
+  // true (default): post via the Playwright stealth browser (patchright).
+  // false:           post via dlvr.it official API → direct OAuth token fallback.
+  //                  Use false only when you have DLVRIT_API_KEY configured and
+  //                  want the proxy-free official-API path.
+  STOCKTWITS_USE_LEGACY_POSTER: Joi.boolean().default(false),
+
+  // ── Posting discipline (PostingPolicyService) ─────────────────────────────
+  // Token-bucket: max posts per hour per dlvr.it account.
+  // StockTwits does not publish a hard limit; 10/hour is conservative and
+  // matches the cadence of well-behaved third-party clients.
+  STOCKTWITS_API_RATE_LIMIT_PER_HOUR: Joi.number().integer().min(1).max(200).default(10),
+  // Minimum milliseconds to wait between consecutive posts for the same account.
+  // Default 5 min. Jitter up to STOCKTWITS_API_MAX_INTER_POST_MS is added on top.
+  STOCKTWITS_API_MIN_INTER_POST_MS: Joi.number()
+    .integer()
+    .min(10_000)
+    .max(3_600_000)
+    .default(300_000),
+  // Upper bound for the randomised inter-post jitter window.
+  STOCKTWITS_API_MAX_INTER_POST_MS: Joi.number()
+    .integer()
+    .min(10_000)
+    .max(3_600_000)
+    .default(600_000),
+  // Rolling window (minutes) in which identical content hashes are rejected
+  // before they even reach dlvr.it — duplicate content is a primary mute trigger.
+  STOCKTWITS_API_DEDUP_WINDOW_MINUTES: Joi.number()
+    .integer()
+    .min(1)
+    .max(1440)
+    .default(60),
 
   // --- PIPELINE & QUOTAS ---
   PIPELINE_CRON: Joi.string().default('*/5 * * * *'),
@@ -151,13 +306,25 @@ export const envValidationSchema = Joi.object({
   AUTO_APPROVAL_MIN_SCORE: Joi.number().default(0.75),
   CONTENT_PROMPT_VERSION: Joi.string().default('phase1-v1'),
   CONTENT_DISCLOSURE_VERSION: Joi.string().default('v1'),
-  CONTENT_VARIATION_MAX_ATTEMPTS: Joi.number().integer().min(1).max(10).default(3),
+  CONTENT_VARIATION_MAX_ATTEMPTS: Joi.number()
+    .integer()
+    .min(1)
+    .max(10)
+    .default(3),
   CONTENT_MAX_SIMILARITY: Joi.number().min(0.5).max(0.99).default(0.72),
   PUBLISH_COOLDOWN_MINUTES: Joi.number().integer().min(1).default(90),
   PUBLISH_MAX_RETRIES: Joi.number().integer().min(1).max(10).default(3),
-  PUBLISH_RETRY_DELAY_SECONDS: Joi.number().integer().min(5).max(600).default(30),
+  PUBLISH_RETRY_DELAY_SECONDS: Joi.number()
+    .integer()
+    .min(5)
+    .max(600)
+    .default(30),
   PUBLISH_DEAD_LETTER_ENABLED: Joi.boolean().default(true),
-  PUBLISH_REPLAY_BATCH_SIZE: Joi.number().integer().min(1).max(1000).default(200),
+  PUBLISH_REPLAY_BATCH_SIZE: Joi.number()
+    .integer()
+    .min(1)
+    .max(1000)
+    .default(200),
   PHASE2_PER_ACCOUNT_QUOTA: Joi.number().integer().min(1).default(4),
   PHASE2_GLOBAL_QUOTA: Joi.number().integer().min(1).default(12),
   PHASE2_QUIET_HOURS_START: Joi.number().integer().min(0).max(23).optional(),
@@ -165,7 +332,10 @@ export const envValidationSchema = Joi.object({
   PHASE2_MIN_DELAY_MINUTES: Joi.number().integer().min(1).default(10),
   PHASE2_MAX_DELAY_MINUTES: Joi.number().integer().min(1).default(45),
   PHASE2_ADAPTIVE_COOLDOWN_MINUTES: Joi.number().integer().min(1).default(30),
-  PHASE2_DUPLICATE_SIMILARITY_THRESHOLD: Joi.number().min(0.5).max(1).default(0.82),
+  PHASE2_DUPLICATE_SIMILARITY_THRESHOLD: Joi.number()
+    .min(0.5)
+    .max(1)
+    .default(0.82),
   SOURCE_CONNECTOR_WEIGHTS_JSON: Joi.string().allow('').optional(),
   SOURCE_CONNECTOR_PRIORITIES_JSON: Joi.string().allow('').optional(),
   HTTP_REQUEST_TIMEOUT_MS: Joi.number()
@@ -176,9 +346,21 @@ export const envValidationSchema = Joi.object({
   HTTP_MAX_RETRIES: Joi.number().integer().min(0).max(6).default(2),
   RETENTION_ENABLED: Joi.boolean().default(true),
   RETENTION_CRON: Joi.string().default('15 2 * * *'),
-  RETENTION_SOURCE_EVENTS_DAYS: Joi.number().integer().min(1).max(3650).default(30),
-  RETENTION_AUDIT_EVENTS_DAYS: Joi.number().integer().min(1).max(3650).default(365),
-  RETENTION_PUBLISH_ATTEMPTS_DAYS: Joi.number().integer().min(1).max(3650).default(90),
+  RETENTION_SOURCE_EVENTS_DAYS: Joi.number()
+    .integer()
+    .min(1)
+    .max(3650)
+    .default(30),
+  RETENTION_AUDIT_EVENTS_DAYS: Joi.number()
+    .integer()
+    .min(1)
+    .max(3650)
+    .default(365),
+  RETENTION_PUBLISH_ATTEMPTS_DAYS: Joi.number()
+    .integer()
+    .min(1)
+    .max(3650)
+    .default(90),
   RETENTION_DLQ_DAYS: Joi.number().integer().min(1).max(3650).default(180),
 }).custom((value, helpers) => {
   const env = value as Record<string, unknown>;

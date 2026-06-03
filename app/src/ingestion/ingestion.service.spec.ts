@@ -80,7 +80,11 @@ describe('IngestionService', () => {
       REDDIT_SUBREDDITS: 'stocks,investing',
     };
     const { service } = makeService(configValues);
-    expect((service as never as { isRedditConfigured: () => boolean }).isRedditConfigured()).toBe(true);
+    expect(
+      (
+        service as never as { isRedditConfigured: () => boolean }
+      ).isRedditConfigured(),
+    ).toBe(true);
   });
 
   it('extracts nested rapidapi reddit items and unwraps item data', () => {

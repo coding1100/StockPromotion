@@ -223,9 +223,7 @@ export class DiscordUiPublisher {
     }
 
     const normalized = configuredPath.replace(/\//g, '\\').toLowerCase();
-    const isChromeProfile = normalized.includes(
-      '\\google\\chrome\\user data',
-    );
+    const isChromeProfile = normalized.includes('\\google\\chrome\\user data');
     if (isChromeProfile) {
       this.logger.warn(
         'DISCORD_UI_USER_DATA_DIR points to Chrome profile. Using isolated Chromium profile instead.',
@@ -277,7 +275,9 @@ export class DiscordUiPublisher {
       return true;
     }
 
-    const emailInput = page.locator('input[name="email"], input[type="email"]').first();
+    const emailInput = page
+      .locator('input[name="email"], input[type="email"]')
+      .first();
     return emailInput.isVisible({ timeout: 2500 }).catch(() => false);
   }
 
@@ -555,9 +555,7 @@ export class DiscordUiPublisher {
 
     const captchaInfo = await page
       .evaluate(() => {
-        const iframes = Array.from(
-          document.querySelectorAll('iframe'),
-        ) as HTMLIFrameElement[];
+        const iframes = Array.from(document.querySelectorAll('iframe'));
         for (const iframe of iframes) {
           const src = iframe.getAttribute('src') || '';
           const sitekeyMatch = src.match(/sitekey=([0-9a-fA-F-]{8,})/);
@@ -619,8 +617,9 @@ export class DiscordUiPublisher {
         // Discord listens to hCaptcha widget callbacks; if a global is exposed,
         // call it. Otherwise the textarea write is the best we can do without
         // patching hcaptcha.render before it ran.
-        const cb = (window as unknown as { __hcaptchaCallback?: (t: string) => void })
-          .__hcaptchaCallback;
+        const cb = (
+          window as unknown as { __hcaptchaCallback?: (t: string) => void }
+        ).__hcaptchaCallback;
         if (typeof cb === 'function') {
           try {
             cb(capToken);
@@ -835,7 +834,9 @@ export class DiscordUiPublisher {
         return await this.collectGuildChannels(page, guildId);
       } catch (error) {
         const message =
-          error instanceof Error ? error.message : 'discord_ui_channels_not_found';
+          error instanceof Error
+            ? error.message
+            : 'discord_ui_channels_not_found';
         const isAuthError = message.startsWith('discord_ui_login_required');
         if (!isAuthError || attempt === maxAttempts) {
           throw error;
@@ -891,7 +892,11 @@ export class DiscordUiPublisher {
           channelUrl: string;
         }> = [];
 
-        const pushRow = (channelId: string, channelName: string, href: string) => {
+        const pushRow = (
+          channelId: string,
+          channelName: string,
+          href: string,
+        ) => {
           if (!/^\d{15,25}$/.test(channelId) || seen.has(channelId)) {
             return;
           }
@@ -1051,7 +1056,9 @@ export class DiscordUiPublisher {
       return rows;
     } catch (error) {
       const reason =
-        error instanceof Error ? error.message : 'discord_ui_channel_api_failed';
+        error instanceof Error
+          ? error.message
+          : 'discord_ui_channel_api_failed';
       this.logger.warn(`Discord API channel discovery failed: ${reason}`);
       return [];
     }
@@ -1131,9 +1138,7 @@ export class DiscordUiPublisher {
       );
 
       if (!confirmation.sent) {
-        const skipReasons = new Set([
-          'discord_ui_slowmode_or_rate_limited',
-        ]);
+        const skipReasons = new Set(['discord_ui_slowmode_or_rate_limited']);
         const skipped = skipReasons.has(confirmation.reason ?? '');
         return {
           channelId: input.channelId,
@@ -1179,7 +1184,10 @@ export class DiscordUiPublisher {
     }
   }
 
-  private async typeMultilineMessage(page: Page, message: string): Promise<void> {
+  private async typeMultilineMessage(
+    page: Page,
+    message: string,
+  ): Promise<void> {
     const lines = message.replace(/\r\n/g, '\n').split('\n');
     for (let i = 0; i < lines.length; i += 1) {
       if (lines[i].length > 0) {
@@ -1342,7 +1350,9 @@ export class DiscordUiPublisher {
     return readOnlyNotice.isVisible({ timeout: 1500 }).catch(() => false);
   }
 
-  private async findComposer(page: Page): Promise<ReturnType<Page['locator']> | null> {
+  private async findComposer(
+    page: Page,
+  ): Promise<ReturnType<Page['locator']> | null> {
     const selectors = [
       'div[role="textbox"][data-slate-editor="true"]',
       'div[aria-label^="Message #"][role="textbox"]',

@@ -1,0 +1,7 @@
+node_modules
+dist
+artifacts
+.pw-stocktwits
+*.log
+.env
+.env.*

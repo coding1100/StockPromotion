@@ -51,16 +51,16 @@ describe('StocktwitsPublisher', () => {
     const strictFlowSpy = jest
       .spyOn(publisherAny, 'executeStrictSymbolComposerFlow')
       .mockResolvedValue(composerScope);
-    jest
-      .spyOn(publisherAny, 'submitInlineSymbolPost')
-      .mockResolvedValue(undefined);
+    jest.spyOn(publisherAny, 'snapshotMessageIds').mockResolvedValue(new Set());
+    jest.spyOn(publisherAny, 'interceptPostApiResponse').mockResolvedValue(null);
+    jest.spyOn(publisherAny, 'humanReviewBeforePost').mockResolvedValue(undefined);
+    jest.spyOn(publisherAny, 'submitInlineSymbolPost').mockResolvedValue(undefined);
     const modalSpy = jest
       .spyOn(publisherAny, 'handlePostConfirmationModal')
       .mockResolvedValue(undefined);
     jest.spyOn(publisherAny, 'finalizeDialogPost').mockResolvedValue(undefined);
-    jest
-      .spyOn(publisherAny, 'waitForPublishConfirmation')
-      .mockResolvedValue('12345');
+    jest.spyOn(publisherAny, 'checkPostSubmitRestrictions').mockResolvedValue(undefined);
+    jest.spyOn(publisherAny, 'waitForPublishConfirmation').mockResolvedValue('12345');
 
     const messageId = await publisherAny.postOnSymbolFeed(
       page,
@@ -90,19 +90,17 @@ describe('StocktwitsPublisher', () => {
     const composerScope = {} as Locator;
 
     jest.spyOn(publisherAny, 'navigateToSymbolFeed').mockResolvedValue(undefined);
-    jest
-      .spyOn(publisherAny, 'executeStrictSymbolComposerFlow')
-      .mockResolvedValue(composerScope);
-    jest
-      .spyOn(publisherAny, 'submitInlineSymbolPost')
-      .mockResolvedValue(undefined);
+    jest.spyOn(publisherAny, 'executeStrictSymbolComposerFlow').mockResolvedValue(composerScope);
+    jest.spyOn(publisherAny, 'snapshotMessageIds').mockResolvedValue(new Set());
+    jest.spyOn(publisherAny, 'interceptPostApiResponse').mockResolvedValue(null);
+    jest.spyOn(publisherAny, 'humanReviewBeforePost').mockResolvedValue(undefined);
+    jest.spyOn(publisherAny, 'submitInlineSymbolPost').mockResolvedValue(undefined);
     const modalSpy = jest
       .spyOn(publisherAny, 'handlePostConfirmationModal')
       .mockResolvedValue(undefined);
     jest.spyOn(publisherAny, 'finalizeDialogPost').mockResolvedValue(undefined);
-    jest
-      .spyOn(publisherAny, 'waitForPublishConfirmation')
-      .mockResolvedValue('99887');
+    jest.spyOn(publisherAny, 'checkPostSubmitRestrictions').mockResolvedValue(undefined);
+    jest.spyOn(publisherAny, 'waitForPublishConfirmation').mockResolvedValue('99887');
 
     const messageId = await publisherAny.postOnSymbolFeed(
       page,
@@ -120,7 +118,9 @@ describe('StocktwitsPublisher', () => {
     const publisherAny = publisher as any;
     const page = {} as Page;
 
-    jest.spyOn(publisherAny, 'navigateToSymbolFeed').mockResolvedValue(undefined);
+    jest
+      .spyOn(publisherAny, 'navigateToSymbolFeed')
+      .mockResolvedValue(undefined);
     jest
       .spyOn(publisherAny, 'executeStrictSymbolComposerFlow')
       .mockRejectedValue(
@@ -142,26 +142,29 @@ describe('StocktwitsPublisher', () => {
     const publisherAny = publisher as any;
 
     expect(
-      publisherAny.prepareSymbolFeedMessage('QQQ', '$QQQ\n\nMomentum is accelerating.'),
+      publisherAny.prepareSymbolFeedMessage(
+        'QQQ',
+        '$QQQ\n\nMomentum is accelerating.',
+      ),
     ).toBe('Momentum is accelerating.');
     expect(
       publisherAny.prepareSymbolFeedMessage('QQQ', 'Momentum is accelerating.'),
     ).toBe('Momentum is accelerating.');
   });
 
-  it('prefers local composer post button before global fallbacks', async () => {
+  it('prefers tagged inline post button before global fallbacks', async () => {
     const publisher = new StocktwitsPublisher(configServiceMock as never);
     const publisherAny = publisher as any;
-    const page = {} as Page;
+    const page = { locator: jest.fn().mockReturnValue({ first: jest.fn().mockReturnValue({}) }) } as unknown as Page;
     const composer = {} as Locator;
 
-    const localSpy = jest
-      .spyOn(publisherAny, 'clickPostButtonWithinComposerContainer')
-      .mockResolvedValue(true);
+    const tagSpy = jest.spyOn(publisherAny, 'tagInlinePostButton').mockResolvedValue(true);
+    jest.spyOn(publisherAny, 'humanHoverBeforeClick').mockResolvedValue(undefined);
+    jest.spyOn(publisherAny, 'clickWithFallbacks').mockResolvedValue(undefined);
 
-    await publisherAny.submitInlineSymbolPost(page, composer);
+    await publisherAny.submitInlineSymbolPost(page, composer, 'ORCL');
 
-    expect(localSpy).toHaveBeenCalledWith(page, composer);
+    expect(tagSpy).toHaveBeenCalledWith(page, 'ORCL', expect.any(Number));
   });
 
   it('throws when no inline post button is found in symbol flow', async () => {
@@ -170,12 +173,12 @@ describe('StocktwitsPublisher', () => {
     const page = {} as Page;
     const composer = {} as Locator;
 
-    jest
-      .spyOn(publisherAny, 'clickPostButtonWithinComposerContainer')
-      .mockResolvedValue(false);
+    jest.spyOn(publisherAny, 'tagInlinePostButton').mockResolvedValue(false);
+    jest.spyOn(publisherAny, 'findInlineComposerByAttributes').mockResolvedValue(null);
+    jest.spyOn(publisherAny, 'waitForEnabledInlinePostButton').mockResolvedValue(null);
 
     await expect(
-      publisherAny.submitInlineSymbolPost(page, composer),
+      publisherAny.submitInlineSymbolPost(page, composer, 'ORCL'),
     ).rejects.toThrow(/stocktwits_inline_post_button_not_found_or_disabled/i);
   });
 });

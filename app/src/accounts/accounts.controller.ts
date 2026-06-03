@@ -1,4 +1,12 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { AccountPlatform } from '@prisma/client';
 import { AccountsService } from './accounts.service';
@@ -10,9 +18,7 @@ export class AccountsController {
 
   @Get()
   async listAccounts(@Query('platform') platform?: string) {
-    return this.accountsService.listAccountsDashboard(
-      parsePlatform(platform),
-    );
+    return this.accountsService.listAccountsDashboard(parsePlatform(platform));
   }
 
   @Patch(':id/quarantine')

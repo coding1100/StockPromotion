@@ -242,11 +242,7 @@ export class LlmService {
   }
 
   private rememberOpener(text: string): void {
-    const opener = text
-      .split(/\s+/)
-      .slice(0, 8)
-      .join(' ')
-      .trim();
+    const opener = text.split(/\s+/).slice(0, 8).join(' ').trim();
     if (!opener) {
       return;
     }
