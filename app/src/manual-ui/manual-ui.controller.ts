@@ -72,6 +72,17 @@ export class ManualUiController {
     return { success: true };
   }
 
+  @Delete('accounts')
+  async deleteAccounts(
+    @Body() body: { ids: string[] },
+  ): Promise<Record<string, unknown>> {
+    if (!Array.isArray(body.ids) || body.ids.length === 0) {
+      return { success: false, error: 'ids array is required.' };
+    }
+    const deleted = await this.publishingService.deleteDlvritAccounts(body.ids);
+    return { success: true, deleted };
+  }
+
   // ── UI ───────────────────────────────────────────────────────────────────────
 
   @Get()
@@ -192,7 +203,19 @@ export class ManualUiController {
       }
       .acc-table td { padding: 12px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; }
       .acc-table tr:last-child td { border-bottom: none; }
+      .acc-table tr.selected td { background: #eff6ff; }
       .acc-table .actions { display: flex; gap: 8px; }
+      .acc-table input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; accent-color: #6366f1; }
+
+      /* Bulk toolbar */
+      .bulk-toolbar {
+        display: none; align-items: center; gap: 12px;
+        padding: 10px 14px; margin-bottom: 14px;
+        background: #eff6ff; border: 1px solid #bfdbfe;
+        border-radius: 8px; font-size: 13px; color: #1d4ed8;
+      }
+      .bulk-toolbar.visible { display: flex; }
+      .bulk-toolbar span { flex: 1; font-weight: 500; }
       .badge {
         display: inline-flex; align-items: center;
         padding: 3px 10px; border-radius: 20px;
@@ -306,9 +329,17 @@ export class ManualUiController {
           <button class="btn btn-primary" onclick="openModal()">+ Add Account</button>
         </div>
 
+        <!-- Bulk action toolbar — shown when ≥1 row is checked -->
+        <div class="bulk-toolbar" id="bulk-toolbar">
+          <span id="bulk-label">0 selected</span>
+          <button class="btn btn-sm btn-danger" onclick="deleteSelected()">Delete Selected</button>
+          <button class="btn btn-sm btn-ghost" onclick="clearSelection()">Clear</button>
+        </div>
+
         <table class="acc-table">
           <thead>
             <tr>
+              <th style="width:36px;"><input type="checkbox" id="select-all" title="Select all" onchange="toggleSelectAll(this)" /></th>
               <th>Handle</th>
               <th>dlvr.it ID</th>
               <th>Status</th>
@@ -316,7 +347,7 @@ export class ManualUiController {
             </tr>
           </thead>
           <tbody id="accounts-body">
-            <tr><td colspan="4"><div class="empty-state">Loading...</div></td></tr>
+            <tr><td colspan="5"><div class="empty-state">Loading...</div></td></tr>
           </tbody>
         </table>
 
@@ -432,6 +463,81 @@ export class ManualUiController {
       // ── Accounts table ──────────────────────────────────────────────────────
       const accountsBody      = document.getElementById('accounts-body');
       const stocktwitsAccount = document.getElementById('stocktwits-account');
+      const bulkToolbar       = document.getElementById('bulk-toolbar');
+      const bulkLabel         = document.getElementById('bulk-label');
+      const selectAllCb       = document.getElementById('select-all');
+
+      function getCheckedIds() {
+        return Array.from(accountsBody.querySelectorAll('input[type="checkbox"]:checked'))
+          .map(cb => cb.dataset.id);
+      }
+
+      function updateBulkToolbar() {
+        const ids = getCheckedIds();
+        if (ids.length > 0) {
+          bulkLabel.textContent = ids.length + ' account' + (ids.length > 1 ? 's' : '') + ' selected';
+          bulkToolbar.classList.add('visible');
+        } else {
+          bulkToolbar.classList.remove('visible');
+        }
+        // Sync select-all checkbox state
+        const all = accountsBody.querySelectorAll('input[type="checkbox"]');
+        selectAllCb.indeterminate = ids.length > 0 && ids.length < all.length;
+        selectAllCb.checked = all.length > 0 && ids.length === all.length;
+      }
+
+      function toggleSelectAll(cb) {
+        accountsBody.querySelectorAll('input[type="checkbox"]').forEach(c => {
+          c.checked = cb.checked;
+          c.closest('tr').classList.toggle('selected', cb.checked);
+        });
+        updateBulkToolbar();
+      }
+
+      function clearSelection() {
+        accountsBody.querySelectorAll('input[type="checkbox"]').forEach(c => {
+          c.checked = false;
+          c.closest('tr').classList.remove('selected');
+        });
+        selectAllCb.checked = false;
+        selectAllCb.indeterminate = false;
+        updateBulkToolbar();
+      }
+
+      async function deleteSelected() {
+        const ids = getCheckedIds();
+        if (!ids.length) return;
+        const label = ids.length === 1 ? '1 account' : ids.length + ' accounts';
+        if (!confirm('Permanently delete ' + label + '? This cannot be undone.')) return;
+        try {
+          const res = await fetch(basePath + '/accounts', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids }),
+          });
+          const json = await res.json();
+          if (!json.success) { alert('Delete failed: ' + (json.error || 'unknown error')); return; }
+          await loadAccounts();
+        } catch (e) {
+          alert('Delete failed: ' + e.message);
+        }
+      }
+
+      async function deleteSingle(id, handle) {
+        if (!confirm('Permanently delete "' + handle + '"? This cannot be undone.')) return;
+        try {
+          const res = await fetch(basePath + '/accounts', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: [id] }),
+          });
+          const json = await res.json();
+          if (!json.success) { alert('Delete failed: ' + (json.error || 'unknown error')); return; }
+          await loadAccounts();
+        } catch (e) {
+          alert('Delete failed: ' + e.message);
+        }
+      }
 
       async function loadAccounts() {
         try {
@@ -450,10 +556,15 @@ export class ManualUiController {
           });
           if (prev) stocktwitsAccount.value = prev;
 
+          // Reset selection state
+          selectAllCb.checked      = false;
+          selectAllCb.indeterminate = false;
+          bulkToolbar.classList.remove('visible');
+
           // Render table
           if (!accounts.length) {
             accountsBody.innerHTML = \`
-              <tr><td colspan="4">
+              <tr><td colspan="5">
                 <div class="empty-state">
                   <svg width="32" height="32" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/>
@@ -479,6 +590,7 @@ export class ManualUiController {
               : \`<button class="btn btn-sm btn-success" onclick="toggleAccount('\${a.id}','enable')">Enable</button>\`;
             return \`
               <tr>
+                <td><input type="checkbox" data-id="\${a.id}" onchange="onRowCheck(this)" /></td>
                 <td><strong style="font-size:13px;">\${a.accountHandle}</strong></td>
                 <td>\${idCell}</td>
                 <td><span class="badge \${badgeClass}">\${badgeLabel}</span></td>
@@ -486,13 +598,19 @@ export class ManualUiController {
                   <div class="actions">
                     <button class="btn btn-sm btn-blue" onclick="openModal('\${a.accountHandle}', \${a.dlvritAccountId || ''})">Edit</button>
                     \${toggleBtn}
+                    <button class="btn btn-sm btn-danger" onclick="deleteSingle('\${a.id}','\${a.accountHandle}')">Delete</button>
                   </div>
                 </td>
               </tr>\`;
           }).join('');
         } catch {
-          accountsBody.innerHTML = '<tr><td colspan="4" style="padding:16px;color:#ef4444;font-size:13px;">Failed to load accounts.</td></tr>';
+          accountsBody.innerHTML = '<tr><td colspan="5" style="padding:16px;color:#ef4444;font-size:13px;">Failed to load accounts.</td></tr>';
         }
+      }
+
+      function onRowCheck(cb) {
+        cb.closest('tr').classList.toggle('selected', cb.checked);
+        updateBulkToolbar();
       }
 
       async function toggleAccount(id, action) {

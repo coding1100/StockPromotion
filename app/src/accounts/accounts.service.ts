@@ -911,6 +911,17 @@ export class AccountsService {
     });
     return row?.dlvritAccountId ?? null;
   }
+
+  async deleteStocktwitsAccounts(ids: string[]): Promise<number> {
+    if (!ids.length) return 0;
+    const result = await this.prisma.accountProfile.deleteMany({
+      where: {
+        id: { in: ids },
+        platform: AccountPlatform.STOCKTWITS,
+      },
+    });
+    return result.count;
+  }
 }
 
 function parseJsonArray(raw: string, envName: string): unknown[] {
