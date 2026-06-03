@@ -78,279 +78,331 @@ export class ManualUiController {
   @Header('Content-Type', 'text/html; charset=utf-8')
   render(): string {
     return `<!doctype html>
-<html lang="en">
+<html lang=”en”>
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta charset=”utf-8” />
+    <meta name=”viewport” content=”width=device-width, initial-scale=1” />
     <title>Manual Publisher</title>
     <style>
+      *, *::before, *::after { box-sizing: border-box; }
       :root { color-scheme: light; }
       body {
         margin: 0;
-        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        font-family: “Segoe UI”, Tahoma, Geneva, Verdana, sans-serif;
         background: #f5f7fb;
         color: #111827;
       }
-      .wrap {
-        max-width: 760px;
-        margin: 32px auto;
-        padding: 0 16px;
-      }
+      .wrap { max-width: 780px; margin: 36px auto; padding: 0 20px 60px; }
+
+      /* Card */
       .card {
         background: #fff;
         border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 16px;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.04);
+        border-radius: 14px;
+        padding: 28px;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.05);
       }
-      h1 {
-        margin: 0 0 12px;
-        font-size: 20px;
+      .card + .card { margin-top: 24px; }
+      .card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 24px;
       }
+      .card-header h1 { margin: 0; font-size: 18px; font-weight: 700; }
+      .card-header p  { margin: 4px 0 0; font-size: 13px; color: #6b7280; }
+
+      /* Form elements */
+      .field { margin-top: 18px; }
+      .field:first-child { margin-top: 0; }
       label {
         display: block;
         margin-bottom: 6px;
-        font-size: 14px;
+        font-size: 13px;
         font-weight: 600;
+        color: #374151;
       }
+      input[type=”text”],
+      input[type=”number”],
+      select,
       textarea {
         width: 100%;
-        min-height: 140px;
-        resize: vertical;
         border: 1px solid #d1d5db;
         border-radius: 8px;
-        padding: 10px;
+        padding: 10px 12px;
         font-size: 14px;
-        box-sizing: border-box;
+        font-family: inherit;
+        color: #111827;
+        background: #fff;
+        transition: border-color .15s;
+        outline: none;
       }
-      .row {
-        display: flex;
-        gap: 16px;
-        margin-top: 12px;
-        flex-wrap: wrap;
-      }
+      input[type=”text”]:focus,
+      input[type=”number”]:focus,
+      select:focus,
+      textarea:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.1); }
+      textarea { min-height: 130px; resize: vertical; }
+      .hint { margin-top: 6px; font-size: 12px; color: #9ca3af; line-height: 1.5; }
+
+      /* Checkboxes row */
+      .platforms { display: flex; gap: 20px; margin-top: 18px; flex-wrap: wrap; }
       .check {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        font-size: 14px;
-        font-weight: 500;
+        display: inline-flex; align-items: center; gap: 8px;
+        font-size: 14px; font-weight: 500; cursor: pointer;
       }
-      .field {
-        margin-top: 12px;
+      .check input[type=”checkbox”] { width: 16px; height: 16px; cursor: pointer; }
+
+      /* Buttons */
+      .btn {
+        display: inline-flex; align-items: center; gap: 6px;
+        border: none; border-radius: 8px;
+        font-size: 14px; font-weight: 600; font-family: inherit;
+        padding: 10px 18px; cursor: pointer; transition: opacity .15s;
       }
-      input[type="text"], input[type="password"] {
-        width: 100%;
+      .btn:disabled { opacity: .55; cursor: default; }
+      .btn-primary  { background: #111827; color: #fff; }
+      .btn-success  { background: #16a34a; color: #fff; }
+      .btn-blue     { background: #2563eb; color: #fff; }
+      .btn-danger   { background: #dc2626; color: #fff; }
+      .btn-ghost    {
+        background: transparent; color: #374151;
         border: 1px solid #d1d5db;
-        border-radius: 8px;
-        padding: 10px;
-        font-size: 14px;
-        box-sizing: border-box;
       }
-      button {
-        border: none;
-        border-radius: 8px;
-        background: #111827;
-        color: #fff;
-        font-size: 14px;
-        font-weight: 600;
-        padding: 10px 14px;
-        cursor: pointer;
+      .btn-sm { padding: 5px 12px; font-size: 12px; border-radius: 6px; }
+      .btn:hover:not(:disabled) { opacity: .85; }
+
+      /* Result pre */
+      pre.result {
+        margin-top: 18px;
+        background: #0f172a; color: #e2e8f0;
+        border-radius: 10px; padding: 14px;
+        white-space: pre-wrap; word-break: break-word;
+        font-size: 12px; line-height: 1.6;
       }
-      button:disabled { opacity: 0.6; cursor: default; }
-      pre {
-        margin-top: 14px;
-        background: #0f172a;
-        color: #e2e8f0;
-        border-radius: 10px;
-        padding: 12px;
-        white-space: pre-wrap;
-        word-break: break-word;
-        font-size: 12px;
+
+      /* Divider */
+      .divider { border: none; border-top: 1px solid #f3f4f6; margin: 24px 0; }
+
+      /* Accounts table */
+      .acc-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .acc-table th {
+        text-align: left; padding: 10px 12px;
+        background: #f9fafb; border-bottom: 1px solid #e5e7eb;
+        font-size: 12px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: .04em;
       }
-      .hint {
-        margin-top: 10px;
-        color: #6b7280;
-        font-size: 12px;
+      .acc-table td { padding: 12px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; }
+      .acc-table tr:last-child td { border-bottom: none; }
+      .acc-table .actions { display: flex; gap: 8px; }
+      .badge {
+        display: inline-flex; align-items: center;
+        padding: 3px 10px; border-radius: 20px;
+        font-size: 11px; font-weight: 600; letter-spacing: .03em;
+      }
+      .badge-active   { background: #dcfce7; color: #15803d; }
+      .badge-inactive { background: #fee2e2; color: #b91c1c; }
+      .badge-warn     { background: #fef9c3; color: #854d0e; }
+
+      /* Empty state */
+      .empty-state {
+        text-align: center; padding: 36px 16px; color: #9ca3af; font-size: 13px;
+      }
+      .empty-state svg { display: block; margin: 0 auto 12px; opacity: .4; }
+
+      /* Modal */
+      .modal-overlay {
+        display: none; position: fixed; inset: 0;
+        background: rgba(0,0,0,.45); z-index: 100;
+        align-items: center; justify-content: center;
+      }
+      .modal-overlay.open { display: flex; }
+      .modal {
+        background: #fff; border-radius: 14px;
+        padding: 28px; width: 100%; max-width: 440px;
+        box-shadow: 0 20px 60px rgba(0,0,0,.2);
+        animation: modalIn .18s ease;
+      }
+      @keyframes modalIn {
+        from { transform: translateY(-12px); opacity: 0; }
+        to   { transform: translateY(0);     opacity: 1; }
+      }
+      .modal h2 { margin: 0 0 20px; font-size: 16px; font-weight: 700; }
+      .modal .field { margin-top: 16px; }
+      .modal .field:first-of-type { margin-top: 0; }
+      .modal-footer {
+        display: flex; gap: 10px; justify-content: flex-end;
+        margin-top: 24px; padding-top: 20px; border-top: 1px solid #f3f4f6;
+      }
+      .modal-error {
+        margin-top: 14px; padding: 10px 12px;
+        background: #fef2f2; border: 1px solid #fecaca;
+        border-radius: 8px; color: #b91c1c; font-size: 13px; display: none;
       }
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <div class="card">
-        <h1>Manual Post Publisher</h1>
-        <form id="publish-form">
-          <label for="post-body">Post <span id="body-hint" style="font-weight:400;font-size:0.85em;color:#888;">(required for Discord; optional when using StockTwits batch below)</span></label>
-          <textarea id="post-body" placeholder="Write your post..."></textarea>
+    <div class=”wrap”>
 
-          <div class="row">
-            <label class="check">
-              <input type="checkbox" name="platform" value="stocktwits" checked />
-              StockTwits
-            </label>
-            <label class="check">
-              <input type="checkbox" name="platform" value="discord" checked />
-              Discord
-            </label>
+      <!-- ── Publish Card ─────────────────────────────────────────────────── -->
+      <div class=”card”>
+        <div class=”card-header”>
+          <div>
+            <h1>Manual Post Publisher</h1>
+            <p>Publish directly to StockTwits symbol streams and Discord.</p>
+          </div>
+        </div>
+
+        <form id=”publish-form”>
+          <div class=”field”>
+            <label for=”post-body”>Post Body <span style=”font-weight:400;color:#9ca3af;”>(required for Discord; optional when using batch below)</span></label>
+            <textarea id=”post-body” placeholder=”Write your post...”></textarea>
           </div>
 
-          <div class="field">
-            <label for="stocktwits-symbol">StockTwits Symbol (required when StockTwits is enabled)</label>
-            <input id="stocktwits-symbol" type="text" placeholder="AAPL" />
+          <div class=”platforms”>
+            <label class=”check”><input type=”checkbox” name=”platform” value=”stocktwits” checked /> StockTwits</label>
+            <label class=”check”><input type=”checkbox” name=”platform” value=”discord” checked /> Discord</label>
           </div>
 
-          <div class="field">
-            <label for="stocktwits-account">StockTwits Account</label>
-            <select id="stocktwits-account" style="width:100%;border:1px solid #d1d5db;border-radius:8px;padding:10px;font-size:14px;box-sizing:border-box;">
-              <option value="">— Auto-select eligible account —</option>
+          <div class=”field”>
+            <label for=”stocktwits-symbol”>StockTwits Symbol</label>
+            <input id=”stocktwits-symbol” type=”text” placeholder=”e.g. AAPL” />
+          </div>
+
+          <div class=”field”>
+            <label for=”stocktwits-account”>StockTwits Account</label>
+            <select id=”stocktwits-account”>
+              <option value=””>— Auto-select eligible account —</option>
             </select>
-            <div class="hint">Accounts are configured in the <strong>Account Management</strong> section below. Auto-select picks the next eligible account based on health and cooldown.</div>
+            <div class=”hint”>Leave on auto to rotate through healthy accounts. Manage accounts below.</div>
           </div>
 
-          <div class="field">
-            <label for="stocktwits-batch">StockTwits Multi-Symbol Posts (optional, one per line)</label>
-            <textarea id="stocktwits-batch" placeholder="AAPL | Apple post text here\nTSLA | Tesla post text here"></textarea>
-            <div class="hint">If provided, this batch takes precedence over the single symbol field. Format: SYMBOL | POST</div>
+          <div class=”field”>
+            <label for=”stocktwits-batch”>Multi-Symbol Batch <span style=”font-weight:400;color:#9ca3af;”>(optional — overrides symbol field)</span></label>
+            <textarea id=”stocktwits-batch” style=”min-height:90px;” placeholder=”AAPL | Apple looking strong today&#10;TSLA | Tesla breaking out”></textarea>
+            <div class=”hint”>One post per line. Format: <code style=”background:#f3f4f6;padding:1px 5px;border-radius:4px;”>SYMBOL | post text</code></div>
           </div>
 
-          <div class="field">
-            <label for="discord-server-url">Discord Server URL (optional)</label>
-            <input id="discord-server-url" type="text" placeholder="https://discord.com/channels/<guild>/<channel>" />
+          <div class=”field”>
+            <label for=”discord-server-url”>Discord Server URL <span style=”font-weight:400;color:#9ca3af;”>(optional)</span></label>
+            <input id=”discord-server-url” type=”text” placeholder=”https://discord.com/channels/...” />
           </div>
 
-          <div class=”row” style=”margin-top:16px;align-items:center;”>
-            <button type=”submit” id=”submit-btn”>Publish</button>
+          <hr class=”divider” />
+
+          <div style=”display:flex;gap:10px;align-items:center;”>
+            <button type=”submit” id=”submit-btn” class=”btn btn-primary”>Publish</button>
+            <span id=”publish-status” style=”font-size:13px;color:#6b7280;”></span>
           </div>
-          <pre id=”result”>No request yet.</pre>
+          <pre id=”result” class=”result” style=”display:none;”></pre>
         </form>
       </div>
 
-      <div class=”card” style=”margin-top:24px;”>
-        <h1>Account Management</h1>
-        <p style=”font-size:13px;color:#6b7280;margin:0 0 16px;”>
-          Add your Stocktwits accounts here. Get the <strong>dlvr.it Account ID</strong> from
-          <strong>dlvrit.com → Profile → Connected Accounts</strong> after linking each Stocktwits account.
-        </p>
+      <!-- ── Account Management Card ──────────────────────────────────────── -->
+      <div class=”card”>
+        <div class=”card-header”>
+          <div>
+            <h1>Account Management</h1>
+            <p>Configure Stocktwits accounts linked to dlvr.it for posting.</p>
+          </div>
+          <button class=”btn btn-primary” onclick=”openModal()”>+ Add Account</button>
+        </div>
 
-        <table id=”accounts-table” style=”width:100%;border-collapse:collapse;font-size:13px;”>
+        <table class=”acc-table”>
           <thead>
-            <tr style=”background:#f9fafb;”>
-              <th style=”text-align:left;padding:8px 10px;border-bottom:1px solid #e5e7eb;”>Handle</th>
-              <th style=”text-align:left;padding:8px 10px;border-bottom:1px solid #e5e7eb;”>dlvr.it ID</th>
-              <th style=”text-align:left;padding:8px 10px;border-bottom:1px solid #e5e7eb;”>Status</th>
-              <th style=”text-align:left;padding:8px 10px;border-bottom:1px solid #e5e7eb;”>Actions</th>
+            <tr>
+              <th>Handle</th>
+              <th>dlvr.it ID</th>
+              <th>Status</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id=”accounts-body”>
-            <tr><td colspan=”4” style=”padding:12px;color:#9ca3af;”>Loading...</td></tr>
+            <tr><td colspan=”4”><div class=”empty-state”>Loading...</div></td></tr>
           </tbody>
         </table>
 
-        <div style=”margin-top:16px;padding-top:16px;border-top:1px solid #e5e7eb;”>
-          <h2 style=”font-size:15px;margin:0 0 12px;”>Add / Update Account</h2>
-          <div style=”display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;”>
-            <div style=”flex:1;min-width:140px;”>
-              <label style=”display:block;font-size:13px;font-weight:600;margin-bottom:4px;”>Stocktwits Handle</label>
-              <input id=”acc-handle” type=”text” placeholder=”e.g. myaccount” style=”width:100%;border:1px solid #d1d5db;border-radius:8px;padding:9px;font-size:13px;box-sizing:border-box;” />
-            </div>
-            <div style=”flex:1;min-width:140px;”>
-              <label style=”display:block;font-size:13px;font-weight:600;margin-bottom:4px;”>dlvr.it Account ID</label>
-              <input id=”acc-dlvrit-id” type=”number” placeholder=”e.g. 12345” style=”width:100%;border:1px solid #d1d5db;border-radius:8px;padding:9px;font-size:13px;box-sizing:border-box;” />
-            </div>
-            <button type=”button” id=”acc-save-btn” style=”padding:9px 18px;background:#16a34a;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;”>Save</button>
-          </div>
-          <pre id=”acc-result” style=”margin-top:10px;background:#0f172a;color:#e2e8f0;border-radius:8px;padding:10px;font-size:12px;white-space:pre-wrap;display:none;”></pre>
+        <p style=”margin:16px 0 0;font-size:12px;color:#9ca3af;”>
+          Get the dlvr.it Account ID from <strong>dlvrit.com → Profile → Connected Accounts</strong> after linking each Stocktwits account.
+        </p>
+      </div>
+    </div>
+
+    <!-- ── Modal ──────────────────────────────────────────────────────────── -->
+    <div class=”modal-overlay” id=”modal-overlay” onclick=”handleOverlayClick(event)”>
+      <div class=”modal”>
+        <h2 id=”modal-title”>Add Account</h2>
+
+        <div class=”field”>
+          <label for=”modal-handle”>Stocktwits Handle</label>
+          <input id=”modal-handle” type=”text” placeholder=”e.g. myaccount” autocomplete=”off” />
+        </div>
+
+        <div class=”field”>
+          <label for=”modal-dlvrit-id”>dlvr.it Account ID</label>
+          <input id=”modal-dlvrit-id” type=”number” placeholder=”e.g. 12345” autocomplete=”off” />
+          <div class=”hint”>Found in dlvrit.com → Profile → Connected Accounts after linking Stocktwits.</div>
+        </div>
+
+        <div class=”modal-error” id=”modal-error”></div>
+
+        <div class=”modal-footer”>
+          <button class=”btn btn-ghost” onclick=”closeModal()”>Cancel</button>
+          <button class=”btn btn-success” id=”modal-save-btn” onclick=”saveAccount()”>Save Account</button>
         </div>
       </div>
     </div>
 
     <script>
-      const form = document.getElementById('publish-form');
-      const bodyEl = document.getElementById('post-body');
-      const stocktwitsSymbolEl = document.getElementById('stocktwits-symbol');
-      const stocktwitsAccountEl = document.getElementById('stocktwits-account');
-      const stocktwitsBatchEl = document.getElementById('stocktwits-batch');
-      const discordServerUrlEl = document.getElementById('discord-server-url');
-      const submitBtn = document.getElementById('submit-btn');
-      const resultEl = document.getElementById('result');
-
-      const accHandleEl = document.getElementById('acc-handle');
-      const accDlvritIdEl = document.getElementById('acc-dlvrit-id');
-      const accSaveBtn = document.getElementById('acc-save-btn');
-      const accResultEl = document.getElementById('acc-result');
-      const accountsBody = document.getElementById('accounts-body');
-
       const basePath = window.location.pathname.replace(/\\/$/, '');
 
-      // ── Account management ──────────────────────────────────────────────────
+      // ── Modal ───────────────────────────────────────────────────────────────
+      const overlay     = document.getElementById('modal-overlay');
+      const modalTitle  = document.getElementById('modal-title');
+      const modalHandle = document.getElementById('modal-handle');
+      const modalId     = document.getElementById('modal-dlvrit-id');
+      const modalError  = document.getElementById('modal-error');
+      const modalSaveBtn = document.getElementById('modal-save-btn');
 
-      async function loadAccounts() {
-        try {
-          const res = await fetch(basePath + '/accounts');
-          const json = await res.json();
-          const accounts = json.accounts || [];
-
-          // Populate dropdown
-          const currentVal = stocktwitsAccountEl.value;
-          stocktwitsAccountEl.innerHTML = '<option value="">— Auto-select eligible account —</option>';
-          accounts.forEach((acc) => {
-            if (acc.status === 'ACTIVE' && acc.dlvritAccountId) {
-              const opt = document.createElement('option');
-              opt.value = acc.accountHandle;
-              opt.textContent = acc.accountHandle + ' (ID: ' + acc.dlvritAccountId + ')';
-              stocktwitsAccountEl.appendChild(opt);
-            }
-          });
-          if (currentVal) stocktwitsAccountEl.value = currentVal;
-
-          // Populate table
-          if (accounts.length === 0) {
-            accountsBody.innerHTML = '<tr><td colspan="4" style="padding:12px;color:#9ca3af;">No accounts configured yet.</td></tr>';
-            return;
-          }
-          accountsBody.innerHTML = accounts.map((acc) => \`
-            <tr style="border-bottom:1px solid #f3f4f6;">
-              <td style="padding:8px 10px;">\${acc.accountHandle}</td>
-              <td style="padding:8px 10px;">\${acc.dlvritAccountId ?? '<span style="color:#ef4444">Not set</span>'}</td>
-              <td style="padding:8px 10px;">
-                <span style="padding:2px 8px;border-radius:12px;font-size:12px;background:\${acc.status === 'ACTIVE' ? '#dcfce7' : '#fee2e2'};color:\${acc.status === 'ACTIVE' ? '#16a34a' : '#dc2626'};">
-                  \${acc.status}
-                </span>
-              </td>
-              <td style="padding:8px 10px;display:flex;gap:6px;">
-                <button onclick="editAccount('\${acc.accountHandle}', \${acc.dlvritAccountId})" style="padding:4px 10px;font-size:12px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;">Edit</button>
-                \${acc.status === 'ACTIVE'
-                  ? \`<button onclick="toggleAccount('\${acc.id}', 'disable')" style="padding:4px 10px;font-size:12px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;">Disable</button>\`
-                  : \`<button onclick="toggleAccount('\${acc.id}', 'enable')" style="padding:4px 10px;font-size:12px;background:#16a34a;color:#fff;border:none;border-radius:6px;cursor:pointer;">Enable</button>\`
-                }
-              </td>
-            </tr>
-          \`).join('');
-        } catch (e) {
-          accountsBody.innerHTML = '<tr><td colspan="4" style="padding:12px;color:#ef4444;">Failed to load accounts.</td></tr>';
-        }
+      function openModal(handle, dlvritId) {
+        modalHandle.value  = handle  || '';
+        modalId.value      = dlvritId || '';
+        modalTitle.textContent = handle ? 'Edit Account' : 'Add Account';
+        modalError.style.display = 'none';
+        modalError.textContent   = '';
+        overlay.classList.add('open');
+        setTimeout(() => modalHandle.focus(), 80);
       }
 
-      function editAccount(handle, dlvritId) {
-        accHandleEl.value = handle;
-        accDlvritIdEl.value = dlvritId || '';
-        accHandleEl.focus();
+      function closeModal() {
+        overlay.classList.remove('open');
       }
 
-      async function toggleAccount(id, action) {
-        await fetch(basePath + '/accounts/' + id + '/' + action, { method: 'PUT' });
-        loadAccounts();
+      function handleOverlayClick(e) {
+        if (e.target === overlay) closeModal();
       }
 
-      accSaveBtn.addEventListener('click', async () => {
-        const handle = accHandleEl.value.trim();
-        const dlvritId = parseInt(accDlvritIdEl.value.trim(), 10);
-        if (!handle || !dlvritId) {
-          accResultEl.style.display = 'block';
-          accResultEl.textContent = 'Both Handle and dlvr.it ID are required.';
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeModal();
+      });
+
+      async function saveAccount() {
+        const handle   = modalHandle.value.trim();
+        const dlvritId = parseInt(modalId.value.trim(), 10);
+
+        if (!handle) {
+          showModalError('Stocktwits handle is required.');
+          modalHandle.focus();
           return;
         }
-        accSaveBtn.disabled = true;
+        if (!dlvritId || dlvritId <= 0) {
+          showModalError('A valid dlvr.it Account ID is required.');
+          modalId.focus();
+          return;
+        }
+
+        modalSaveBtn.disabled = true;
+        modalSaveBtn.textContent = 'Saving…';
+        modalError.style.display = 'none';
+
         try {
           const res = await fetch(basePath + '/accounts', {
             method: 'POST',
@@ -358,85 +410,163 @@ export class ManualUiController {
             body: JSON.stringify({ accountHandle: handle, dlvritAccountId: dlvritId }),
           });
           const json = await res.json();
-          accResultEl.style.display = 'block';
-          accResultEl.textContent = JSON.stringify(json, null, 2);
-          if (json.success) {
-            accHandleEl.value = '';
-            accDlvritIdEl.value = '';
-            loadAccounts();
+          if (!json.success) {
+            showModalError(json.error || 'Failed to save account.');
+            return;
           }
+          closeModal();
+          await loadAccounts();
         } catch (e) {
-          accResultEl.style.display = 'block';
-          accResultEl.textContent = 'Error: ' + e.message;
+          showModalError('Network error: ' + e.message);
         } finally {
-          accSaveBtn.disabled = false;
+          modalSaveBtn.disabled = false;
+          modalSaveBtn.textContent = 'Save Account';
         }
-      });
+      }
+
+      function showModalError(msg) {
+        modalError.textContent = msg;
+        modalError.style.display = 'block';
+      }
+
+      // ── Accounts table ──────────────────────────────────────────────────────
+      const accountsBody      = document.getElementById('accounts-body');
+      const stocktwitsAccount = document.getElementById('stocktwits-account');
+
+      async function loadAccounts() {
+        try {
+          const res  = await fetch(basePath + '/accounts');
+          const json = await res.json();
+          const accounts = json.accounts || [];
+
+          // Refresh dropdown
+          const prev = stocktwitsAccount.value;
+          stocktwitsAccount.innerHTML = '<option value=””>— Auto-select eligible account —</option>';
+          accounts.filter(a => a.status === 'ACTIVE' && a.dlvritAccountId).forEach(a => {
+            const opt = document.createElement('option');
+            opt.value       = a.accountHandle;
+            opt.textContent = a.accountHandle + '  (ID: ' + a.dlvritAccountId + ')';
+            stocktwitsAccount.appendChild(opt);
+          });
+          if (prev) stocktwitsAccount.value = prev;
+
+          // Render table
+          if (!accounts.length) {
+            accountsBody.innerHTML = \`
+              <tr><td colspan=”4”>
+                <div class=”empty-state”>
+                  <svg width=”32” height=”32” fill=”none” viewBox=”0 0 24 24” stroke=”currentColor”>
+                    <path stroke-linecap=”round” stroke-linejoin=”round” stroke-width=”1.5” d=”M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z”/>
+                  </svg>
+                  No accounts yet. Click <strong>+ Add Account</strong> to get started.
+                </div>
+              </td></tr>\`;
+            return;
+          }
+
+          accountsBody.innerHTML = accounts.map(a => {
+            const badgeClass = a.dlvritAccountId
+              ? (a.status === 'ACTIVE' ? 'badge-active' : 'badge-inactive')
+              : 'badge-warn';
+            const badgeLabel = a.dlvritAccountId
+              ? (a.status === 'ACTIVE' ? 'Active' : 'Disabled')
+              : 'Not configured';
+            const idCell = a.dlvritAccountId
+              ? \`<code style=”background:#f3f4f6;padding:2px 7px;border-radius:5px;font-size:12px;”>\${a.dlvritAccountId}</code>\`
+              : \`<span style=”color:#9ca3af;font-style:italic;”>—</span>\`;
+            const toggleBtn = a.status === 'ACTIVE'
+              ? \`<button class=”btn btn-sm btn-danger” onclick=”toggleAccount('\${a.id}','disable')”>Disable</button>\`
+              : \`<button class=”btn btn-sm btn-success” onclick=”toggleAccount('\${a.id}','enable')”>Enable</button>\`;
+            return \`
+              <tr>
+                <td><strong style=”font-size:13px;”>\${a.accountHandle}</strong></td>
+                <td>\${idCell}</td>
+                <td><span class=”badge \${badgeClass}”>\${badgeLabel}</span></td>
+                <td>
+                  <div class=”actions”>
+                    <button class=”btn btn-sm btn-blue” onclick=”openModal('\${a.accountHandle}', \${a.dlvritAccountId || ''})”>Edit</button>
+                    \${toggleBtn}
+                  </div>
+                </td>
+              </tr>\`;
+          }).join('');
+        } catch {
+          accountsBody.innerHTML = '<tr><td colspan=”4” style=”padding:16px;color:#ef4444;font-size:13px;”>Failed to load accounts.</td></tr>';
+        }
+      }
+
+      async function toggleAccount(id, action) {
+        await fetch(basePath + '/accounts/' + id + '/' + action, { method: 'PUT' });
+        loadAccounts();
+      }
 
       loadAccounts();
 
       // ── Publish form ────────────────────────────────────────────────────────
+      const form            = document.getElementById('publish-form');
+      const bodyEl          = document.getElementById('post-body');
+      const symbolEl        = document.getElementById('stocktwits-symbol');
+      const batchEl         = document.getElementById('stocktwits-batch');
+      const discordUrlEl    = document.getElementById('discord-server-url');
+      const submitBtn       = document.getElementById('submit-btn');
+      const publishStatus   = document.getElementById('publish-status');
+      const resultEl        = document.getElementById('result');
 
-      form.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        resultEl.textContent = '';
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        resultEl.style.display = 'none';
+        publishStatus.textContent = '';
 
         try {
-          const platforms = Array.from(document.querySelectorAll('input[name="platform"]:checked'))
-            .map((input) => input.value);
+          const platforms = Array.from(document.querySelectorAll('input[name=”platform”]:checked')).map(i => i.value);
 
-          const batchLines = stocktwitsBatchEl.value
-            .split('\\n')
-            .map((line) => line.trim())
-            .filter(Boolean);
+          const batchLines = batchEl.value.split('\\n').map(l => l.trim()).filter(Boolean);
           const stocktwitsItems = [];
           for (const line of batchLines) {
-            const divider = line.indexOf('|');
-            if (divider <= 0) {
-              throw new Error('Invalid StockTwits batch row — use: SYMBOL | post text');
-            }
-            const symbol = line.slice(0, divider).trim().replace(/^\\$/, '');
-            const rowBody = line.slice(divider + 1).trim();
-            if (!symbol) throw new Error('Invalid StockTwits batch row — symbol is empty');
-            if (!rowBody) throw new Error(\`StockTwits batch row for \${symbol} has no post text\`);
+            const div = line.indexOf('|');
+            if (div <= 0) throw new Error('Invalid batch row — use: SYMBOL | post text');
+            const symbol  = line.slice(0, div).trim().replace(/^\\$/, '');
+            const rowBody = line.slice(div + 1).trim();
+            if (!symbol)  throw new Error('Batch row has empty symbol');
+            if (!rowBody) throw new Error(\`Batch row for \${symbol} has no text\`);
             stocktwitsItems.push({ symbol, body: rowBody });
           }
 
           const hasBatch = stocktwitsItems.length > 0;
-          const publishesToDiscord = platforms.includes('discord');
-          const publishesToStocktwits = platforms.includes('stocktwits');
           const bodyValue = bodyEl.value.trim();
 
-          if (publishesToDiscord && !bodyValue) {
-            bodyEl.focus();
-            throw new Error('Post body is required when Discord is enabled.');
+          if (platforms.includes('discord') && !bodyValue) {
+            bodyEl.focus(); throw new Error('Post body is required when Discord is enabled.');
           }
-          if (!hasBatch && publishesToStocktwits && !bodyValue) {
-            bodyEl.focus();
-            throw new Error('Post body is required when not using the StockTwits batch field.');
+          if (!hasBatch && platforms.includes('stocktwits') && !bodyValue) {
+            bodyEl.focus(); throw new Error('Post body is required when not using batch mode.');
           }
 
           const payload = {
             body: bodyValue,
             platforms,
-            stocktwitsSymbol: stocktwitsSymbolEl.value.trim() || undefined,
-            stocktwitsAccountHandle: stocktwitsAccountEl.value || undefined,
+            stocktwitsSymbol: symbolEl.value.trim() || undefined,
+            stocktwitsAccountHandle: stocktwitsAccount.value || undefined,
             stocktwitsItems: hasBatch ? stocktwitsItems : undefined,
-            discordServerUrl: discordServerUrlEl.value.trim() || undefined,
+            discordServerUrl: discordUrlEl.value.trim() || undefined,
           };
 
           submitBtn.disabled = true;
-          resultEl.textContent = 'Publishing…';
+          publishStatus.textContent = 'Publishing…';
 
-          const response = await fetch(basePath + '/publish', {
+          const res  = await fetch(basePath + '/publish', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
           });
-          const json = await response.json();
+          const json = await res.json();
+          publishStatus.textContent = '';
+          resultEl.style.display = 'block';
           resultEl.textContent = JSON.stringify(json, null, 2);
-        } catch (error) {
-          resultEl.textContent = '⚠ ' + String(error instanceof Error ? error.message : error);
+        } catch (err) {
+          publishStatus.textContent = '';
+          resultEl.style.display = 'block';
+          resultEl.textContent = '⚠ ' + String(err instanceof Error ? err.message : err);
         } finally {
           submitBtn.disabled = false;
         }
