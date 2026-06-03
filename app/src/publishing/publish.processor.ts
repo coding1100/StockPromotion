@@ -19,7 +19,9 @@ export class PublishProcessor extends WorkerHost {
     if (job.name !== PUBLISH_JOB_EXECUTE) {
       return;
     }
-    this.logger.log(`Processing queue job ${job.id} -> ${job.data.publishJobId}`);
+    this.logger.log(
+      `Processing queue job ${job.id} -> ${job.data.publishJobId}`,
+    );
     await this.publishingService.executePublishJob(job.data.publishJobId);
   }
 }

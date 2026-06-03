@@ -196,10 +196,7 @@ export class TelegramPublisher {
     };
   }
 
-  private async getChat(
-    token: string,
-    chatId: string,
-  ): Promise<unknown> {
+  private async getChat(token: string, chatId: string): Promise<unknown> {
     const response = await executeWithRetry(
       () =>
         axios.get<TelegramApiResponse<unknown>>(

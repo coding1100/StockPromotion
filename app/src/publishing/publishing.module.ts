@@ -7,9 +7,11 @@ import { AuditModule } from '../audit/audit.module';
 import { PUBLISH_QUEUE } from '../common/constants/queue.constants';
 import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
+import { DlvritPublisher } from './dlvrit.publisher';
 import { PublishProcessor } from './publish.processor';
 import { TelemetryModule } from '../telemetry/telemetry.module';
 import { DiscordUiPublisher } from './discord-ui.publisher';
+import { PolicyModule } from '../policy/policy.module';
 
 @Module({
   imports: [
@@ -20,11 +22,13 @@ import { DiscordUiPublisher } from './discord-ui.publisher';
     AccountsModule,
     AuditModule,
     TelemetryModule,
+    PolicyModule,
   ],
   providers: [
     PublishingService,
     TelegramPublisher,
     StocktwitsPublisher,
+    DlvritPublisher,
     DiscordUiPublisher,
     PublishProcessor,
   ],

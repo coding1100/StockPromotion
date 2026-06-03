@@ -5,7 +5,7 @@ NestJS backend that ingests retail-finance signals (Reddit + secondary connector
 - Multi-source ingestion with mockable connectors for development
 - Trend detection across configurable time windows
 - LLM draft generation with structured outputs
-- **Stocktwits** publishing via Playwright + CapSolver (Cloudflare Turnstile)
+- **Stocktwits** publishing via **dlvr.it official API** (immune to muting) with Playwright browser as a legacy fallback
 - **Discord** publishing via Playwright UI automation
 - **Telegram** publishing with discovery candidate approval
 - Multi-account routing, health scoring, quarantine, replacement workflow
@@ -105,7 +105,70 @@ REDDIT_FETCH_LIMIT=10
 
 Set `REDDIT_MOCK_DATA_JSON=[...]` in development if you don't have a RapidAPI key — see "Development mock mode" below.
 
-### Stocktwits publishing
+### StockTwits publishing — dlvr.it setup (recommended, immune to muting)
+
+**Why dlvr.it and not Playwright?**
+dlvr.it is a whitelisted official StockTwits API partner. Posts originate from
+dlvr.it's servers using their vetted OAuth token — not from your IP, not from a
+browser, not through a proxy. StockTwits trusts this source. Playwright browser
+automation triggers behavioural muting every time because StockTwits scores CDP
+fingerprints, timing patterns, and posting cadence. dlvr.it bypasses all of that.
+
+StockTwits has also frozen new API developer registrations, so dlvr.it is the only
+practical programmatic posting channel available.
+
+**One-time setup (10 minutes):**
+
+1. Create a free or paid account at [dlvrit.com](https://dlvrit.com)
+2. Go to **Account Settings → API Key** and copy your key
+3. Go to **Connect Accounts → StockTwits** and connect each of your posting accounts
+4. Add to `.env`:
+   ```dotenv
+   DLVRIT_API_KEY=your_key_here
+   ```
+5. Verify the connection:
+   ```bash
+   curl -X POST http://localhost:3000/api/orchestration/stocktwits/session \
+     -H "x-api-key: $ADMIN_API_KEY"
+   ```
+   The response will list the dlvr.it accounts the system found.
+
+**Posting discipline (anti-mute defaults, all configurable):**
+```dotenv
+# Maximum posts per hour per account (token bucket). Default 10 = 1 post every 6 min.
+STOCKTWITS_API_RATE_LIMIT_PER_HOUR=10
+
+# Minimum wait between consecutive posts: 5–10 min with random jitter.
+# Rapid multi-symbol bursts are a primary mute trigger even through official API.
+STOCKTWITS_API_MIN_INTER_POST_MS=300000
+STOCKTWITS_API_MAX_INTER_POST_MS=600000
+
+# Reject identical content posted again within this window (minutes).
+# Duplicate posts are StockTwits' #1 spam signal.
+STOCKTWITS_API_DEDUP_WINDOW_MINUTES=60
+
+# Set to true ONLY for emergency rollback to the Playwright browser path.
+# Not recommended — causes behavioural muting.
+STOCKTWITS_USE_LEGACY_POSTER=false
+```
+
+**What actually causes muting (in priority order):**
+1. Identical or near-identical messages posted repeatedly (dedup window fixes this)
+2. Rapid multi-symbol bursts — posting to 10 symbols in 5 minutes (inter-post delay fixes this)
+3. 100% promotional content with zero genuine engagement
+4. Browser automation fingerprints (dlvr.it eliminates this entirely)
+5. Multiple accounts posting identical content (account rotation games)
+
+**For muted accounts:** dlvr.it posting will not unmute an account that has been
+explicitly restricted for content violations. You need to:
+1. Wait for the mute to expire (StockTwits temporary mutes last 24–72 hours typically)
+2. Or appeal at stocktwits.com/support
+3. Once unmuted, switch to dlvr.it to prevent recurrence
+4. Vary your content — promotional posts must be ≤10% of total account activity per StockTwits rules
+
+---
+
+### StockTwits publishing — legacy Playwright config (only needed when `USE_LEGACY_POSTER=true`)
 
 ```dotenv
 STOCKTWITS_LOGIN_URL=https://stocktwits.com/signin
@@ -117,7 +180,31 @@ STOCKTWITS_MANUAL_LOGIN_TIMEOUT_MS=300000
 STOCKTWITS_NAV_TIMEOUT_MS=45000
 STOCKTWITS_PUBLISH_CONFIRM_TIMEOUT_MS=30000
 
-# Comma-separated list of symbols to broadcast to when no specific symbol is provided on the request
+# Optional: one-line proxy (user:pass@host:port), e.g. DataImpulse — used if set
+# unless STOCKTWITS_PROXIES_JSON is set (pool wins).
+STOCKTWITS_PROXY=user:pass@gw.dataimpulse.com:10000
+
+# Optional: browser proxy for Stocktwits (split form; ignored if STOCKTWITS_PROXY or pool is set).
+STOCKTWITS_PROXY_SERVER=http://host:port
+STOCKTWITS_PROXY_USERNAME=
+STOCKTWITS_PROXY_PASSWORD=
+STOCKTWITS_PROXY_BYPASS=localhost,127.0.0.1
+
+# Page opened by “Test Stocktwits proxy” on the manual publisher UI (headed desktop).
+STOCKTWITS_PROXY_TEST_URL=https://whoer.net
+# In Docker / Linux without $DISPLAY the test runs headless and uses this URL (JSON with "ip").
+STOCKTWITS_PROXY_TEST_URL_HEADLESS=https://api.ipify.org?format=json
+# After ipify, headless mode opens this page and returns a JPEG screenshot in the API (default whoer).
+STOCKTWITS_PROXY_TEST_VISUAL_URL=https://whoer.net
+STOCKTWITS_PROXY_TEST_VISUAL_WAIT_MS=5000
+# Optional: force headless for the proxy test (true/false). Unset = auto from $DISPLAY.
+STOCKTWITS_PROXY_TEST_HEADLESS=
+
+# Optional: rotating proxy pool (JSON). If set, it overrides STOCKTWITS_PROXY and the single proxy vars.
+STOCKTWITS_PROXIES_JSON='[{"server":"http://host1:port","username":"u1","password":"p1"},{"server":"http://host2:port","username":"u2","password":"p2"}]'
+
+# Optional default symbol list used by automation and scheduling flows.
+# Manual publishing now requires an explicit stocktwitsSymbol per request.
 STOCKTWITS_TARGET_SYMBOLS=GME,AAPL,TSLA
 
 # Account credentials (JSON array)
@@ -214,20 +301,10 @@ PIPELINE_CRON=*/5 * * * *                 # every 5 minutes
      }'
    ```
 
-3. **Manual broadcast — every symbol in `STOCKTWITS_TARGET_SYMBOLS`**
+3. **Manual StockTwits compliance rule**
 
-   Omit `stocktwitsSymbol` from the body:
-   ```bash
-   curl -X POST http://localhost:3000/api/orchestration/publish/manual \
-     -H "x-api-key: <API_KEY>" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "body": "Broadcast test.",
-       "publishToStocktwits": true,
-       "publishToDiscord": false
-     }'
-   ```
-   The publisher will log in once and post to each symbol in `STOCKTWITS_TARGET_SYMBOLS` (e.g. `GME,AAPL,TSLA`) sequentially with randomized inter-symbol pauses.
+   `stocktwitsSymbol` is required for manual StockTwits publishing.  
+   Manual broadcast of the same post across multiple symbols is intentionally blocked by compliance.
 
 4. **Stocktwits session warmup (one-time)**
 
@@ -359,6 +436,8 @@ npm run ops:replay-window -- -FromIso 2026-04-01T00:00:00Z -ToIso 2026-04-01T06:
 ---
 
 ## Troubleshooting
+
+**Docker: browser shows “can’t reach” / connection refused on port 3000** — the app container must reach Postgres and Redis by **service name** (`postgres`, `redis`), not `127.0.0.1`. `docker-compose.yml` overrides `DATABASE_URL`, `REDIS_HOST`, and `LISTEN_HOST` for the `app` service so a host-oriented `.env` still works. Check logs: `docker logs stockpromo-app --tail 80`. After it stays up, open **`http://localhost:3000/`** (redirects to the manual UI) or **`http://localhost:3000/api/manual-ui`**. Health: **`http://localhost:3000/api/health/live`**.
 
 **Stocktwits: "Invalid regular expression: /Shares+yours+ideas+ons+$?GME/i"** — already fixed; pull latest.
 

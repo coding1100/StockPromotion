@@ -76,13 +76,11 @@ export class ContentService {
         (event) => `${event.source}: ${event.body.slice(0, 120)}`,
       );
 
-      let accepted:
-        | {
-            generated: Awaited<ReturnType<LlmService['generateDraft']>>;
-            policy: ReturnType<PolicyService['evaluateDraft']>;
-            contentHash: string;
-          }
-        | null = null;
+      let accepted: {
+        generated: Awaited<ReturnType<LlmService['generateDraft']>>;
+        policy: ReturnType<PolicyService['evaluateDraft']>;
+        contentHash: string;
+      } | null = null;
 
       for (let attempt = 0; attempt < maxVariationAttempts; attempt += 1) {
         const generated = await this.llmService.generateDraft({
@@ -103,7 +101,9 @@ export class ContentService {
         }
 
         const tooSimilar = recentDraftBodies.some((row) => {
-          return calculateContentSimilarity(row.body, policy.body) >= maxSimilarity;
+          return (
+            calculateContentSimilarity(row.body, policy.body) >= maxSimilarity
+          );
         });
         if (tooSimilar) {
           continue;

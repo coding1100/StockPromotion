@@ -41,4 +41,3 @@ export function toRedditTimeRange(maxWindowHours: number): string {
   }
   return 'all';
 }
-

@@ -11,6 +11,7 @@ import { ConfigService } from '@nestjs/config';
 import { AxiosError } from 'axios';
 import {
   AccountPlatform,
+  AccountStatus,
   DeadLetterStatus,
   DraftStatus,
   Prisma,
@@ -28,10 +29,13 @@ import {
 } from '../common/constants/queue.constants';
 import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
+import { DlvritPublisher } from './dlvrit.publisher';
 import { TelemetryService } from '../telemetry/telemetry.service';
 import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
 import { MANDATORY_DISCLAIMER } from '../common/constants/policy.constants';
 import { DiscordUiPublisher } from './discord-ui.publisher';
+import { StocktwitsComplianceService } from '../policy/stocktwits-compliance.service';
+import { PostingPolicyService } from '../policy/posting-policy.service';
 
 @Injectable()
 export class PublishingService {
@@ -46,7 +50,10 @@ export class PublishingService {
     private readonly auditService: AuditService,
     private readonly telegramPublisher: TelegramPublisher,
     private readonly stocktwitsPublisher: StocktwitsPublisher,
+    private readonly dlvritPublisher: DlvritPublisher,
     private readonly discordUiPublisher: DiscordUiPublisher,
+    private readonly stocktwitsComplianceService: StocktwitsComplianceService,
+    private readonly postingPolicyService: PostingPolicyService,
     private readonly telemetryService: TelemetryService,
     @InjectQueue(PUBLISH_QUEUE) private readonly publishQueue: Queue,
   ) {}
@@ -238,33 +245,50 @@ export class PublishingService {
     for (const [draftIndex, draftId] of draftIds.entries()) {
       const draft = await this.prisma.contentDraft.findUnique({
         where: { id: draftId },
+        include: { trendTopic: true },
       });
       if (!draft || draft.status !== DraftStatus.AUTO_APPROVED) {
         continue;
       }
 
-      if (stocktwitsTrendingSymbols.length > 0) {
-        const stocktwitsOffsetBase = draftIndex * stocktwitsTrendingSymbols.length;
-        for (const [symbolIndex, symbol] of stocktwitsTrendingSymbols.entries()) {
-          const scheduleAt = this.resolveScheduledTime(
-            stocktwitsPolicy,
-            stocktwitsOffsetBase + symbolIndex,
-          );
-          const stocktwitsAccount = await this.accountsService.getEligibleAccount(
-            AccountPlatform.STOCKTWITS,
-            {
-              scheduledAt: scheduleAt,
-            },
-          );
-          if (!stocktwitsAccount) {
-            continue;
-          }
+      // Each draft is always posted to the symbol it was written about.
+      // The old approach (post every draft to every trending symbol) was the
+      // primary cause of account muting: StockTwits flags content posted to
+      // unrelated symbol feeds as spam ("$AAPL\n\n<GME content>" on the AAPL
+      // stream is explicitly against their rules). Each piece of content must
+      // only appear on the feed for the ticker it discusses.
+      const draftSymbol = draft.trendTopic?.symbol ?? null;
+      if (!draftSymbol) {
+        this.logger.warn(
+          `Draft ${draftId} has no associated trend symbol — skipping StockTwits scheduling.`,
+        );
+      }
 
+      // Additionally, check whether the draft's symbol is currently trending
+      // so we prioritise while the ticker has momentum; skip if not in the
+      // trending list (content about a symbol that isn't trending has lower
+      // value and higher spam risk on feeds).
+      const symbolIsTrending =
+        draftSymbol !== null &&
+        (stocktwitsTrendingSymbols.length === 0 ||
+          stocktwitsTrendingSymbols.includes(draftSymbol));
+
+      if (draftSymbol && symbolIsTrending) {
+        const scheduleAt = this.resolveScheduledTime(
+          stocktwitsPolicy,
+          draftIndex,
+        );
+        const stocktwitsAccount = await this.accountsService.getEligibleAccount(
+          AccountPlatform.STOCKTWITS,
+          { scheduledAt: scheduleAt },
+        );
+
+        if (stocktwitsAccount) {
           const createdCount = await this.createAndQueuePublishJob({
             draftId,
             platform: PublishPlatform.STOCKTWITS,
             accountId: stocktwitsAccount.id,
-            targetRef: symbol,
+            targetRef: draftSymbol,
             scheduleAt,
             cooldownMinutes: publishCooldown,
             similarityThreshold: stocktwitsPolicy.duplicateSimilarityThreshold,
@@ -278,10 +302,10 @@ export class PublishingService {
               'draft',
               draftId,
               {
-                symbol,
+                symbol: draftSymbol,
                 accountId: stocktwitsAccount.id,
                 scheduleAt: scheduleAt.toISOString(),
-                source: 'trending_all_top10',
+                source: 'draft_own_symbol',
               },
             );
           }
@@ -319,7 +343,8 @@ export class PublishingService {
     }
 
     this.logger.log(
-      `Scheduled publish jobs -> stocktwits:${stocktwitsScheduledCount}, telegram:${telegramScheduledCount}, total:${scheduledCount}. StockTwits symbols considered: ${stocktwitsTrendingSymbols.join(', ') || 'none'}`,
+      `Scheduled publish jobs -> stocktwits:${stocktwitsScheduledCount}, telegram:${telegramScheduledCount}, total:${scheduledCount}. ` +
+        `Trending symbols (used as filter): ${stocktwitsTrendingSymbols.join(', ') || 'none'}`,
     );
 
     this.telemetryService.increment(
@@ -373,27 +398,34 @@ export class PublishingService {
           },
         });
         await this.reconcileDraftPublishState(job.draftId);
-        await this.auditService.record('publish.skipped', 'publish_job', job.id, {
-          platform: job.platform,
-          reason:
-            'discord_webhook_publishing_removed_use_manual_discord_ui_mode',
-        });
+        await this.auditService.record(
+          'publish.skipped',
+          'publish_job',
+          job.id,
+          {
+            platform: job.platform,
+            reason:
+              'discord_webhook_publishing_removed_use_manual_discord_ui_mode',
+          },
+        );
         return;
       }
 
       try {
         let activeAccount = job.account;
         if (job.platform === PublishPlatform.TELEGRAM) {
-          activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
-            AccountPlatform.TELEGRAM,
-            job.accountId,
-          );
+          activeAccount =
+            await this.accountsService.ensureEligibleAccountForExecution(
+              AccountPlatform.TELEGRAM,
+              job.accountId,
+            );
         }
         if (job.platform === PublishPlatform.STOCKTWITS) {
-          activeAccount = await this.accountsService.ensureEligibleAccountForExecution(
-            AccountPlatform.STOCKTWITS,
-            job.accountId,
-          );
+          activeAccount =
+            await this.accountsService.ensureEligibleAccountForExecution(
+              AccountPlatform.STOCKTWITS,
+              job.accountId,
+            );
         }
 
         if (activeAccount && activeAccount.id !== job.accountId) {
@@ -450,15 +482,136 @@ export class PublishingService {
             sanitizedBody,
             stocktwitsTargetSymbol,
           );
-          const result = await this.stocktwitsPublisher.publish(
-            credentials,
-            stocktwitsMessage,
-            job.id,
-            stocktwitsTargetSymbol ?? undefined,
-          );
-          externalPostId = result.externalPostId;
-          evidenceUri = result.evidenceUri;
-          responsePayload = result;
+
+          // ── Gate 1: Market hours ────────────────────────────────────────────
+          const enforceMarketHours =
+            this.configService.get<boolean>(
+              'STOCKTWITS_ENFORCE_MARKET_HOURS',
+            ) ?? false;
+          if (
+            enforceMarketHours &&
+            !this.postingPolicyService.isMarketHours()
+          ) {
+            this.logger.warn(
+              `Job ${job.id}: skipping StockTwits post — outside market hours ` +
+                `(Mon–Fri 8 AM–6 PM ET). Set STOCKTWITS_ENFORCE_MARKET_HOURS=false to disable.`,
+            );
+            await this.prisma.publishJob.update({
+              where: { id: job.id },
+              data: {
+                status: PublishStatus.SKIPPED,
+                attempts: { increment: 1 },
+                lastError: 'stocktwits_off_hours',
+              },
+            });
+            await this.reconcileDraftPublishState(job.draftId);
+            return;
+          }
+
+          // ── Gate 2: Account warm-up ─────────────────────────────────────────
+          const minWarmupPosts =
+            this.configService.get<number>('STOCKTWITS_MIN_WARMUP_POSTS') ?? 0;
+          if (minWarmupPosts > 0) {
+            const successfulPosts = await this.prisma.publishJob.count({
+              where: {
+                accountId: activeAccount.id,
+                platform: PublishPlatform.STOCKTWITS,
+                status: PublishStatus.SUCCESS,
+              },
+            });
+            if (successfulPosts < minWarmupPosts) {
+              this.logger.warn(
+                `Job ${job.id}: account "${activeAccount.accountHandle}" is in ` +
+                  `warm-up phase (${successfulPosts}/${minWarmupPosts} successful posts). ` +
+                  `Running engagement session to build account trust instead of skipping.`,
+              );
+              // Run an engagement session (browse + like) instead of silently
+              // skipping. This builds genuine activity history even while the
+              // account is below the promotional-post threshold.
+              try {
+                await this.stocktwitsPublisher.runEngagementSession(credentials);
+                this.logger.log(
+                  `Warm-up engagement for "${activeAccount.accountHandle}" complete.`,
+                );
+              } catch (engErr) {
+                this.logger.warn(
+                  `Warm-up engagement failed (non-fatal): ${engErr instanceof Error ? engErr.message : engErr}`,
+                );
+              }
+              await this.prisma.publishJob.update({
+                where: { id: job.id },
+                data: {
+                  status: PublishStatus.SKIPPED,
+                  attempts: { increment: 1 },
+                  lastError: `stocktwits_warmup_required:${successfulPosts}/${minWarmupPosts}`,
+                },
+              });
+              await this.reconcileDraftPublishState(job.draftId);
+              return;
+            }
+          }
+
+          // ── Gate 3: DB-backed minimum inter-post spacing ────────────────────
+          // The in-memory token bucket in PostingPolicyService resets on restart.
+          // This DB check enforces the same minimum gap using the persisted
+          // lastPublishedAt timestamp, so the constraint survives process bounces.
+          const minInterPostMs =
+            this.configService.get<number>('STOCKTWITS_API_MIN_INTER_POST_MS') ?? 0;
+          if (minInterPostMs > 0) {
+            const healthState = await this.prisma.accountHealthState.findUnique({
+              where: { accountId: activeAccount.id },
+              select: { lastPublishedAt: true },
+            });
+            const lastPublishedAt = healthState?.lastPublishedAt;
+            if (lastPublishedAt) {
+              const elapsed = Date.now() - lastPublishedAt.getTime();
+              if (elapsed < minInterPostMs) {
+                const waitSec = Math.ceil((minInterPostMs - elapsed) / 1_000);
+                throw new Error(
+                  `stocktwits_posting_policy_rate_limit: account ` +
+                    `"${activeAccount.accountHandle}" posted ` +
+                    `${Math.round(elapsed / 1_000)}s ago — minimum spacing is ` +
+                    `${Math.round(minInterPostMs / 1_000)}s. Retry in ${waitSec}s.`,
+                );
+              }
+            }
+          }
+
+          const useLegacyPoster =
+            this.configService.get<boolean>('STOCKTWITS_USE_LEGACY_POSTER') ??
+            false;
+
+          if (useLegacyPoster) {
+            const result = await this.stocktwitsPublisher.publish(
+              credentials,
+              stocktwitsMessage,
+              job.id,
+              stocktwitsTargetSymbol ?? undefined,
+            );
+            externalPostId = result.externalPostId;
+            evidenceUri = result.evidenceUri;
+            responsePayload = result;
+          } else {
+            const dlvritAccountId =
+              await this.accountsService.getDlvritAccountId(
+                activeAccount.accountHandle,
+              );
+            if (!dlvritAccountId) {
+              throw new Error(
+                `dlvrit_account_not_configured: account "${activeAccount.accountHandle}" ` +
+                  `has no dlvritAccountId set. Configure it via the Manual UI → Account Management.`,
+              );
+            }
+            const result = await this.dlvritPublisher.postToAccount({
+              dlvritAccountId,
+              message: stocktwitsMessage,
+              jobId: job.id,
+            });
+            externalPostId = result.externalPostId;
+            evidenceUri = result.evidenceUri;
+            responsePayload = result;
+          }
+
           if (stocktwitsTargetSymbol) {
             resolvedTargetRef = stocktwitsTargetSymbol;
           }
@@ -534,9 +687,27 @@ export class PublishingService {
           });
         }
 
-        const rerouted = await this.tryRerouteFailedJob(job.id, message);
-        if (rerouted) {
-          return;
+        // Account restriction (muted/banned) must HALT posting immediately.
+        // Rerouting to another account burns that account on identical content
+        // and signals coordinated spam to StockTwits moderation — exactly wrong.
+        if (PostingPolicyService.isAccountRestrictionError(message)) {
+          // isRestrictionError() already matched "muted"/"restricted" above,
+          // so recordPublishOutcome(restricted:true) was already called at
+          // line 816 — the account is already being QUARANTINED. Just log loudly
+          // and skip the reroute.
+          this.logger.error(
+            `[POSTING HALTED] Account restriction detected for job ${job.id}. ` +
+              `Account "${job.account?.accountHandle ?? job.accountId}" ` +
+              `is muted or restricted by StockTwits. Account QUARANTINED. ` +
+              `Do NOT retry through proxies or other accounts. ` +
+              `Check the account at stocktwits.com manually.`,
+          );
+          // No reroute — fall through to FAILED recording.
+        } else {
+          const rerouted = await this.tryRerouteFailedJob(job.id, message);
+          if (rerouted) {
+            return;
+          }
         }
 
         await this.prisma.publishJob.update({
@@ -577,11 +748,16 @@ export class PublishingService {
         this.logger.error(
           `Publish failed for job ${job.id} (${job.platform}) -> ${job.targetRef}. ${message}`,
         );
-        await this.auditService.record('publish.failed', 'publish_job', job.id, {
-          platform: job.platform,
-          message,
-          evidenceUri,
-        });
+        await this.auditService.record(
+          'publish.failed',
+          'publish_job',
+          job.id,
+          {
+            platform: job.platform,
+            message,
+            evidenceUri,
+          },
+        );
       }
     } finally {
       await this.releasePublishJobLock(lockKey);
@@ -706,10 +882,7 @@ export class PublishingService {
     }));
   }
 
-  async dismissDeadLetter(
-    deadLetterId: string,
-    note?: string,
-  ): Promise<void> {
+  async dismissDeadLetter(deadLetterId: string, note?: string): Promise<void> {
     const existing = await this.prisma.publishDeadLetter.findUnique({
       where: { id: deadLetterId },
     });
@@ -757,7 +930,9 @@ export class PublishingService {
       throw new NotFoundException('Dead-letter entry not found');
     }
     if (existing.status !== DeadLetterStatus.OPEN) {
-      throw new BadRequestException('Only OPEN dead-letter entries can be replayed');
+      throw new BadRequestException(
+        'Only OPEN dead-letter entries can be replayed',
+      );
     }
     if (existing.publishJob.status !== PublishStatus.FAILED) {
       throw new BadRequestException(
@@ -788,7 +963,10 @@ export class PublishingService {
       },
     );
 
-    await this.markDeadLetterAsReplayedIfOpen(existing.publishJobId, 'dlq_replay');
+    await this.markDeadLetterAsReplayedIfOpen(
+      existing.publishJobId,
+      'dlq_replay',
+    );
 
     await this.auditService.record(
       'publish.dead_letter.replayed',
@@ -808,7 +986,9 @@ export class PublishingService {
     const from = new Date(input.fromIso);
     const to = new Date(input.toIso);
     if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
-      throw new BadRequestException('fromIso/toIso must be valid ISO timestamps');
+      throw new BadRequestException(
+        'fromIso/toIso must be valid ISO timestamps',
+      );
     }
     if (from > to) {
       throw new BadRequestException('fromIso cannot be after toIso');
@@ -970,7 +1150,9 @@ export class PublishingService {
       throw new NotFoundException('Publish job not found');
     }
     if (existing.status !== PublishStatus.PENDING) {
-      throw new BadRequestException('Only PENDING publish jobs can be dispatched immediately');
+      throw new BadRequestException(
+        'Only PENDING publish jobs can be dispatched immediately',
+      );
     }
 
     const now = new Date();
@@ -1016,7 +1198,9 @@ export class PublishingService {
       throw new NotFoundException('Publish job not found');
     }
     if (existing.status !== PublishStatus.FAILED) {
-      throw new BadRequestException('Only FAILED publish jobs can be rerun immediately');
+      throw new BadRequestException(
+        'Only FAILED publish jobs can be rerun immediately',
+      );
     }
 
     const now = new Date();
@@ -1088,6 +1272,85 @@ export class PublishingService {
     return this.stocktwitsPublisher.getSessionStatus();
   }
 
+  /**
+   * Run engagement-only sessions (browse + like) for all StockTwits accounts
+   * that are below the warm-up post threshold.
+   *
+   * Call this endpoint manually after creating new accounts to build genuine
+   * activity history before switching to promotional posting.
+   * Also useful for existing muted accounts while waiting for mutes to expire —
+   * engagement sessions keep the account behaviorally warm.
+   */
+  async runWarmupEngagementForEligibleAccounts(): Promise<{
+    attempted: number;
+    succeeded: number;
+    results: Array<{ handle: string; success: boolean; error?: string; likesPerformed?: number }>;
+  }> {
+    await this.accountsService.syncAccountsFromConfig();
+    const minWarmupPosts =
+      this.configService.get<number>('STOCKTWITS_MIN_WARMUP_POSTS') ?? 50;
+
+    const allActive = await this.prisma.accountProfile.findMany({
+      where: {
+        platform: AccountPlatform.STOCKTWITS,
+        status: AccountStatus.ACTIVE,
+      },
+      select: { id: true, accountHandle: true },
+    });
+
+    const results: Array<{ handle: string; success: boolean; error?: string; likesPerformed?: number }> = [];
+
+    for (const account of allActive) {
+      const successfulPosts = await this.prisma.publishJob.count({
+        where: {
+          accountId: account.id,
+          platform: PublishPlatform.STOCKTWITS,
+          status: PublishStatus.SUCCESS,
+        },
+      });
+
+      if (successfulPosts >= minWarmupPosts) {
+        continue; // Already warmed up
+      }
+
+      const credentials = this.accountsService.getStocktwitsCredentials(
+        account.accountHandle,
+      );
+      if (!credentials) {
+        results.push({ handle: account.accountHandle, success: false, error: 'credentials_missing' });
+        continue;
+      }
+
+      try {
+        const result = await this.stocktwitsPublisher.runEngagementSession({
+          ...credentials,
+          handle: account.accountHandle,
+        });
+        results.push({
+          handle: account.accountHandle,
+          success: true,
+          likesPerformed: result.likesPerformed,
+        });
+        await this.auditService.record('stocktwits.warmup.engagement', 'account', account.id, {
+          accountHandle: account.accountHandle,
+          successfulPosts,
+          minWarmupPosts,
+          ...result,
+        });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        results.push({ handle: account.accountHandle, success: false, error: errMsg });
+        this.logger.warn(`Warm-up engagement failed for @${account.accountHandle}: ${errMsg}`);
+      }
+    }
+
+    return {
+      attempted: results.length,
+      succeeded: results.filter((r) => r.success).length,
+      results,
+    };
+  }
+
   async bootstrapStocktwitsSession(): Promise<Record<string, unknown>> {
     await this.accountsService.syncAccountsFromConfig();
     const account = await this.accountsService.getEligibleAccount(
@@ -1120,9 +1383,40 @@ export class PublishingService {
     };
   }
 
+  /**
+   * Opens Chrome through the configured Stocktwits proxy to verify connectivity.
+   * Headed on a desktop; headless in Docker (no X11), returning `detectedPublicIp` when possible.
+   */
+  async openStocktwitsProxyTestWindow(
+    manualProxyOverride?: string,
+  ): Promise<{
+    ok: boolean;
+    message: string;
+    testUrl: string;
+    proxyServer?: string;
+    headless?: boolean;
+    detectedPublicIp?: string;
+    visualCheckUrl?: string;
+    screenshotMimeType?: string;
+    screenshotBase64?: string;
+    verification?: 'playwright' | 'nodejs_axios_fallback';
+    chromeError?: string;
+    manualProxyOverrideUsed?: boolean;
+    error?: string;
+  }> {
+    return this.stocktwitsPublisher.openProxyVerificationWindow(
+      manualProxyOverride,
+    );
+  }
+
   async publishManualPost(input: {
     body: string;
     stocktwitsSymbol?: string;
+    stocktwitsItems?: Array<{ symbol?: string; body?: string }>;
+    stocktwitsUsername?: string;
+    stocktwitsPassword?: string;
+    stocktwitsProxy?: string;
+    stocktwitsAccountHandle?: string;
     publishToStocktwits?: boolean;
     publishToDiscord?: boolean;
     discordServerUrl?: string;
@@ -1136,9 +1430,22 @@ export class PublishingService {
       accountId: string | null;
       accountHandle: string | null;
       targetSymbol: string | null;
+      targetSymbols: string[];
+      totalCount: number;
+      successCount: number;
+      failedCount: number;
+      manualCredentialsUsed: boolean;
+      proxyOverrideUsed: boolean;
       externalPostId: string | null;
       evidenceUri: string | null;
       error: string | null;
+      results: Array<{
+        symbol: string;
+        success: boolean;
+        externalPostId: string | null;
+        evidenceUri: string | null;
+        error: string | null;
+      }>;
     };
     discord: {
       attempted: boolean;
@@ -1155,10 +1462,26 @@ export class PublishingService {
       }>;
     };
   }> {
-    const sanitizedBody = this.stripMandatoryDisclaimer(input.body || '').trim();
-    if (!sanitizedBody) {
-      throw new BadRequestException('body is required');
+    const sanitizedBody = this.stripMandatoryDisclaimer(
+      input.body || '',
+    ).trim();
+    const runtimeStocktwitsUsername = (input.stocktwitsUsername || '').trim();
+    const runtimeStocktwitsPassword = (input.stocktwitsPassword || '').trim();
+    const runtimeStocktwitsProxy = (input.stocktwitsProxy || '').trim();
+    const hasManualStocktwitsCredentials =
+      runtimeStocktwitsUsername.length > 0 ||
+      runtimeStocktwitsPassword.length > 0;
+    if (
+      hasManualStocktwitsCredentials &&
+      (!runtimeStocktwitsUsername || !runtimeStocktwitsPassword)
+    ) {
+      throw new BadRequestException(
+        'Both stocktwitsUsername and stocktwitsPassword are required when using manual StockTwits credentials.',
+      );
     }
+
+    const useLegacyPoster =
+      this.configService.get<boolean>('STOCKTWITS_USE_LEGACY_POSTER') ?? false;
 
     const publishToStocktwits = input.publishToStocktwits !== false;
     const publishToDiscord = input.publishToDiscord !== false;
@@ -1167,6 +1490,51 @@ export class PublishingService {
         'At least one destination must be enabled (StockTwits or Discord).',
       );
     }
+
+    if (publishToStocktwits && useLegacyPoster) {
+      if (!runtimeStocktwitsUsername) {
+        throw new BadRequestException(
+          'StockTwits Username and Password are required for manual publishing.',
+        );
+      }
+      if (!runtimeStocktwitsPassword) {
+        throw new BadRequestException(
+          'StockTwits Password is required for manual publishing.',
+        );
+      }
+    }
+
+    if (publishToStocktwits && runtimeStocktwitsProxy) {
+      if (!runtimeStocktwitsUsername || !runtimeStocktwitsPassword) {
+        throw new BadRequestException(
+          'When StockTwits Proxy is set, StockTwits Username and Password are required so StockTwits login and the browser use that account through this proxy only (not a .env-configured account or .env proxy).',
+        );
+      }
+    }
+    const normalizedStocktwitsItems = (input.stocktwitsItems ?? []).map(
+      (row, index) => {
+        const symbolRaw = (row?.symbol ?? '').trim();
+        const bodyRaw = this.stripMandatoryDisclaimer(row?.body ?? '').trim();
+        if (!symbolRaw || !bodyRaw) {
+          throw new BadRequestException(
+            `stocktwitsItems[${index}] requires both symbol and body`,
+          );
+        }
+
+        const normalizedSymbol =
+          this.normalizeStocktwitsTargetSymbol(symbolRaw);
+        if (!normalizedSymbol) {
+          throw new BadRequestException(
+            `stocktwitsItems[${index}].symbol is invalid. Use a ticker like AAPL.`,
+          );
+        }
+
+        return {
+          symbol: normalizedSymbol,
+          body: bodyRaw,
+        };
+      },
+    );
 
     const stocktwitsSymbolRaw = (input.stocktwitsSymbol || '').trim();
     let normalizedStocktwitsSymbol: string | null = null;
@@ -1180,6 +1548,34 @@ export class PublishingService {
       }
     }
 
+    if (publishToDiscord && !sanitizedBody) {
+      throw new BadRequestException(
+        'body is required when Discord publish is enabled',
+      );
+    }
+
+    if (publishToStocktwits) {
+      const maxMsgLen =
+        this.configService.get<number>('STOCKTWITS_MAX_MESSAGE_LENGTH') ?? 140;
+      if (normalizedStocktwitsItems.length > 0) {
+        for (const item of normalizedStocktwitsItems) {
+          this.stocktwitsComplianceService.enforceManualPublishCompliance({
+            body: item.body,
+            symbol: item.symbol,
+            publishToStocktwits: true,
+            maxMessageLength: maxMsgLen,
+          });
+        }
+      } else {
+        this.stocktwitsComplianceService.enforceManualPublishCompliance({
+          body: sanitizedBody,
+          symbol: normalizedStocktwitsSymbol,
+          publishToStocktwits: true,
+          maxMessageLength: maxMsgLen,
+        });
+      }
+    }
+
     const manualPublishId = `manual-${Date.now()}-${randomInt(100000, 1_000_000)}`;
 
     const stocktwitsResult: {
@@ -1188,18 +1584,43 @@ export class PublishingService {
       accountId: string | null;
       accountHandle: string | null;
       targetSymbol: string | null;
+      targetSymbols: string[];
+      totalCount: number;
+      successCount: number;
+      failedCount: number;
+      manualCredentialsUsed: boolean;
+      proxyOverrideUsed: boolean;
       externalPostId: string | null;
       evidenceUri: string | null;
       error: string | null;
+      results: Array<{
+        symbol: string;
+        success: boolean;
+        externalPostId: string | null;
+        evidenceUri: string | null;
+        error: string | null;
+      }>;
     } = {
       attempted: publishToStocktwits,
       success: false,
       accountId: null,
       accountHandle: null,
       targetSymbol: normalizedStocktwitsSymbol,
+      targetSymbols:
+        normalizedStocktwitsItems.length > 0
+          ? normalizedStocktwitsItems.map((item) => item.symbol)
+          : normalizedStocktwitsSymbol
+            ? [normalizedStocktwitsSymbol]
+            : [],
+      totalCount: 0,
+      successCount: 0,
+      failedCount: 0,
+      manualCredentialsUsed: hasManualStocktwitsCredentials,
+      proxyOverrideUsed: Boolean(runtimeStocktwitsProxy),
       externalPostId: null,
       evidenceUri: null,
       error: null,
+      results: [],
     };
 
     const discordResult: {
@@ -1228,115 +1649,285 @@ export class PublishingService {
     await this.accountsService.syncAccountsFromConfig();
 
     if (publishToStocktwits) {
+      {
       let selectedAccount: {
         id: string;
         accountHandle: string;
       } | null = null;
       try {
-        selectedAccount = await this.accountsService.getEligibleAccount(
-          AccountPlatform.STOCKTWITS,
-          {
-            scheduledAt: new Date(),
-          },
-        );
-        if (!selectedAccount) {
-          throw new Error('stocktwits_no_eligible_account');
-        }
+        const publisherOverrides = runtimeStocktwitsProxy
+          ? { proxy: runtimeStocktwitsProxy }
+          : undefined;
 
-        const credentialsRaw = this.accountsService.getStocktwitsCredentials(
-          selectedAccount.accountHandle,
-        );
-        if (!credentialsRaw) {
-          throw new Error('stocktwits_credentials_missing');
-        }
-        // Thread the account handle into the credentials object so the
-        // publisher can isolate browser profiles per-account (no cookie
-        // bleed between accounts).
-        const credentials = {
-          ...credentialsRaw,
-          handle: selectedAccount.accountHandle,
-        };
+        // ── Resolve account ────────────────────────────────────────────────────
+        // dlvr.it path: pick by handle from UI or auto-select eligible account.
+        // Legacy path: use manual credentials if provided, otherwise auto-select.
+        if (!useLegacyPoster) {
+          const handle =
+            (input.stocktwitsAccountHandle || '').trim() ||
+            (await this.accountsService.getEligibleAccount(
+              AccountPlatform.STOCKTWITS,
+              { scheduledAt: new Date() },
+            ).then((a) => a?.accountHandle ?? null));
 
-        const stocktwitsMessage = this.buildStocktwitsSymbolMessage(
-          sanitizedBody,
-          normalizedStocktwitsSymbol,
-        );
-        const stocktwitsPublishId = `${manualPublishId}-stocktwits`;
-
-        // If the request didn't specify a symbol, broadcast to every entry
-        // in STOCKTWITS_TARGET_SYMBOLS instead of posting once to the first
-        // one. The env list is the user-managed broadcast target list.
-        const hasExplicitSymbol = Boolean(normalizedStocktwitsSymbol);
-        const envSymbolList =
-          this.configService.get<string>('STOCKTWITS_TARGET_SYMBOLS')?.trim() ?? '';
-        const useBroadcast = !hasExplicitSymbol && envSymbolList.length > 0;
-
-        if (useBroadcast) {
-          const broadcast = await this.stocktwitsPublisher.publishToTargetSymbols(
-            credentials,
-            stocktwitsMessage,
-            stocktwitsPublishId,
-          );
-
-          const successfulIds = broadcast.results
-            .filter((r) => r.success && r.externalPostId)
-            .map((r) => `${r.symbol}:${r.externalPostId}`);
-          const firstSuccess = broadcast.results.find((r) => r.success) ?? null;
-          const failureSummary = broadcast.results
-            .filter((r) => !r.success)
-            .map((r) => `${r.symbol}=${r.error ?? 'unknown'}`)
-            .join('; ');
-
-          stocktwitsResult.success = broadcast.successCount > 0;
-          stocktwitsResult.accountId = selectedAccount.id;
-          stocktwitsResult.accountHandle = selectedAccount.accountHandle;
-          stocktwitsResult.externalPostId = successfulIds.join(',') || null;
-          stocktwitsResult.evidenceUri =
-            firstSuccess?.evidenceUri ??
-            broadcast.results[0]?.evidenceUri ??
-            null;
-          if (broadcast.failedCount > 0) {
-            stocktwitsResult.error =
-              broadcast.successCount === 0
-                ? `stocktwits_broadcast_all_failed: ${failureSummary}`
-                : `stocktwits_broadcast_partial: ${failureSummary}`;
+          if (!handle) {
+            throw new Error('stocktwits_no_eligible_account');
           }
 
-          await this.recordAccountOutcomeSafe(selectedAccount.id, {
-            success: stocktwitsResult.success,
-            reason: stocktwitsResult.error ?? undefined,
-            metadata: {
-              mode: 'manual_broadcast',
-              platform: PublishPlatform.STOCKTWITS,
-              targetRef: broadcast.results.map((r) => r.symbol).join(','),
-              totalCount: broadcast.totalCount,
-              successCount: broadcast.successCount,
-              failedCount: broadcast.failedCount,
+          const dlvritProfile = await this.prisma.accountProfile.findUnique({
+            where: {
+              platform_accountHandle: {
+                platform: AccountPlatform.STOCKTWITS,
+                accountHandle: handle,
+              },
             },
           });
+
+          if (!dlvritProfile) {
+            throw new Error(
+              `stocktwits_account_not_found: "${handle}" not found in DB.`,
+            );
+          }
+
+          selectedAccount = dlvritProfile;
+          const dlvritAccountId = dlvritProfile.dlvritAccountId;
+          if (!dlvritAccountId) {
+            throw new Error(
+              `dlvrit_account_not_configured: account "${handle}" has no ` +
+                `dlvritAccountId. Set it via Manual UI → Account Management.`,
+            );
+          }
+
+          const stocktwitsPublishId = `${manualPublishId}-stocktwits`;
+          const items =
+            normalizedStocktwitsItems.length > 0
+              ? normalizedStocktwitsItems
+              : normalizedStocktwitsSymbol
+                ? [{ symbol: normalizedStocktwitsSymbol, body: sanitizedBody }]
+                : [];
+
+          if (items.length === 0) {
+            throw new BadRequestException(
+              'stocktwitsSymbol is required when publishing to StockTwits.',
+            );
+          }
+
+          const rowResults: Array<{
+            symbol: string;
+            success: boolean;
+            externalPostId: string | null;
+            evidenceUri: string | null;
+            error: string | null;
+          }> = [];
+
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const message = this.buildStocktwitsSymbolMessage(
+              item.body,
+              item.symbol,
+            );
+            try {
+              const result = await this.dlvritPublisher.postToAccount({
+                dlvritAccountId,
+                message,
+                jobId: `${stocktwitsPublishId}-${item.symbol}-${i + 1}`,
+              });
+              rowResults.push({
+                symbol: item.symbol,
+                success: true,
+                externalPostId: result.externalPostId,
+                evidenceUri: result.evidenceUri,
+                error: null,
+              });
+            } catch (err) {
+              rowResults.push({
+                symbol: item.symbol,
+                success: false,
+                externalPostId: null,
+                evidenceUri: null,
+                error: err instanceof Error ? err.message : 'unknown',
+              });
+            }
+          }
+
+          const successRows = rowResults.filter((r) => r.success);
+          const failedRows = rowResults.filter((r) => !r.success);
+          stocktwitsResult.results = rowResults;
+          stocktwitsResult.totalCount = rowResults.length;
+          stocktwitsResult.successCount = successRows.length;
+          stocktwitsResult.failedCount = failedRows.length;
+          stocktwitsResult.success =
+            failedRows.length === 0 && successRows.length > 0;
+          stocktwitsResult.accountId = selectedAccount.id;
+          stocktwitsResult.accountHandle = selectedAccount.accountHandle;
+          stocktwitsResult.targetSymbols = items.map((i) => i.symbol);
+          stocktwitsResult.targetSymbol =
+            items.length === 1 ? items[0].symbol : null;
+          stocktwitsResult.externalPostId =
+            successRows
+              .map((r) => `${r.symbol}:${r.externalPostId ?? ''}`)
+              .filter((t) => !t.endsWith(':'))
+              .join(',') || null;
+          stocktwitsResult.evidenceUri = successRows[0]?.evidenceUri ?? null;
+          if (failedRows.length > 0) {
+            stocktwitsResult.error = failedRows
+              .map((r) => `${r.symbol}=${r.error ?? 'unknown'}`)
+              .join('; ');
+          }
+
+          if (selectedAccount.id) {
+            await this.recordAccountOutcomeSafe(selectedAccount.id, {
+              success: stocktwitsResult.success,
+              reason: stocktwitsResult.error ?? undefined,
+              metadata: {
+                mode: 'manual_dlvrit',
+                platform: PublishPlatform.STOCKTWITS,
+                targetRef: stocktwitsResult.targetSymbols.join(','),
+              },
+            });
+          }
         } else {
+        // ── Legacy Playwright path ─────────────────────────────────────────────
+        const credentials = hasManualStocktwitsCredentials
+          ? {
+              username: runtimeStocktwitsUsername,
+              password: runtimeStocktwitsPassword,
+              handle: runtimeStocktwitsUsername,
+            }
+          : (() => {
+              selectedAccount = null;
+              return null;
+            })();
+
+        let resolvedCredentials = credentials;
+        if (!resolvedCredentials) {
+          selectedAccount = await this.accountsService.getEligibleAccount(
+            AccountPlatform.STOCKTWITS,
+            {
+              scheduledAt: new Date(),
+            },
+          );
+          if (!selectedAccount) {
+            throw new Error('stocktwits_no_eligible_account');
+          }
+          const credentialsRaw = this.accountsService.getStocktwitsCredentials(
+            selectedAccount.accountHandle,
+          );
+          if (!credentialsRaw) {
+            throw new Error('stocktwits_credentials_missing');
+          }
+          resolvedCredentials = {
+            ...credentialsRaw,
+            handle: selectedAccount.accountHandle,
+          };
+        }
+
+        const stocktwitsPublishId = `${manualPublishId}-stocktwits`;
+        if (normalizedStocktwitsItems.length > 0) {
+          const batchItems = normalizedStocktwitsItems.map((item, index) => ({
+            symbol: item.symbol,
+            message: this.buildStocktwitsSymbolMessage(item.body, item.symbol),
+            jobId: `${stocktwitsPublishId}-${item.symbol}-${index + 1}`,
+          }));
+
+          const rowResults = await this.stocktwitsPublisher.publishBatchForManual(
+            resolvedCredentials,
+            batchItems,
+            runtimeStocktwitsProxy || undefined,
+          );
+
+          const successRows = rowResults.filter((row) => row.success);
+          const failedRows = rowResults.filter((row) => !row.success);
+          stocktwitsResult.results = rowResults;
+          stocktwitsResult.totalCount = rowResults.length;
+          stocktwitsResult.successCount = successRows.length;
+          stocktwitsResult.failedCount = failedRows.length;
+          stocktwitsResult.success =
+            failedRows.length === 0 && successRows.length > 0;
+          stocktwitsResult.accountId = selectedAccount?.id ?? null;
+          stocktwitsResult.accountHandle =
+            selectedAccount?.accountHandle ??
+            (hasManualStocktwitsCredentials ? runtimeStocktwitsUsername : null);
+          stocktwitsResult.targetSymbol = null;
+          stocktwitsResult.targetSymbols = normalizedStocktwitsItems.map(
+            (item) => item.symbol,
+          );
+          stocktwitsResult.externalPostId =
+            successRows
+              .map((row) => `${row.symbol}:${row.externalPostId ?? ''}`)
+              .filter((token) => !token.endsWith(':'))
+              .join(',') || null;
+          stocktwitsResult.evidenceUri =
+            successRows[0]?.evidenceUri ?? rowResults[0]?.evidenceUri ?? null;
+          if (failedRows.length > 0) {
+            stocktwitsResult.error = failedRows
+              .map((row) => `${row.symbol}=${row.error ?? 'unknown'}`)
+              .join('; ');
+          }
+
+          if (selectedAccount?.id) {
+            await this.recordAccountOutcomeSafe(selectedAccount.id, {
+              success: stocktwitsResult.success,
+              reason: stocktwitsResult.error ?? undefined,
+              metadata: {
+                mode: 'manual_multi_symbol',
+                platform: PublishPlatform.STOCKTWITS,
+                targetRef: stocktwitsResult.targetSymbols.join(','),
+                totalCount: stocktwitsResult.totalCount,
+                successCount: stocktwitsResult.successCount,
+                failedCount: stocktwitsResult.failedCount,
+              },
+            });
+          }
+        } else {
+          const stocktwitsMessage = this.buildStocktwitsSymbolMessage(
+            sanitizedBody,
+            normalizedStocktwitsSymbol,
+          );
           const publishResult = await this.stocktwitsPublisher.publish(
-            credentials,
+            resolvedCredentials,
             stocktwitsMessage,
             stocktwitsPublishId,
             normalizedStocktwitsSymbol ?? undefined,
+            publisherOverrides,
           );
 
           stocktwitsResult.success = true;
-          stocktwitsResult.accountId = selectedAccount.id;
-          stocktwitsResult.accountHandle = selectedAccount.accountHandle;
+          stocktwitsResult.accountId = selectedAccount?.id ?? null;
+          stocktwitsResult.accountHandle =
+            selectedAccount?.accountHandle ??
+            (hasManualStocktwitsCredentials ? runtimeStocktwitsUsername : null);
+          stocktwitsResult.targetSymbol = normalizedStocktwitsSymbol;
+          stocktwitsResult.targetSymbols = normalizedStocktwitsSymbol
+            ? [normalizedStocktwitsSymbol]
+            : [];
+          stocktwitsResult.totalCount = 1;
+          stocktwitsResult.successCount = 1;
+          stocktwitsResult.failedCount = 0;
           stocktwitsResult.externalPostId = publishResult.externalPostId;
           stocktwitsResult.evidenceUri = publishResult.evidenceUri;
-
-          await this.recordAccountOutcomeSafe(selectedAccount.id, {
-            success: true,
-            metadata: {
-              mode: 'manual_direct',
-              platform: PublishPlatform.STOCKTWITS,
-              targetRef: normalizedStocktwitsSymbol ?? 'home',
+          stocktwitsResult.results = [
+            {
+              symbol: normalizedStocktwitsSymbol ?? '',
+              success: true,
+              externalPostId: publishResult.externalPostId,
+              evidenceUri: publishResult.evidenceUri,
+              error: null,
             },
-          });
+          ];
+
+          if (selectedAccount?.id) {
+            await this.recordAccountOutcomeSafe(selectedAccount.id, {
+              success: true,
+              metadata: {
+                mode: 'manual_direct',
+                platform: PublishPlatform.STOCKTWITS,
+                targetRef: normalizedStocktwitsSymbol ?? 'home',
+              },
+            });
+          }
         }
+        } // end legacy Playwright else block
       } catch (error) {
         const message =
           error instanceof Error ? error.message : 'stocktwits_publish_failed';
@@ -1358,6 +1949,7 @@ export class PublishingService {
           });
         }
       }
+      }
     }
 
     if (publishToDiscord) {
@@ -1370,12 +1962,11 @@ export class PublishingService {
           'discord_ui_server_url_missing (provide discordServerUrl)';
       } else {
         try {
-          const uiResult = await this.discordUiPublisher.broadcastToWritableChannels(
-            {
+          const uiResult =
+            await this.discordUiPublisher.broadcastToWritableChannels({
               serverUrl,
               message: sanitizedBody,
-            },
-          );
+            });
 
           discordResult.targetCount = uiResult.channelCount;
           discordResult.successCount = uiResult.postedCount;
@@ -1389,12 +1980,15 @@ export class PublishingService {
           }));
         } catch (error) {
           discordResult.error =
-            error instanceof Error ? error.message : 'discord_ui_publish_failed';
+            error instanceof Error
+              ? error.message
+              : 'discord_ui_publish_failed';
         }
       }
     }
 
-    const stocktwitsSucceeded = !publishToStocktwits || stocktwitsResult.success;
+    const stocktwitsSucceeded =
+      !publishToStocktwits || stocktwitsResult.success;
     const discordSucceeded =
       !publishToDiscord ||
       (discordResult.error === null &&
@@ -1408,26 +2002,37 @@ export class PublishingService {
         : 'pipeline.publish.manual.partial_or_failed',
     );
 
-    await this.auditService.record('publish.manual.direct', 'manual_post', manualPublishId, {
-      success,
-      publishToStocktwits,
-      publishToDiscord,
-      discordMode: 'ui',
-      stocktwits: {
-        success: stocktwitsResult.success,
-        accountHandle: stocktwitsResult.accountHandle,
-        targetSymbol: stocktwitsResult.targetSymbol,
-        externalPostId: stocktwitsResult.externalPostId,
-        error: stocktwitsResult.error,
+    await this.auditService.record(
+      'publish.manual.direct',
+      'manual_post',
+      manualPublishId,
+      {
+        success,
+        publishToStocktwits,
+        publishToDiscord,
+        discordMode: 'ui',
+        stocktwits: {
+          success: stocktwitsResult.success,
+          accountHandle: stocktwitsResult.accountHandle,
+          manualCredentialsUsed: stocktwitsResult.manualCredentialsUsed,
+          proxyOverrideUsed: stocktwitsResult.proxyOverrideUsed,
+          targetSymbol: stocktwitsResult.targetSymbol,
+          targetSymbols: stocktwitsResult.targetSymbols,
+          totalCount: stocktwitsResult.totalCount,
+          successCount: stocktwitsResult.successCount,
+          failedCount: stocktwitsResult.failedCount,
+          externalPostId: stocktwitsResult.externalPostId,
+          error: stocktwitsResult.error,
+        },
+        discord: {
+          targetCount: discordResult.targetCount,
+          successCount: discordResult.successCount,
+          skippedCount: discordResult.skippedCount,
+          failedCount: discordResult.failedCount,
+          error: discordResult.error,
+        },
       },
-      discord: {
-        targetCount: discordResult.targetCount,
-        successCount: discordResult.successCount,
-        skippedCount: discordResult.skippedCount,
-        failedCount: discordResult.failedCount,
-        error: discordResult.error,
-      },
-    });
+    );
 
     return {
       id: manualPublishId,
@@ -1642,16 +2247,23 @@ export class PublishingService {
     symbol: string | null,
   ): string {
     const trimmedBody = body.trim();
+    let message: string;
+
     if (!symbol) {
-      return trimmedBody;
+      message = trimmedBody;
+    } else {
+      const cashtag = `$${symbol}`;
+      message = trimmedBody.toUpperCase().startsWith(cashtag.toUpperCase())
+        ? trimmedBody
+        : `${cashtag}\n\n${trimmedBody}`;
     }
 
-    const cashtag = `$${symbol}`;
-    if (trimmedBody.toUpperCase().startsWith(cashtag)) {
-      return trimmedBody;
-    }
-
-    return `${cashtag}\n\n${trimmedBody}`;
+    // Enforce Stocktwits character limit before the post reaches the browser.
+    // The cashtag prefix added above counts toward the limit.
+    const maxLength =
+      this.configService.get<number>('STOCKTWITS_MAX_MESSAGE_LENGTH') ??
+      140;
+    return this.stocktwitsComplianceService.trimToLimit(message, maxLength);
   }
 
   private stripMandatoryDisclaimer(body: string): string {
@@ -1661,9 +2273,7 @@ export class PublishingService {
       .filter((line) => line.trim().toLowerCase() !== disclaimer)
       .join('\n');
 
-    return withoutDisclaimer
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
+    return withoutDisclaimer.replace(/\n{3,}/g, '\n\n').trim();
   }
 
   private resolveScheduledTime(
@@ -1915,7 +2525,9 @@ export class PublishingService {
       excludeAccountId: job.accountId,
       scheduledAt: new Date(
         Date.now() +
-          this.configService.getOrThrow<number>('PHASE2_ADAPTIVE_COOLDOWN_MINUTES') *
+          this.configService.getOrThrow<number>(
+            'PHASE2_ADAPTIVE_COOLDOWN_MINUTES',
+          ) *
             60_000,
       ),
     });
@@ -1925,7 +2537,9 @@ export class PublishingService {
 
     const rescheduleAt = new Date(
       Date.now() +
-        this.configService.getOrThrow<number>('PHASE2_ADAPTIVE_COOLDOWN_MINUTES') *
+        this.configService.getOrThrow<number>(
+          'PHASE2_ADAPTIVE_COOLDOWN_MINUTES',
+        ) *
           60_000,
     );
     await this.prisma.publishJob.update({
@@ -1958,12 +2572,17 @@ export class PublishingService {
       },
     );
 
-    await this.auditService.record('publish.rerouted', 'publish_job', publishJobId, {
-      fromAccountId: job.accountId,
-      toAccountId: fallback.id,
-      reason: errorMessage,
-      retryAt: rescheduleAt.toISOString(),
-    });
+    await this.auditService.record(
+      'publish.rerouted',
+      'publish_job',
+      publishJobId,
+      {
+        fromAccountId: job.accountId,
+        toAccountId: fallback.id,
+        reason: errorMessage,
+        retryAt: rescheduleAt.toISOString(),
+      },
+    );
     return true;
   }
 
@@ -1980,7 +2599,9 @@ export class PublishingService {
       return;
     }
 
-    const maxRetries = this.configService.getOrThrow<number>('PUBLISH_MAX_RETRIES');
+    const maxRetries = this.configService.getOrThrow<number>(
+      'PUBLISH_MAX_RETRIES',
+    );
     if (input.attempts < maxRetries) {
       return;
     }
@@ -2002,7 +2623,10 @@ export class PublishingService {
         attempts: input.attempts,
         movedAt: now,
         replayedAt: null,
-        metadata: this.mergeDeadLetterMetadata(existing?.metadata, input.metadata),
+        metadata: this.mergeDeadLetterMetadata(
+          existing?.metadata,
+          input.metadata,
+        ),
       },
       create: {
         publishJobId: input.publishJobId,
@@ -2061,7 +2685,7 @@ export class PublishingService {
   ): Prisma.JsonObject {
     const base =
       existing && typeof existing === 'object' && !Array.isArray(existing)
-        ? (existing as Prisma.JsonObject)
+        ? existing
         : {};
     return {
       ...base,
@@ -2142,16 +2766,38 @@ export class PublishingService {
       SELECT pg_advisory_unlock(hashtext(${lockKey})::bigint)
     `;
   }
+
+  // ── dlvr.it account management (delegated to AccountsService) ────────────────
+
+  async listDlvritAccounts() {
+    return this.accountsService.listDlvritAccounts();
+  }
+
+  async upsertDlvritAccount(accountHandle: string, dlvritAccountId: number) {
+    return this.accountsService.upsertDlvritAccount(
+      accountHandle,
+      dlvritAccountId,
+    );
+  }
+
+  async setDlvritAccountStatus(accountId: string, status: AccountStatus) {
+    return this.accountsService.setDlvritAccountStatus(accountId, status);
+  }
 }
 
 function isRestrictionError(message: string): boolean {
-  return /(ban|blocked|restricted|suspended|captcha|locked|challenge)/i.test(
+  return /(ban|blocked|restricted|suspended|captcha|locked|challenge|rate_limited|muted)/i.test(
     message,
   );
 }
 
 function isReroutableFailure(message: string): boolean {
-  return /(timeout|429|5\d\d|captcha|challenge|blocked|restricted|network)/i.test(
+  // Only transient errors (network, timeout, 5xx, captcha) are reroutable.
+  // Account restriction / mute errors must NEVER trigger a reroute — doing so
+  // burns additional accounts on identical promotional content and signals
+  // coordinated spam to StockTwits moderation.
+  if (PostingPolicyService.isAccountRestrictionError(message)) return false;
+  return /(timeout|429|5\d\d|captcha|challenge|blocked|network|rate_limited|stocktwits_posting_policy_backoff)/i.test(
     message,
   );
 }

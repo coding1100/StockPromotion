@@ -140,6 +140,7 @@ model AccountProfile {
   status                 AccountStatus          @default(ACTIVE)
   healthScore            Float                  @default(1.0)
   config                 Json
+  dlvritAccountId        Int?
   replacementRequestedAt DateTime?
   replacementNotes       String?
   lastSelectedAt         DateTime?

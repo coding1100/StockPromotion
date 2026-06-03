@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -44,8 +44,23 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    # Inside the container, localhost is NOT Postgres/Redis — override host .env.
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stockpromo?schema=public
+      REDIS_HOST: redis
+      LISTEN_HOST: 0.0.0.0
+      STOCKTWITS_USER_DATA_DIR: /usr/src/app/artifacts/stocktwits-user-data
+      # Host .env often sets Google Chrome paths; the Playwright image has no system Chrome.
+      STOCKTWITS_BROWSER_BINARY: ""
+      DISCORD_UI_BROWSER_BINARY: ""
+      # .env sometimes sets 0 for local installs; Docker image ships browsers under /ms-playwright.
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      # Virtual display started by entrypoint.sh — keep Chrome headed so noVNC shows it.
+      DISPLAY: ":99"
+      STOCKTWITS_HEADLESS: "false"
     ports:
       - "3000:3000"
+      - "6080:6080"
     volumes:
       - ./artifacts:/usr/src/app/artifacts
 

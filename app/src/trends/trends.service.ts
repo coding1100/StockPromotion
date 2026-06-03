@@ -248,7 +248,12 @@ export class TrendsService {
       this.configService.get<string>('TREND_WINDOWS_HOURS'),
     );
     return hours.map((value) => ({
-      type: value === 1 ? TrendWindow.H1 : value === 6 ? TrendWindow.H6 : TrendWindow.H24,
+      type:
+        value === 1
+          ? TrendWindow.H1
+          : value === 6
+            ? TrendWindow.H6
+            : TrendWindow.H24,
       hours: value,
     }));
   }
