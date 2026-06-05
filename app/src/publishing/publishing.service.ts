@@ -30,6 +30,7 @@ import {
 import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
 import { DlvritPublisher } from './dlvrit.publisher';
+import { DlvritSessionService } from './dlvrit-session.service';
 import { TelemetryService } from '../telemetry/telemetry.service';
 import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
 import { MANDATORY_DISCLAIMER } from '../common/constants/policy.constants';
@@ -51,6 +52,7 @@ export class PublishingService {
     private readonly telegramPublisher: TelegramPublisher,
     private readonly stocktwitsPublisher: StocktwitsPublisher,
     private readonly dlvritPublisher: DlvritPublisher,
+    private readonly dlvritSessionService: DlvritSessionService,
     private readonly discordUiPublisher: DiscordUiPublisher,
     private readonly stocktwitsComplianceService: StocktwitsComplianceService,
     private readonly postingPolicyService: PostingPolicyService,
@@ -2787,6 +2789,19 @@ export class PublishingService {
   async deleteDlvritAccounts(ids: string[]): Promise<number> {
     return this.accountsService.deleteStocktwitsAccounts(ids);
   }
+
+  async listDlvritConnectedAccounts() {
+    return this.dlvritPublisher.listConnectedAccounts();
+  }
+
+  async listDlvritConnectedAccountsRaw() {
+    return this.dlvritPublisher.listConnectedAccountsRaw();
+  }
+
+  setDlvritSessionCookie(cookie: string): void {
+    this.dlvritSessionService.setCookieManually(cookie);
+  }
+
 }
 
 function isRestrictionError(message: string): boolean {

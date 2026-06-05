@@ -72,23 +72,6 @@ function createService() {
     broadcastToWritableChannels: jest.fn(),
   };
 
-  const dlvritPublisher = {
-    isConfigured: false,
-    post: jest.fn(),
-    postById: jest.fn(),
-    listStocktwitsAccounts: jest.fn().mockResolvedValue([]),
-    findAccount: jest.fn().mockResolvedValue(null),
-  };
-
-  const stocktwitsApiPublisher = {
-    resolveUserDataDir: jest.fn().mockReturnValue('/tmp/test-userdata'),
-    loadToken: jest.fn().mockResolvedValue(null),
-    saveToken: jest.fn().mockResolvedValue(undefined),
-    invalidateToken: jest.fn().mockResolvedValue(undefined),
-    tryPost: jest.fn().mockResolvedValue(null),
-    post: jest.fn(),
-  };
-
   const stocktwitsComplianceService = {
     enforceManualPublishCompliance: jest.fn(),
     trimToLimit: jest.fn().mockImplementation((body: string) => body),
@@ -117,8 +100,6 @@ function createService() {
     auditService as never,
     telegramPublisher as never,
     stocktwitsPublisher as never,
-    dlvritPublisher as never,
-    stocktwitsApiPublisher as never,
     discordUiPublisher as never,
     stocktwitsComplianceService as never,
     postingPolicyService as never,

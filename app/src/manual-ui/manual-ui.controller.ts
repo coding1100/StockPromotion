@@ -83,6 +83,32 @@ export class ManualUiController {
     return { success: true, deleted };
   }
 
+  @Post('dlvrit-session')
+  async setDlvritSession(
+    @Body() body: { cookie: string },
+  ): Promise<Record<string, unknown>> {
+    if (!body.cookie || !body.cookie.trim()) {
+      return { success: false, error: 'cookie value is required.' };
+    }
+    this.publishingService.setDlvritSessionCookie(body.cookie.trim());
+    return { success: true };
+  }
+
+  @Get('dlvrit-connected-accounts')
+  async listDlvritConnectedAccounts(): Promise<Record<string, unknown>> {
+    try {
+      const accounts = await this.publishingService.listDlvritConnectedAccounts();
+      return { success: true, accounts };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : 'unknown error' };
+    }
+  }
+
+  @Get('dlvrit-connected-accounts/raw')
+  async listDlvritConnectedAccountsRaw(): Promise<unknown> {
+    return this.publishingService.listDlvritConnectedAccountsRaw();
+  }
+
   // ── UI ───────────────────────────────────────────────────────────────────────
 
   @Get()
@@ -326,7 +352,10 @@ export class ManualUiController {
             <h1>Account Management</h1>
             <p>Configure Stocktwits accounts linked to dlvr.it for posting.</p>
           </div>
-          <button class="btn btn-primary" onclick="openModal()">+ Add Account</button>
+          <div style="display:flex;gap:8px;">
+            <button class="btn btn-ghost" onclick="openCookieModal()" style="border:1px solid #d1d5db;">Set dlvr.it Cookie</button>
+            <button class="btn btn-primary" onclick="openModal()">+ Add Account</button>
+          </div>
         </div>
 
         <!-- Bulk action toolbar — shown when ≥1 row is checked -->
@@ -341,7 +370,7 @@ export class ManualUiController {
             <tr>
               <th style="width:36px;"><input type="checkbox" id="select-all" title="Select all" onchange="toggleSelectAll(this)" /></th>
               <th>Handle</th>
-              <th>dlvr.it ID</th>
+              <th>dlvr.it Route ID</th>
               <th>Status</th>
               <th>Actions</th>
             </tr>
@@ -352,7 +381,7 @@ export class ManualUiController {
         </table>
 
         <p style="margin:16px 0 0;font-size:12px;color:#9ca3af;">
-          Get the dlvr.it Account ID from <strong>dlvrit.com → Profile → Connected Accounts</strong> after linking each Stocktwits account.
+          Create a Route in <strong>dlvrit.com</strong> with StockTwits as the destination, then click <strong>+ Add Account</strong> and use <strong>Fetch from dlvr.it</strong> to pick the Route ID.
         </p>
       </div>
     </div>
@@ -368,9 +397,19 @@ export class ManualUiController {
         </div>
 
         <div class="field">
-          <label for="modal-dlvrit-id">dlvr.it Account ID</label>
-          <input id="modal-dlvrit-id" type="number" placeholder="e.g. 12345" autocomplete="off" />
-          <div class="hint">Found in dlvrit.com → Profile → Connected Accounts after linking Stocktwits.</div>
+          <label for="modal-dlvrit-id">dlvr.it Route ID</label>
+          <div style="display:flex;gap:8px;align-items:flex-start;">
+            <input id="modal-dlvrit-id" type="number" placeholder="e.g. 2676570" autocomplete="off" style="flex:1;" />
+            <button type="button" class="btn btn-ghost" id="fetch-dlvrit-btn" onclick="fetchDlvritAccounts()" style="white-space:nowrap;border:1px solid #d1d5db;">Fetch from dlvr.it</button>
+          </div>
+          <div class="hint">Click <strong>Fetch from dlvr.it</strong> to load your routes, or enter the Route ID manually from dlvrit.com.</div>
+          <div id="dlvrit-account-picker" style="display:none;margin-top:10px;">
+            <label style="font-size:12px;color:#6b7280;margin-bottom:4px;display:block;">Pick a route:</label>
+            <select id="dlvrit-account-select" style="width:100%;" onchange="onDlvritAccountSelected(this)">
+              <option value="">— select —</option>
+            </select>
+          </div>
+          <div id="dlvrit-fetch-error" style="display:none;margin-top:6px;font-size:12px;color:#ef4444;"></div>
         </div>
 
         <div class="modal-error" id="modal-error"></div>
@@ -382,10 +421,64 @@ export class ManualUiController {
       </div>
     </div>
 
+    <!-- ── Cookie Modal ───────────────────────────────────────────────────── -->
+    <div class="modal-overlay" id="cookie-overlay" onclick="if(event.target===this)closeCookieModal()" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.45);z-index:1000;align-items:center;justify-content:center;">
+      <div class="modal" style="max-width:500px;width:90%;padding:28px;">
+        <h2>Set dlvr.it Session Cookie</h2>
+        <p style="font-size:13px;color:#6b7280;margin:8px 0 16px;">
+          In your browser, open <strong>app.dlvrit.com</strong>, press <strong>F12</strong> → Application → Cookies →
+          <strong>dlvrit.com</strong>, find the cookie named <strong>dlvrit</strong>, and paste its value below.
+        </p>
+        <div class="field">
+          <label for="cookie-input">dlvrit cookie value</label>
+          <input id="cookie-input" type="text" placeholder="Paste cookie value here…" autocomplete="off" style="font-family:monospace;font-size:12px;" />
+        </div>
+        <div class="modal-error" id="cookie-error" style="display:none;"></div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onclick="closeCookieModal()">Cancel</button>
+          <button class="btn btn-success" id="cookie-save-btn" onclick="saveCookie()">Save Cookie</button>
+        </div>
+      </div>
+    </div>
+
     <script>
       const basePath = window.location.pathname.replace(/\\/$/, '');
 
-      // ── Modal ───────────────────────────────────────────────────────────────
+      // ── Cookie Modal ────────────────────────────────────────────────────────
+      function openCookieModal() {
+        document.getElementById('cookie-input').value = '';
+        document.getElementById('cookie-error').style.display = 'none';
+        const co = document.getElementById('cookie-overlay');
+        co.style.display = 'flex';
+        setTimeout(() => document.getElementById('cookie-input').focus(), 80);
+      }
+      function closeCookieModal() {
+        document.getElementById('cookie-overlay').style.display = 'none';
+      }
+      async function saveCookie() {
+        const val = document.getElementById('cookie-input').value.trim();
+        const errEl = document.getElementById('cookie-error');
+        const btn = document.getElementById('cookie-save-btn');
+        if (!val) { errEl.textContent = 'Cookie value is required.'; errEl.style.display = 'block'; return; }
+        btn.disabled = true; btn.textContent = 'Saving…'; errEl.style.display = 'none';
+        try {
+          const res = await fetch(basePath + '/dlvrit-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookie: val }),
+          });
+          const json = await res.json();
+          if (!json.success) { errEl.textContent = json.error || 'Failed to save cookie.'; errEl.style.display = 'block'; return; }
+          closeCookieModal();
+          alert('dlvr.it session cookie saved successfully. Next post will use it.');
+        } catch (e) {
+          errEl.textContent = 'Network error: ' + e.message; errEl.style.display = 'block';
+        } finally {
+          btn.disabled = false; btn.textContent = 'Save Cookie';
+        }
+      }
+
+      // ── Account Modal ───────────────────────────────────────────────────────
       const overlay     = document.getElementById('modal-overlay');
       const modalTitle  = document.getElementById('modal-title');
       const modalHandle = document.getElementById('modal-handle');
@@ -405,6 +498,64 @@ export class ManualUiController {
 
       function closeModal() {
         overlay.classList.remove('open');
+        document.getElementById('dlvrit-account-picker').style.display = 'none';
+        document.getElementById('dlvrit-fetch-error').style.display = 'none';
+      }
+
+      async function fetchDlvritAccounts() {
+        const btn = document.getElementById('fetch-dlvrit-btn');
+        const picker = document.getElementById('dlvrit-account-picker');
+        const select = document.getElementById('dlvrit-account-select');
+        const errEl = document.getElementById('dlvrit-fetch-error');
+
+        btn.disabled = true;
+        btn.textContent = 'Loading…';
+        errEl.style.display = 'none';
+        picker.style.display = 'none';
+
+        try {
+          const res = await fetch(basePath + '/dlvrit-connected-accounts');
+          const json = await res.json();
+          if (!json.success) {
+            errEl.textContent = json.error || 'Failed to fetch accounts from dlvr.it';
+            errEl.style.display = 'block';
+            return;
+          }
+          const accounts = json.accounts || [];
+          if (!accounts.length) {
+            errEl.textContent = 'No routes found in dlvr.it. Create a route with StockTwits as a destination at dlvrit.com first.';
+            errEl.style.display = 'block';
+            return;
+          }
+          select.innerHTML = '<option value="">— select —</option>';
+          accounts.forEach(a => {
+            const opt = document.createElement('option');
+            opt.value = a.id;
+            opt.dataset.name = a.name;
+            opt.textContent = '[' + a.id + '] ' + a.name;
+            select.appendChild(opt);
+          });
+          picker.style.display = 'block';
+        } catch (e) {
+          errEl.textContent = 'Network error: ' + e.message;
+          errEl.style.display = 'block';
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Fetch from dlvr.it';
+        }
+      }
+
+      function onDlvritAccountSelected(sel) {
+        const val = sel.value;
+        if (val) {
+          document.getElementById('modal-dlvrit-id').value = val;
+          // Pre-fill handle from account name if handle field is empty
+          const handle = document.getElementById('modal-handle');
+          if (!handle.value.trim()) {
+            const selectedOpt = sel.options[sel.selectedIndex];
+            handle.value = selectedOpt.dataset.name || '';
+          }
+        }
       }
 
       function handleOverlayClick(e) {
@@ -412,7 +563,7 @@ export class ManualUiController {
       }
 
       document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') closeModal();
+        if (e.key === 'Escape') { closeModal(); closeCookieModal(); }
       });
 
       async function saveAccount() {
