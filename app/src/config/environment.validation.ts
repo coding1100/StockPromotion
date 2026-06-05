@@ -248,6 +248,11 @@ export const envValidationSchema = Joi.object({
   // The automated pipeline uses dlvr.it by default. Set
   // STOCKTWITS_USE_LEGACY_POSTER=true only as a temporary rollback to Playwright.
   DLVRIT_API_KEY: Joi.string().allow('').optional(),
+  DLVRIT_SESSION_COOKIE: Joi.string().allow('').optional(),
+  DLVRIT_USER_DATA_DIR: Joi.string().allow('').optional(),
+  DLVRIT_HEADLESS: Joi.string().allow('').optional(),
+  DLVRIT_LOGIN_EMAIL: Joi.string().allow('').optional(),
+  DLVRIT_LOGIN_PASSWORD: Joi.string().allow('').optional(),
 
   // ── Account warm-up gate ─────────────────────────────────────────────────
   // New accounts that immediately post promotional content get muted fastest.

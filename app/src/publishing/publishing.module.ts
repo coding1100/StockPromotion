@@ -8,6 +8,7 @@ import { PUBLISH_QUEUE } from '../common/constants/queue.constants';
 import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
 import { DlvritPublisher } from './dlvrit.publisher';
+import { DlvritSessionService } from './dlvrit-session.service';
 import { PublishProcessor } from './publish.processor';
 import { TelemetryModule } from '../telemetry/telemetry.module';
 import { DiscordUiPublisher } from './discord-ui.publisher';
@@ -28,6 +29,7 @@ import { PolicyModule } from '../policy/policy.module';
     PublishingService,
     TelegramPublisher,
     StocktwitsPublisher,
+    DlvritSessionService,
     DlvritPublisher,
     DiscordUiPublisher,
     PublishProcessor,

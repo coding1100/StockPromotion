@@ -58,6 +58,7 @@ services:
       # Virtual display started by entrypoint.sh — keep Chrome headed so noVNC shows it.
       DISPLAY: ":99"
       STOCKTWITS_HEADLESS: "false"
+      DLVRIT_USER_DATA_DIR: /usr/src/app/artifacts/dlvrit-user-data
     ports:
       - "3000:3000"
       - "6080:6080"
