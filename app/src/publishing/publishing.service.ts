@@ -1422,6 +1422,9 @@ export class PublishingService {
     publishToStocktwits?: boolean;
     publishToDiscord?: boolean;
     discordServerUrl?: string;
+    discordServerUrls?: string[];
+    discordEmail?: string;
+    discordPassword?: string;
   }): Promise<{
     id: string;
     body: string;
@@ -1955,36 +1958,58 @@ export class PublishingService {
     }
 
     if (publishToDiscord) {
-      const serverUrl =
-        input.discordServerUrl?.trim() ||
-        this.configService.get<string>('DISCORD_UI_SERVER_URL')?.trim() ||
-        '';
-      if (!serverUrl) {
+      const serverUrls: string[] = [];
+
+      if (Array.isArray(input.discordServerUrls) && input.discordServerUrls.length > 0) {
+        serverUrls.push(...input.discordServerUrls.map((u) => u.trim()).filter(Boolean));
+      }
+
+      if (serverUrls.length === 0) {
+        const fallback =
+          input.discordServerUrl?.trim() ||
+          this.configService.get<string>('DISCORD_UI_SERVER_URL')?.trim() ||
+          '';
+        if (fallback) {
+          serverUrls.push(fallback);
+        }
+      }
+
+      if (serverUrls.length === 0) {
         discordResult.error =
-          'discord_ui_server_url_missing (provide discordServerUrl)';
+          'discord_ui_server_url_missing (provide discordServerUrls)';
       } else {
         try {
-          const uiResult =
-            await this.discordUiPublisher.broadcastToWritableChannels({
-              serverUrl,
+          const multiResult =
+            await this.discordUiPublisher.broadcastToMultipleServers({
+              serverUrls,
               message: sanitizedBody,
+              email: input.discordEmail,
+              password: input.discordPassword,
             });
 
-          discordResult.targetCount = uiResult.channelCount;
-          discordResult.successCount = uiResult.postedCount;
-          discordResult.skippedCount = uiResult.skippedCount;
-          discordResult.failedCount = uiResult.failedCount;
-          discordResult.results = uiResult.channels.map((row) => ({
-            channelId: row.channelId,
-            success: row.posted,
-            externalPostId: null,
-            error: row.reason,
-          }));
+          discordResult.targetCount = multiResult.totalChannelCount;
+          discordResult.successCount = multiResult.totalPostedCount;
+          discordResult.skippedCount = multiResult.totalSkippedCount;
+          discordResult.failedCount = multiResult.totalFailedCount;
+          for (const server of multiResult.servers) {
+            discordResult.results.push(
+              ...server.channels.map((row) => ({
+                channelId: row.channelId,
+                success: row.posted,
+                externalPostId: null,
+                error: row.reason,
+              })),
+            );
+            if (server.error && !discordResult.error) {
+              discordResult.error = server.error;
+            }
+          }
         } catch (error) {
           discordResult.error =
             error instanceof Error
               ? error.message
               : 'discord_ui_publish_failed';
+          discordResult.failedCount += 1;
         }
       }
     }
@@ -2798,8 +2823,8 @@ export class PublishingService {
     return this.dlvritPublisher.listConnectedAccountsRaw();
   }
 
-  setDlvritSessionCookie(cookie: string): void {
-    this.dlvritSessionService.setCookieManually(cookie);
+  async refreshDlvritSession(): Promise<void> {
+    await this.dlvritSessionService.refreshSession();
   }
 
 }
