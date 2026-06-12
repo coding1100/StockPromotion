@@ -3,10 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { mkdir } from 'fs/promises';
 import { join } from 'path';
 import { BrowserContext, Locator, Page } from 'playwright';
-import { chromium } from 'playwright-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-
-chromium.use(StealthPlugin());
+import { firefox } from 'playwright-extra';
 
 type DiscordUiChannelResult = {
   channelId: string;
@@ -21,11 +18,43 @@ type DiscordUiChannelResult = {
 export class DiscordUiPublisher {
   private readonly logger = new Logger(DiscordUiPublisher.name);
 
+  private static readonly USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+  ];
+
+  private static readonly VIEWPORTS = [
+    { width: 1920, height: 1080 },
+    { width: 1680, height: 1050 },
+    { width: 1440, height: 900 },
+    { width: 1600, height: 900 },
+    { width: 1366, height: 768 },
+    { width: 1536, height: 864 },
+  ];
+
   constructor(private readonly configService: ConfigService) {}
+
+  private pickRandom<T>(arr: T[]): T {
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
+
+  private randInt(min: number, max: number): number {
+    return min + Math.floor(Math.random() * (max - min + 1));
+  }
+
+  private jitter(baseMs: number, varianceMs: number): number {
+    return Math.max(0, baseMs + (Math.random() - 0.5) * 2 * varianceMs);
+  }
 
   async broadcastToWritableChannels(input: {
     serverUrl: string;
     message: string;
+    email?: string;
+    password?: string;
   }): Promise<{
     guildId: string;
     channelCount: number;
@@ -48,60 +77,15 @@ export class DiscordUiPublisher {
 
     const { context, page } = await this.createBrowserSession();
     try {
-      await page.goto(serverUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navigationTimeoutMs,
-      });
-
-      await this.ensureLoggedIn(page);
-      // After login, the URL may be /channels/@me — re-navigate to the target guild.
-      if (!page.url().includes(`/channels/${guildId}`)) {
-        await page.goto(serverUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: this.navigationTimeoutMs,
-        });
-      }
-
-      const channels = await this.collectGuildChannelsWithAuthRecovery(
+      const result = await this.postToServerChannels(
         page,
         guildId,
         serverUrl,
+        normalizedMessage,
+        input.email,
+        input.password,
       );
-
-      const results: DiscordUiChannelResult[] = [];
-      for (let index = 0; index < channels.length; index += 1) {
-        const channel = channels[index];
-        const row = await this.tryPostInChannel(page, {
-          channelId: channel.channelId,
-          channelName: channel.channelName,
-          channelUrl: channel.channelUrl,
-          message: normalizedMessage,
-        });
-        results.push(row);
-
-        if (index < channels.length - 1) {
-          const delay = this.randomInterChannelDelayMs();
-          this.logger.debug(
-            `Discord inter-channel pause: ${delay}ms before next channel`,
-          );
-          await page.waitForTimeout(delay);
-        }
-      }
-
-      const postedCount = results.filter((row) => row.posted).length;
-      const skippedCount = results.filter((row) => row.skipped).length;
-      const failedCount = results.filter(
-        (row) => !row.posted && !row.skipped,
-      ).length;
-
-      return {
-        guildId,
-        channelCount: results.length,
-        postedCount,
-        skippedCount,
-        failedCount,
-        channels: results,
-      };
+      return { guildId, ...result };
     } catch (error) {
       const baseReason =
         error instanceof Error ? error.message : 'discord_ui_publish_failed';
@@ -117,6 +101,285 @@ export class DiscordUiPublisher {
     } finally {
       await context.close();
     }
+  }
+
+  // Post to multiple servers in a single browser session.
+  // Applies inter-server delay between servers and inter-channel delay within each.
+  async broadcastToMultipleServers(input: {
+    serverUrls: string[];
+    message: string;
+    email?: string;
+    password?: string;
+  }): Promise<{
+    serverCount: number;
+    totalChannelCount: number;
+    totalPostedCount: number;
+    totalSkippedCount: number;
+    totalFailedCount: number;
+    servers: Array<{
+      serverUrl: string;
+      guildId: string;
+      channelCount: number;
+      postedCount: number;
+      skippedCount: number;
+      failedCount: number;
+      channels: DiscordUiChannelResult[];
+      error?: string;
+    }>;
+  }> {
+    const normalizedMessage = input.message.trim();
+    if (!normalizedMessage) {
+      throw new Error('discord_ui_message_empty');
+    }
+
+    const serverUrls = input.serverUrls
+      .map((u) => u.trim())
+      .filter((u) => u.length > 0);
+    if (serverUrls.length === 0) {
+      throw new Error('discord_ui_server_urls_empty');
+    }
+
+    const { context, page } = await this.createBrowserSession();
+
+    const servers: Array<{
+      serverUrl: string;
+      guildId: string;
+      channelCount: number;
+      postedCount: number;
+      skippedCount: number;
+      failedCount: number;
+      channels: DiscordUiChannelResult[];
+      error?: string;
+    }> = [];
+
+    let totalChannelCount = 0;
+    let totalPostedCount = 0;
+    let totalSkippedCount = 0;
+    let totalFailedCount = 0;
+
+    try {
+      for (let si = 0; si < serverUrls.length; si += 1) {
+        const serverUrl = serverUrls[si];
+        const guildId = this.extractGuildId(serverUrl);
+
+        if (!guildId) {
+          this.logger.warn(
+            `Discord: skipping invalid server URL at index ${si}: ${serverUrl}`,
+          );
+          servers.push({
+            serverUrl,
+            guildId: '',
+            channelCount: 0,
+            postedCount: 0,
+            skippedCount: 0,
+            failedCount: 1,
+            channels: [],
+            error: 'discord_ui_server_url_invalid',
+          });
+          totalFailedCount += 1;
+          continue;
+        }
+
+        this.logger.log(
+          `Discord: processing server ${si + 1}/${serverUrls.length} (guild ${guildId})`,
+        );
+
+        try {
+          const result = await this.postToServerChannels(
+            page,
+            guildId,
+            serverUrl,
+            normalizedMessage,
+            input.email,
+            input.password,
+          );
+
+          servers.push({ serverUrl, guildId, ...result });
+          totalChannelCount += result.channelCount;
+          totalPostedCount += result.postedCount;
+          totalSkippedCount += result.skippedCount;
+          totalFailedCount += result.failedCount;
+        } catch (error) {
+          const reason =
+            error instanceof Error ? error.message : 'discord_ui_server_failed';
+          const evidenceUri = await this.captureScreenshot(
+            page,
+            `discord-ui-${guildId}-${Date.now()}-fatal`,
+          );
+          const fullReason = evidenceUri
+            ? `${reason} | evidence:${evidenceUri}`
+            : reason;
+
+          this.logger.error(
+            `Discord: server ${si + 1}/${serverUrls.length} (${guildId}) failed: ${fullReason}`,
+          );
+          servers.push({
+            serverUrl,
+            guildId,
+            channelCount: 0,
+            postedCount: 0,
+            skippedCount: 0,
+            failedCount: 1,
+            channels: [],
+            error: fullReason,
+          });
+          totalFailedCount += 1;
+        }
+
+        if (si < serverUrls.length - 1) {
+          const delay = this.randomInterServerDelayMs();
+          this.logger.log(
+            `Discord inter-server pause: ${Math.round(delay / 1000)}s before server ` +
+            `${si + 2}/${serverUrls.length}`,
+          );
+          await page.waitForTimeout(delay);
+        }
+      }
+    } finally {
+      await context.close();
+    }
+
+    return {
+      serverCount: serverUrls.length,
+      totalChannelCount,
+      totalPostedCount,
+      totalSkippedCount,
+      totalFailedCount,
+      servers,
+    };
+  }
+
+  // Best-effort: read the active channel name from the DOM so direct-link results
+  // show a real name instead of "channel-<id>".
+  private async resolveChannelNameFromDom(
+    page: Page,
+    channelId: string,
+  ): Promise<string> {
+    try {
+      // The active channel link in the sidebar has the channel ID in its href
+      const link = page
+        .locator(`a[href*="/${channelId}"]`)
+        .first();
+      const label = await link.getAttribute('aria-label', { timeout: 2_000 }).catch(() => null);
+      if (label?.trim()) return label.trim();
+
+      // Fallback: inner text of the link
+      const text = await link.innerText({ timeout: 1_500 }).catch(() => null);
+      if (text?.trim()) return text.trim().replace(/^#\s*/, '');
+    } catch {
+      // non-fatal
+    }
+    return `channel-${channelId}`;
+  }
+
+  private async postToServerChannels(
+    page: Page,
+    guildId: string,
+    serverUrl: string,
+    normalizedMessage: string,
+    email?: string,
+    password?: string,
+  ): Promise<{
+    channelCount: number;
+    postedCount: number;
+    skippedCount: number;
+    failedCount: number;
+    channels: DiscordUiChannelResult[];
+  }> {
+    await page.goto(serverUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: this.navigationTimeoutMs,
+    });
+
+    await this.ensureLoggedIn(page, email, password);
+    if (!page.url().includes(`/channels/${guildId}`)) {
+      await page.goto(serverUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: this.navigationTimeoutMs,
+      });
+    }
+
+    // ── Determine target channels ───────────────────────────────────────────
+    // Direct channel link  → post only to that channel, no sidebar scanning.
+    // Server link          → discover community channels, apply cap.
+    const directChannelId = this.extractChannelId(serverUrl);
+
+    let channels: Array<{ channelId: string; channelName: string; channelUrl: string }>;
+
+    if (directChannelId) {
+      const channelName = await this.resolveChannelNameFromDom(page, directChannelId);
+      this.logger.log(
+        `Discord: direct channel URL — posting only to #${channelName} (${directChannelId}), skipping channel scan.`,
+      );
+      channels = [
+        {
+          channelId: directChannelId,
+          channelName,
+          channelUrl: serverUrl,
+        },
+      ];
+    } else {
+      const allChannels = await this.collectGuildChannelsWithAuthRecovery(
+        page,
+        guildId,
+        serverUrl,
+        email,
+        password,
+      );
+
+      const filteredChannels = allChannels.filter(
+        (ch) => !this.shouldSkipChannel(ch.channelName),
+      );
+      const cap = this.maxChannelsPerSession;
+      channels = filteredChannels.slice(0, cap);
+
+      this.logger.log(
+        `Discord channel scan: ${allChannels.length} total, ` +
+        `${allChannels.length - filteredChannels.length} non-community channels skipped, ` +
+        `${filteredChannels.length} eligible, ` +
+        `${channels.length} selected this session (cap: ${cap}). ` +
+        `Override with DISCORD_UI_MAX_CHANNELS_PER_SESSION.`,
+      );
+    }
+
+    const results: DiscordUiChannelResult[] = [];
+    for (let index = 0; index < channels.length; index += 1) {
+      const channel = channels[index];
+      const channelMessage = this.diversifyMessage(normalizedMessage);
+
+      const row = await this.tryPostInChannel(page, {
+        channelId: channel.channelId,
+        channelName: channel.channelName,
+        channelUrl: channel.channelUrl,
+        guildId,
+        isFirstChannel: index === 0,
+        message: channelMessage,
+      });
+      results.push(row);
+
+      if (index < channels.length - 1) {
+        const delay = this.randomInterChannelDelayMs();
+        this.logger.log(
+          `Discord inter-channel pause: ${Math.round(delay / 1000)}s before ` +
+          `channel ${index + 2}/${channels.length} ("${channels[index + 1].channelName}")`,
+        );
+        await page.waitForTimeout(delay);
+      }
+    }
+
+    const postedCount = results.filter((row) => row.posted).length;
+    const skippedCount = results.filter((row) => row.skipped).length;
+    const failedCount = results.filter(
+      (row) => !row.posted && !row.skipped,
+    ).length;
+
+    return {
+      channelCount: results.length,
+      postedCount,
+      skippedCount,
+      failedCount,
+      channels: results,
+    };
   }
 
   private get navigationTimeoutMs(): number {
@@ -148,17 +411,74 @@ export class DiscordUiPublisher {
     );
   }
 
+  // Safe defaults: 3–8 minutes between channels.
+  // Discord's AutoMod flags rapid same-content posts across channels.
+  // Override with DISCORD_UI_INTER_CHANNEL_DELAY_MIN_MS / _MAX_MS for testing.
   private randomInterChannelDelayMs(): number {
     const min =
       this.configService.get<number>('DISCORD_UI_INTER_CHANNEL_DELAY_MIN_MS') ??
-      2_000;
+      180_000;
     const max =
       this.configService.get<number>('DISCORD_UI_INTER_CHANNEL_DELAY_MAX_MS') ??
-      5_000;
+      480_000;
     if (max <= min) {
       return Math.max(0, min);
     }
     return min + Math.floor(Math.random() * (max - min + 1));
+  }
+
+  private get maxChannelsPerSession(): number {
+    return (
+      this.configService.get<number>('DISCORD_UI_MAX_CHANNELS_PER_SESSION') ?? 2
+    );
+  }
+
+  // Safe defaults: 5–15 minutes between servers.
+  // Override with DISCORD_UI_INTER_SERVER_DELAY_MIN_MS / _MAX_MS for testing.
+  private randomInterServerDelayMs(): number {
+    const min =
+      this.configService.get<number>('DISCORD_UI_INTER_SERVER_DELAY_MIN_MS') ??
+      300_000;
+    const max =
+      this.configService.get<number>('DISCORD_UI_INTER_SERVER_DELAY_MAX_MS') ??
+      900_000;
+    if (max <= min) {
+      return Math.max(0, min);
+    }
+    return min + Math.floor(Math.random() * (max - min + 1));
+  }
+
+  // Subtle per-channel message variation so each post has a unique hash.
+  // Keeps the first line intact (confirmation probe reads first 80 chars).
+  private diversifyMessage(message: string): string {
+    let result = message;
+    const lines = result.split('\n');
+
+    // If 3+ lines: randomly shuffle lines after the first (preserve probe)
+    if (lines.length >= 3 && Math.random() < 0.55) {
+      const first = lines[0];
+      const rest = lines.slice(1);
+      for (let i = rest.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [rest[i], rest[j]] = [rest[j], rest[i]];
+      }
+      result = [first, ...rest].join('\n');
+    }
+
+    // Append a subtle trailing variant 60% of the time
+    const lastChar = result[result.length - 1];
+    const endsWithPunctuation = '.!?'.includes(lastChar);
+    if (Math.random() < 0.6) {
+      const emojiPool = [' 📊', ' 📈', ' 💡', ' 🔍', ' 📌', ' 💰'];
+      if (endsWithPunctuation) {
+        result += emojiPool[Math.floor(Math.random() * emojiPool.length)];
+      } else {
+        const pool = [...emojiPool, '.', '...'];
+        result += pool[Math.floor(Math.random() * pool.length)];
+      }
+    }
+
+    return result;
   }
 
   private get loginEmail(): string {
@@ -173,10 +493,65 @@ export class DiscordUiPublisher {
     );
   }
 
+  private shouldSkipChannel(channelName: string): boolean {
+    const name = channelName.toLowerCase().replace(/[-_\s]/g, '');
+
+    const skipPatterns = [
+      // Questions / Q&A
+      'question', 'questions', 'qanda', 'qna', 'askme', 'askhere',
+      'askus', 'faq', 'faqs', 'inquiries', 'inquiry',
+
+      // Support / Help
+      'support', 'helpdesk', 'helpcenter', 'ticket', 'tickets',
+      'presales', 'presalessupport', 'supportcall', 'contactus',
+      'contact', 'assistance',
+
+      // Verification / Onboarding
+      'verification', 'verify', 'captcha', 'welcome', 'rules',
+      'serverrules', 'readfirst', 'getstarted', 'gettingstarted', 'onboarding',
+
+      // Announcements / Updates
+      'announcement', 'announcements', 'updates', 'update', 'changelog',
+      'patchnotes', 'newsfeed', 'news',
+
+      // Live / Streaming / Events
+      'goinglive', 'golive', 'livestream', 'streams', 'events',
+      'event', 'calendar', 'schedule',
+
+      // Commercial / Sales / Buy
+      'buynow', 'purchase', 'shop', 'store', 'sales', 'sale',
+      'checkout', 'order', 'orders', 'payment', 'payments',
+      'pricing', 'deals', 'deal', 'promo', 'promotions', 'promotion',
+      'discount', 'discounts',
+
+      // Admin / Mod / Staff / Bots
+      'admin', 'staff', 'mod', 'mods', 'moderator', 'moderators',
+      'botcommands', 'botcommand', 'commands',
+
+      // Info / Roles / Intros (read-only type channels)
+      'info', 'information', 'introductions', 'roles', 'selfroles',
+      'reactionroles', 'colorroles',
+
+      // Partner / Affiliate / Sponsor
+      'partners', 'affiliate', 'affiliates', 'sponsorship',
+    ];
+
+    return skipPatterns.some((p) => name.includes(p));
+  }
+
   private extractGuildId(url: string): string | null {
     const match = url.match(
       /^https:\/\/discord\.com\/channels\/(\d{15,25})(?:\/\d{15,25})?/i,
     );
+    return match?.[1] || null;
+  }
+
+  // Returns the channel ID when the URL points directly at a channel,
+  // or null when the URL is a server-only link (no channel segment).
+  private extractChannelId(url: string): string | null {
+    const match = url
+      .trim()
+      .match(/^https:\/\/discord\.com\/channels\/\d{15,25}\/(\d{15,25})/i);
     return match?.[1] || null;
   }
 
@@ -194,80 +569,156 @@ export class DiscordUiPublisher {
     );
 
     await mkdir(userDataDir, { recursive: true });
+    this.logger.log(`Discord session profile: ${userDataDir}`);
 
-    const context = await chromium.launchPersistentContext(userDataDir, {
+    const viewport = this.pickRandom(DiscordUiPublisher.VIEWPORTS);
+    const userAgent = this.pickRandom(DiscordUiPublisher.USER_AGENTS);
+
+    const context = await firefox.launchPersistentContext(userDataDir, {
       headless: this.isHeadless,
       executablePath: browserBinary || undefined,
-      viewport: { width: 1600, height: 1200 },
-      ignoreDefaultArgs: ['--enable-automation'],
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--window-position=0,0',
-      ],
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      viewport,
+      userAgent,
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      permissions: [],
+      firefoxUserPrefs: {
+        // Disable the webdriver flag — primary bot-detection signal in Firefox
+        'dom.webdriver.enabled': false,
+        // Override UA at the pref level so it survives redirects
+        'general.useragent.override': userAgent,
+        // Block notification permission prompts
+        'permissions.default.desktop-notification': 2,
+        // Disable update checks and telemetry
+        'app.update.auto': false,
+        'toolkit.telemetry.unified': false,
+        'toolkit.telemetry.enabled': false,
+        'toolkit.telemetry.archive.enabled': false,
+        'app.normandy.enabled': false,
+        'app.shield.optoutstudies.enabled': false,
+        // Disable first-run overlays and welcome pages
+        'browser.startup.homepage_override.mstone': 'ignore',
+        'startup.homepage_welcome_url.additional': '',
+        // Disable safe-browsing and other phone-home calls
+        'browser.safebrowsing.malware.enabled': false,
+        'browser.safebrowsing.phishing.enabled': false,
+        // Keep WebGL enabled — sites check for it; disabling it looks like a headless flag
+        'webgl.disabled': false,
+        // Disable resistFingerprinting — it changes many APIs in detectable ways
+        'privacy.resistFingerprinting': false,
+        // Don't reveal automation in HTTP headers
+        'general.platform.override': 'Win32',
+        // Media autoplay allowed (Discord uses audio/video)
+        'media.autoplay.default': 0,
+        'media.autoplay.blocking_policy': 0,
+      },
     });
+
+    await this.injectFingerprintEvasion(context);
 
     const page = context.pages()[0] ?? (await context.newPage());
     page.setDefaultTimeout(this.navigationTimeoutMs);
     return { context, page };
   }
 
+  private async injectFingerprintEvasion(context: BrowserContext): Promise<void> {
+    await context.addInitScript(() => {
+      // Firefox: dom.webdriver.enabled=false (pref) handles this, but belt-and-suspenders
+      try {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      } catch { /* already defined */ }
+
+      // Consistent language fingerprint
+      try {
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      } catch { /* already defined */ }
+
+      // Canvas fingerprint noise — imperceptible per-session shift
+      const noiseShift = (Math.random() - 0.5) * 0.018;
+      const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL = function (type?: string, quality?: unknown) {
+        const ctx2d = this.getContext('2d');
+        if (ctx2d && this.width > 0 && this.height > 0) {
+          try {
+            const imgData = ctx2d.getImageData(0, 0, this.width, this.height);
+            for (let i = 0; i < imgData.data.length; i += 128) {
+              imgData.data[i] = Math.max(0, Math.min(255, imgData.data[i] + noiseShift));
+            }
+            ctx2d.putImageData(imgData, 0, 0);
+          } catch { /* cross-origin canvas — skip */ }
+        }
+        return origToDataURL.call(this, type, quality as number);
+      };
+
+      // WebGL renderer noise — randomize per-session so fingerprint differs each run
+      const renderers = [
+        'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+        'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+        'ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
+        'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+      ];
+      const chosenRenderer = renderers[Math.floor(Math.random() * renderers.length)];
+      const patchWebGL = (Ctor: typeof WebGLRenderingContext) => {
+        const orig = Ctor.prototype.getParameter;
+        Ctor.prototype.getParameter = function (param: number) {
+          if (param === 37445) return chosenRenderer;
+          if (param === 37446) return chosenRenderer.split(',')[0].replace('ANGLE (', '');
+          return orig.call(this, param);
+        };
+      };
+      try { patchWebGL(WebGLRenderingContext); } catch { /* unavailable */ }
+      try { patchWebGL(WebGL2RenderingContext); } catch { /* unavailable */ }
+
+      // Notifications — return denied so Discord doesn't pop the permission dialog
+      const origQuery = window.navigator.permissions?.query?.bind(window.navigator.permissions);
+      if (origQuery) {
+        (window.navigator.permissions as unknown as { query: (d: unknown) => Promise<unknown> }).query =
+          (descriptor: unknown) => {
+            const d = descriptor as { name?: string };
+            if (d?.name === 'notifications') {
+              return Promise.resolve({ state: 'denied', onchange: null } as PermissionStatus);
+            }
+            return origQuery(descriptor as PermissionDescriptor);
+          };
+      }
+    });
+  }
+
   private resolveDiscordUserDataDir(configuredPath: string): string {
-    const defaultPath = join(process.cwd(), '.pw-discord-chromium');
-    if (!configuredPath) {
-      return defaultPath;
+    if (configuredPath) {
+      return configuredPath;
     }
-
-    const normalized = configuredPath.replace(/\//g, '\\').toLowerCase();
-    const isChromeProfile = normalized.includes('\\google\\chrome\\user data');
-    if (isChromeProfile) {
-      this.logger.warn(
-        'DISCORD_UI_USER_DATA_DIR points to Chrome profile. Using isolated Chromium profile instead.',
-      );
-      return defaultPath;
-    }
-
-    return configuredPath;
+    return join(process.cwd(), '.pw-discord-firefox');
   }
 
   private resolveDiscordBrowserBinary(configuredPath: string): string {
-    if (!configuredPath) {
-      return '';
-    }
-
-    const normalized = configuredPath.replace(/\//g, '\\').toLowerCase();
-    const looksLikeSystemChrome =
-      normalized.includes('\\google\\chrome\\application\\chrome.exe') ||
-      normalized.endsWith('\\chrome.exe');
-    if (looksLikeSystemChrome) {
-      this.logger.warn(
-        'DISCORD_UI_BROWSER_BINARY points to Chrome. Using Playwright Chromium instead.',
-      );
-      return '';
-    }
-
-    return configuredPath;
+    return configuredPath || '';
   }
 
-  private async ensureLoggedIn(page: Page): Promise<void> {
+  private async ensureLoggedIn(page: Page, emailOverride?: string, passwordOverride?: string): Promise<void> {
     const loginRequired = await this.isLoginRequired(page);
     if (!loginRequired) {
+      this.logger.log('Discord: reusing saved session — no login needed.');
       return;
     }
 
-    await this.loginWithCredentials(page);
+    this.logger.log('Discord: saved session missing or expired — logging in fresh.');
+    await this.loginWithCredentials(page, emailOverride, passwordOverride);
     if (await this.isLoginRequired(page)) {
       throw new Error('discord_ui_login_required_after_login_attempt');
     }
+    this.logger.log('Discord: login successful — session saved to profile directory.');
   }
 
   private async isLoginRequired(page: Page): Promise<boolean> {
-    if (page.url().includes('/login')) {
+    const url = page.url();
+    // Fast path: URL already tells us
+    if (url.includes('/login') || url.includes('/register')) {
       return true;
+    }
+    // Logged-in Discord always lands on /channels/... or /channels/@me
+    if (url.includes('/channels/')) {
+      return false;
     }
 
     const loginUiDetected = await this.hasLoginUi(page);
@@ -275,10 +726,12 @@ export class DiscordUiPublisher {
       return true;
     }
 
+    // Final fallback: check for the email input with a short timeout.
+    // On a valid session this input never appears, so 800ms is enough.
     const emailInput = page
       .locator('input[name="email"], input[type="email"]')
       .first();
-    return emailInput.isVisible({ timeout: 2500 }).catch(() => false);
+    return emailInput.isVisible({ timeout: 800 }).catch(() => false);
   }
 
   private async hasLoginUi(page: Page): Promise<boolean> {
@@ -306,9 +759,9 @@ export class DiscordUiPublisher {
       .catch(() => false);
   }
 
-  private async loginWithCredentials(page: Page): Promise<void> {
-    const email = this.loginEmail;
-    const password = this.loginPassword;
+  private async loginWithCredentials(page: Page, emailOverride?: string, passwordOverride?: string): Promise<void> {
+    const email = emailOverride?.trim() || this.loginEmail;
+    const password = passwordOverride?.trim() || this.loginPassword;
     if (!email || !password) {
       throw new Error('discord_ui_login_required_missing_credentials');
     }
@@ -821,6 +1274,8 @@ export class DiscordUiPublisher {
     page: Page,
     guildId: string,
     serverUrl: string,
+    emailOverride?: string,
+    passwordOverride?: string,
   ): Promise<
     Array<{
       channelId: string;
@@ -846,7 +1301,7 @@ export class DiscordUiPublisher {
           `Discord auth dropped during channel discovery (${message}). Retrying authentication (${attempt}/${maxAttempts - 1})...`,
         );
 
-        await this.ensureLoggedIn(page);
+        await this.ensureLoggedIn(page, emailOverride, passwordOverride);
         await page.goto(serverUrl, {
           waitUntil: 'domcontentloaded',
           timeout: this.navigationTimeoutMs,
@@ -1073,21 +1528,154 @@ export class DiscordUiPublisher {
     return match?.[1] || null;
   }
 
+  // Move the mouse gradually to a target element via a few intermediate waypoints.
+  private async humanMouseMove(page: Page, target: Locator): Promise<void> {
+    try {
+      const box = await target.boundingBox();
+      if (!box) return;
+
+      // Land somewhere random within the element bounds (not dead-center)
+      const destX = box.x + this.randInt(4, Math.max(5, box.width - 4));
+      const destY = box.y + this.randInt(4, Math.max(5, box.height - 4));
+
+      const { width, height } = page.viewportSize() ?? { width: 1280, height: 720 };
+      let curX = this.randInt(100, width - 200);
+      let curY = this.randInt(80, height - 200);
+
+      // 2-3 intermediate waypoints with slight curve
+      const steps = this.randInt(2, 3);
+      for (let s = 1; s <= steps; s += 1) {
+        const t = s / (steps + 1);
+        const wx = curX + (destX - curX) * t + this.randInt(-40, 40);
+        const wy = curY + (destY - curY) * t + this.randInt(-20, 20);
+        await page.mouse.move(wx, wy, { steps: this.randInt(6, 12) });
+        await page.waitForTimeout(this.randInt(30, 80));
+      }
+
+      await page.mouse.move(destX, destY, { steps: this.randInt(4, 8) });
+    } catch {
+      // Non-fatal — fall through to click
+    }
+  }
+
+  // Simulate a human reading the channel: scroll up briefly, then scroll back.
+  private async simulateChannelReading(page: Page): Promise<void> {
+    try {
+      // Small upward scroll — looks like reading recent messages
+      const scrollAmount = this.randInt(80, 250);
+      await page.mouse.wheel(0, -scrollAmount);
+      await page.waitForTimeout(this.jitter(600, 300));
+      await page.mouse.wheel(0, scrollAmount);
+      await page.waitForTimeout(this.jitter(400, 200));
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  // Click a channel in the left sidebar instead of reloading the page.
+  // Falls back gracefully so the caller can decide whether to use page.goto instead.
+  private async clickChannelInSidebar(
+    page: Page,
+    guildId: string,
+    channelId: string,
+    channelName: string,
+  ): Promise<boolean> {
+    try {
+      const link = page
+        .locator(`a[href="/channels/${guildId}/${channelId}"]`)
+        .first();
+
+      let visible = await link.isVisible({ timeout: 2_000 }).catch(() => false);
+
+      if (!visible) {
+        // Channel might be below the fold — scroll the channel list down
+        const scroller = page
+          .locator(
+            '[class*="scroller"][class*="channelList"], ' +
+            '[class*="channelsList"] [class*="scroller"], ' +
+            'nav[aria-label*="channel" i] [class*="scroller"]',
+          )
+          .first();
+        if (await scroller.isVisible({ timeout: 500 }).catch(() => false)) {
+          await scroller.evaluate((el) => {
+            (el as HTMLElement).scrollTop += 300;
+          });
+          await page.waitForTimeout(this.jitter(250, 100));
+        }
+        visible = await link.isVisible({ timeout: 1_500 }).catch(() => false);
+      }
+
+      if (!visible) {
+        this.logger.debug(
+          `Discord: sidebar link not found for #${channelName} (${channelId})`,
+        );
+        return false;
+      }
+
+      await link.scrollIntoViewIfNeeded().catch(() => undefined);
+      await page.waitForTimeout(this.jitter(150, 80));
+      await this.humanMouseMove(page, link);
+      await page.waitForTimeout(this.jitter(80, 40));
+      await link.click();
+
+      // SPA navigation: wait for URL to update to the target channel
+      await page
+        .waitForURL(`**/${guildId}/${channelId}`, { timeout: 8_000 })
+        .catch(() => undefined);
+
+      // Brief settle for Discord's React render cycle
+      await page.waitForTimeout(this.jitter(700, 250));
+
+      const landed = page.url().includes(`/${channelId}`);
+      if (!landed) {
+        this.logger.debug(
+          `Discord: sidebar click for #${channelName} did not update URL — will fallback.`,
+        );
+      }
+      return landed;
+    } catch {
+      return false;
+    }
+  }
+
   private async tryPostInChannel(
     page: Page,
     input: {
       channelId: string;
       channelName: string;
       channelUrl: string;
+      guildId: string;
+      isFirstChannel: boolean;
       message: string;
     },
   ): Promise<DiscordUiChannelResult> {
     try {
-      await page.goto(input.channelUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navigationTimeoutMs,
-      });
-      await page.waitForTimeout(1200);
+      if (input.isFirstChannel) {
+        // First channel in a server: full navigation is expected and natural
+        await page.goto(input.channelUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: this.navigationTimeoutMs,
+        });
+        await page.waitForTimeout(this.jitter(1800, 600));
+      } else {
+        // Subsequent channels: click the sidebar link — no reload, like a real user
+        const clicked = await this.clickChannelInSidebar(
+          page,
+          input.guildId,
+          input.channelId,
+          input.channelName,
+        );
+        if (!clicked) {
+          this.logger.warn(
+            `Discord: sidebar click failed for #${input.channelName} — falling back to navigation.`,
+          );
+          await page.goto(input.channelUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: this.navigationTimeoutMs,
+          });
+        }
+        await page.waitForTimeout(this.jitter(1200, 400));
+      }
 
       if (await this.hasReadOnlyNotice(page)) {
         return {
@@ -1112,21 +1700,21 @@ export class DiscordUiPublisher {
         };
       }
 
-      // Pre-check: slowmode visible before we even type? Skip rather than wait,
-      // so the run isn't blocked by a long cooldown timer.
-      if (await this.hasSlowmodeOrRateLimitNotice(page)) {
-        return {
-          channelId: input.channelId,
-          channelName: input.channelName,
-          channelUrl: input.channelUrl,
-          posted: false,
-          skipped: true,
-          reason: 'discord_ui_slowmode_or_rate_limited',
-        };
-      }
+      // Simulate reading the channel before posting
+      await this.simulateChannelReading(page);
 
+      // Move mouse naturally to composer, then click
+      await this.humanMouseMove(page, composer);
+      await page.waitForTimeout(this.jitter(120, 60));
       await composer.click();
+
+      // Brief dwell after focus — humans glance at the box before typing
+      await page.waitForTimeout(this.jitter(350, 150));
+
       await this.typeMultilineMessage(page, input.message);
+
+      // Short pause before hitting Enter — proofreading moment
+      await page.waitForTimeout(this.jitter(500, 250));
       await page.keyboard.press('Enter');
 
       // Post-send verification: did the message actually land?
@@ -1150,7 +1738,14 @@ export class DiscordUiPublisher {
         };
       }
 
-      await page.waitForTimeout(this.postDelayMs);
+      // Linger after send — humans don't instantly navigate away
+      await page.waitForTimeout(this.jitter(this.postDelayMs, this.postDelayMs * 0.4));
+
+      // Occasionally scroll up slightly (reading own post)
+      if (Math.random() < 0.4) {
+        await page.mouse.wheel(0, -this.randInt(30, 100));
+        await page.waitForTimeout(this.jitter(400, 150));
+      }
 
       return {
         channelId: input.channelId,
@@ -1191,7 +1786,7 @@ export class DiscordUiPublisher {
     const lines = message.replace(/\r\n/g, '\n').split('\n');
     for (let i = 0; i < lines.length; i += 1) {
       if (lines[i].length > 0) {
-        await page.keyboard.type(lines[i], { delay: 6 });
+        await this.typeHumanLike(page, lines[i]);
       }
       if (i < lines.length - 1) {
         // Shift+Enter inserts a soft line break inside the composer
@@ -1199,17 +1794,45 @@ export class DiscordUiPublisher {
         await page.keyboard.down('Shift');
         await page.keyboard.press('Enter');
         await page.keyboard.up('Shift');
+        await page.waitForTimeout(this.jitter(120, 60));
       }
     }
   }
 
+  // Type a string character-by-character with human-realistic inter-key delays.
+  private async typeHumanLike(page: Page, text: string): Promise<void> {
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text[i];
+      await page.keyboard.type(ch, { delay: 0 });
+
+      const r = Math.random();
+      let delay: number;
+      if (r < 0.03) {
+        // ~3%: thinking pause (mistype hesitation)
+        delay = this.randInt(300, 900);
+      } else if (ch === ' ' || ch === ',' || ch === '.') {
+        // After word boundary — slightly longer
+        delay = this.randInt(60, 160);
+      } else {
+        // Normal keystroke: 35-110 ms
+        delay = this.randInt(35, 110);
+      }
+
+      await page.waitForTimeout(delay);
+    }
+  }
+
   private async hasSlowmodeOrRateLimitNotice(page: Page): Promise<boolean> {
+    // Only match text that means "you are currently blocked from sending".
+    // Do NOT include generic slowmode labels like "Slow Mode is enabled" or
+    // "Slowmode: 5s" — those are permanent channel badges, not active blocks,
+    // and matching them caused every slowmode-configured channel to be skipped.
     const noticePatterns = [
       /you are sending messages too quickly/i,
-      /slowmode is enabled/i,
       /you are being rate limited/i,
-      /you must wait \d+/i,
-      /please wait \d+ seconds before sending another message/i,
+      /please wait \d+ second/i,
+      /must wait \d+ second/i,
+      /slow mode.*\d+s/i,
     ];
     for (const pattern of noticePatterns) {
       const visible = await page
@@ -1344,24 +1967,42 @@ export class DiscordUiPublisher {
   }
 
   private async hasReadOnlyNotice(page: Page): Promise<boolean> {
-    const readOnlyNotice = page.getByText(
-      /You do not have permission to send messages in this channel/i,
-    );
-    return readOnlyNotice.isVisible({ timeout: 1500 }).catch(() => false);
+    const patterns = [
+      /you do not have permission to send messages in this channel/i,
+      /cannot send messages in this channel/i,
+      /this channel is.*read.?only/i,
+      /this channel has been locked/i,
+      /only admins can post/i,
+    ];
+    for (const pattern of patterns) {
+      const visible = await page
+        .getByText(pattern)
+        .first()
+        .isVisible({ timeout: 400 })
+        .catch(() => false);
+      if (visible) return true;
+    }
+    return false;
   }
 
   private async findComposer(
     page: Page,
   ): Promise<ReturnType<Page['locator']> | null> {
     const selectors = [
+      // Slate.js editor — primary Discord composer
       'div[role="textbox"][data-slate-editor="true"]',
+      // Aria-label variants Discord uses for different channel types
       'div[aria-label^="Message #"][role="textbox"]',
       'div[aria-label^="Message @"][role="textbox"]',
+      'div[aria-label^="Message "][role="textbox"]',
+      // Generic contenteditable within the message form (fallback)
+      'form[class*="form"] div[contenteditable="true"]',
+      'div[class*="textArea"] div[contenteditable="true"]',
     ];
 
     for (const selector of selectors) {
       const locator = page.locator(selector);
-      const count = await locator.count();
+      const count = await locator.count().catch(() => 0);
       for (let index = count - 1; index >= 0; index -= 1) {
         const candidate = locator.nth(index);
         const visible = await candidate.isVisible().catch(() => false);

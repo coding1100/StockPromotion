@@ -7,6 +7,9 @@ function createService() {
     contentDraft: {
       findUnique: jest.fn(),
     },
+    accountProfile: {
+      findUnique: jest.fn(),
+    },
     telegramGroupCandidate: {
       findMany: jest.fn().mockResolvedValue([]),
       upsert: jest.fn().mockResolvedValue(undefined),
@@ -68,6 +71,16 @@ function createService() {
     publishBatchForManual: jest.fn(),
   };
 
+  const dlvritPublisher = {
+    postToAccount: jest.fn(),
+    listConnectedAccounts: jest.fn(),
+    listConnectedAccountsRaw: jest.fn(),
+  };
+
+  const dlvritSessionService = {
+    setCookieManually: jest.fn(),
+  };
+
   const discordUiPublisher = {
     broadcastToWritableChannels: jest.fn(),
   };
@@ -100,6 +113,8 @@ function createService() {
     auditService as never,
     telegramPublisher as never,
     stocktwitsPublisher as never,
+    dlvritPublisher as never,
+    dlvritSessionService as never,
     discordUiPublisher as never,
     stocktwitsComplianceService as never,
     postingPolicyService as never,
@@ -115,6 +130,7 @@ function createService() {
       accountsService,
       auditService,
       stocktwitsPublisher,
+      dlvritPublisher,
       discordUiPublisher,
       stocktwitsComplianceService,
       telemetryService,
@@ -146,10 +162,11 @@ describe('PublishingService stocktwits top-trending scheduling', () => {
       .spyOn(service as any, 'createAndQueuePublishJob')
       .mockResolvedValue(1);
 
-    mocks.prisma.contentDraft.findUnique.mockResolvedValue({
-      id: 'draft-1',
-      status: DraftStatus.AUTO_APPROVED,
-      body: 'Base draft body',
+    mocks.prisma.contentDraft.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      const symbolMap: Record<string, string> = { 'draft-orcl': 'ORCL', 'draft-iren': 'IREN' };
+      const symbol = symbolMap[where.id];
+      if (!symbol) return null;
+      return { id: where.id, status: DraftStatus.AUTO_APPROVED, body: `${symbol} content`, trendTopic: { symbol } };
     });
     mocks.accountsService.getEligibleAccount.mockImplementation(
       async (platform: AccountPlatform) => {
@@ -160,7 +177,7 @@ describe('PublishingService stocktwits top-trending scheduling', () => {
       },
     );
 
-    const scheduled = await service.scheduleDraftPublishes(['draft-1']);
+    const scheduled = await service.scheduleDraftPublishes(['draft-orcl', 'draft-iren']);
 
     expect(scheduled).toBe(2);
     const stocktwitsInputs = (createSpy.mock.calls as Array<[Record<string, unknown>]>)
@@ -175,6 +192,7 @@ describe('PublishingService stocktwits top-trending scheduling', () => {
   it('respects account quota constraints by scheduling only symbols with eligible account capacity', async () => {
     const { service, mocks } = createService();
 
+    const trendingSymbols = ['ORCL', 'IREN', 'INTC', 'GSAT', 'BE', 'ASTS', 'NVO', 'RKLB', 'PLTR', 'NVDA'];
     jest
       .spyOn(service, 'syncTelegramCandidatesFromSeed')
       .mockResolvedValue(undefined);
@@ -183,18 +201,7 @@ describe('PublishingService stocktwits top-trending scheduling', () => {
       .mockResolvedValue(undefined);
     jest
       .spyOn(service as any, 'resolveStocktwitsTrendingSymbolsForCycle')
-      .mockResolvedValue([
-        'ORCL',
-        'IREN',
-        'INTC',
-        'GSAT',
-        'BE',
-        'ASTS',
-        'NVO',
-        'RKLB',
-        'PLTR',
-        'NVDA',
-      ]);
+      .mockResolvedValue(trendingSymbols);
     jest
       .spyOn(service as any, 'resolveTelegramTargets')
       .mockResolvedValue([]);
@@ -202,10 +209,10 @@ describe('PublishingService stocktwits top-trending scheduling', () => {
       .spyOn(service as any, 'createAndQueuePublishJob')
       .mockResolvedValue(1);
 
-    mocks.prisma.contentDraft.findUnique.mockResolvedValue({
-      id: 'draft-1',
-      status: DraftStatus.AUTO_APPROVED,
-      body: 'Draft body',
+    mocks.prisma.contentDraft.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      const symbol = where.id.replace('draft-', '').toUpperCase();
+      if (!trendingSymbols.includes(symbol)) return null;
+      return { id: where.id, status: DraftStatus.AUTO_APPROVED, body: `${symbol} content`, trendTopic: { symbol } };
     });
 
     let stocktwitsCapacity = 0;
@@ -225,7 +232,8 @@ describe('PublishingService stocktwits top-trending scheduling', () => {
       },
     );
 
-    const scheduled = await service.scheduleDraftPublishes(['draft-1']);
+    const draftIds = trendingSymbols.map((s) => `draft-${s.toLowerCase()}`);
+    const scheduled = await service.scheduleDraftPublishes(draftIds);
 
     expect(scheduled).toBe(4);
     expect(createSpy).toHaveBeenCalledTimes(4);
@@ -307,12 +315,12 @@ describe('PublishingService manual direct publish', () => {
       id: 'stock-acct-1',
       accountHandle: 'stock-main',
     });
-    mocks.accountsService.getStocktwitsCredentials.mockReturnValue({
-      username: 'stock-user',
-      password: 'stock-pass',
-      secretRef: 'local:test',
+    mocks.prisma.accountProfile.findUnique.mockResolvedValue({
+      id: 'stock-acct-1',
+      accountHandle: 'stock-main',
+      dlvritAccountId: 'dlvrit-123',
     });
-    mocks.stocktwitsPublisher.publish.mockResolvedValue({
+    mocks.dlvritPublisher.postToAccount.mockResolvedValue({
       externalPostId: 'st-post-1',
       evidenceUri: 'artifacts/stocktwits/manual.png',
     });
@@ -357,14 +365,12 @@ describe('PublishingService manual direct publish', () => {
     expect(result.stocktwits.success).toBe(true);
     expect(result.stocktwits.targetSymbol).toBe('ORCL');
     expect(result.discord.successCount).toBe(2);
-    expect(mocks.stocktwitsPublisher.publish).toHaveBeenCalledWith(
+    expect(mocks.dlvritPublisher.postToAccount).toHaveBeenCalledWith(
       expect.objectContaining({
-        username: 'stock-user',
+        dlvritAccountId: 'dlvrit-123',
+        message: expect.stringContaining('$ORCL'),
+        jobId: expect.stringContaining('manual-'),
       }),
-      expect.stringContaining('$ORCL'),
-      expect.stringContaining('manual-'),
-      'ORCL',
-      undefined,
     );
     expect(
       mocks.discordUiPublisher.broadcastToWritableChannels,
@@ -387,12 +393,12 @@ describe('PublishingService manual direct publish', () => {
       id: 'stock-acct-1',
       accountHandle: 'stock-main',
     });
-    mocks.accountsService.getStocktwitsCredentials.mockReturnValue({
-      username: 'stock-user',
-      password: 'stock-pass',
-      secretRef: 'local:test',
+    mocks.prisma.accountProfile.findUnique.mockResolvedValue({
+      id: 'stock-acct-1',
+      accountHandle: 'stock-main',
+      dlvritAccountId: 'dlvrit-123',
     });
-    mocks.stocktwitsPublisher.publish.mockResolvedValue({
+    mocks.dlvritPublisher.postToAccount.mockResolvedValue({
       externalPostId: 'st-post-1',
       evidenceUri: 'artifacts/stocktwits/manual.png',
     });
@@ -437,10 +443,18 @@ describe('PublishingService manual direct publish', () => {
 
   it('publishes one-click multi-symbol stocktwits posts with distinct bodies', async () => {
     const { service, mocks } = createService();
-    mocks.stocktwitsPublisher.publishBatchForManual.mockResolvedValue([
-      { symbol: 'AAPL', success: true, externalPostId: 'st-aapl-1', evidenceUri: 'artifacts/stocktwits/aapl.png', error: null },
-      { symbol: 'TSLA', success: true, externalPostId: 'st-tsla-1', evidenceUri: 'artifacts/stocktwits/tsla.png', error: null },
-    ]);
+    mocks.accountsService.getEligibleAccount.mockResolvedValue({
+      id: 'stock-acct-1',
+      accountHandle: 'stock-main',
+    });
+    mocks.prisma.accountProfile.findUnique.mockResolvedValue({
+      id: 'stock-acct-1',
+      accountHandle: 'stock-main',
+      dlvritAccountId: 'dlvrit-123',
+    });
+    mocks.dlvritPublisher.postToAccount
+      .mockResolvedValueOnce({ externalPostId: 'st-aapl-1', evidenceUri: 'artifacts/stocktwits/aapl.png' })
+      .mockResolvedValueOnce({ externalPostId: 'st-tsla-1', evidenceUri: 'artifacts/stocktwits/tsla.png' });
 
     const result = await service.publishManualPost({
       body: '',
@@ -459,14 +473,12 @@ describe('PublishingService manual direct publish', () => {
     expect(result.stocktwits.targetSymbols).toEqual(['AAPL', 'TSLA']);
     expect(result.stocktwits.totalCount).toBe(2);
     expect(result.stocktwits.successCount).toBe(2);
-    expect(mocks.stocktwitsPublisher.publishBatchForManual).toHaveBeenCalledTimes(1);
-    expect(mocks.stocktwitsPublisher.publishBatchForManual).toHaveBeenCalledWith(
-      expect.objectContaining({ username: 'stock-user' }),
-      expect.arrayContaining([
-        expect.objectContaining({ symbol: 'AAPL', message: expect.stringContaining('$AAPL') }),
-        expect.objectContaining({ symbol: 'TSLA', message: expect.stringContaining('$TSLA') }),
-      ]),
-      undefined,
+    expect(mocks.dlvritPublisher.postToAccount).toHaveBeenCalledTimes(2);
+    expect(mocks.dlvritPublisher.postToAccount).toHaveBeenCalledWith(
+      expect.objectContaining({ dlvritAccountId: 'dlvrit-123', message: expect.stringContaining('$AAPL') }),
+    );
+    expect(mocks.dlvritPublisher.postToAccount).toHaveBeenCalledWith(
+      expect.objectContaining({ dlvritAccountId: 'dlvrit-123', message: expect.stringContaining('$TSLA') }),
     );
     expect(
       mocks.stocktwitsComplianceService.enforceManualPublishCompliance,

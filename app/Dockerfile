@@ -34,6 +34,12 @@ RUN apt-get update \
 COPY package*.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
+# Install Firefox (used for Discord UI automation — less fingerprinted than Chromium).
+RUN npx playwright install firefox
+
+# Install the exact Chromium revision required by the playwright package in node_modules.
+RUN npx playwright install chromium
+
 # Install patchright's patched Chromium. patchright is a Playwright fork that
 # patches CDP-level detection vectors (Runtime.enable etc.) which the JS stealth
 # plugin cannot address. Its Chromium binary is separate from Playwright's.

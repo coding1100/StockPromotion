@@ -29,20 +29,7 @@ export class DlvritSessionService {
     return this.refreshSession();
   }
 
-  setCookieManually(value: string): void {
-    this.store(value);
-    this.logger.log('dlvr.it session cookie updated manually.');
-  }
-
   async refreshSession(): Promise<string> {
-    const envCookie = this.configService.get<string>('DLVRIT_SESSION_COOKIE');
-    if (envCookie?.trim()) {
-      this.store(envCookie.trim());
-      this.logger.log('dlvr.it session loaded from DLVRIT_SESSION_COOKIE env var.');
-      return envCookie.trim();
-    }
-    // Wipe stale browser cookies so we always go through real Google OAuth
-    this.wipeBrowserCookies();
     return this.refreshViaPlaywright();
   }
 
@@ -217,13 +204,6 @@ export class DlvritSessionService {
   }
 
   private loadFromDisk(): void {
-    const envCookie = this.configService.get<string>('DLVRIT_SESSION_COOKIE');
-    if (envCookie?.trim()) {
-      this.cachedCookie = envCookie.trim();
-      this.cachedAt = Date.now();
-      this.logger.log('dlvr.it session loaded from DLVRIT_SESSION_COOKIE env var.');
-      return;
-    }
     try {
       const raw = fs.readFileSync(this.sessionFilePath(), 'utf8');
       const { value, storedAt } = JSON.parse(raw) as { value: string; storedAt: number };
