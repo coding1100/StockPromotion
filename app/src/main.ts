@@ -48,7 +48,13 @@ async function bootstrap() {
     SwaggerModule.setup('api/docs', app, document);
   }
 
+  const expressApp = app.getHttpAdapter().getInstance();
+  expressApp.get('/', (_req: Request, res: Response) => {
+    res.redirect(302, '/api/manual-ui');
+  });
+
   const port = Number(process.env.PORT ?? 3000);
-  await app.listen(port);
+  const host = process.env.LISTEN_HOST ?? '0.0.0.0';
+  await app.listen(port, host);
 }
 void bootstrap();

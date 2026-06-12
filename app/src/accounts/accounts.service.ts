@@ -48,7 +48,10 @@ export class AccountsService {
     const stocktwitsAccounts = this.loadStocktwitsAccountsFromEnv();
     const telegramAccounts = this.loadTelegramAccountsFromEnv();
 
-    await this.syncPlatformAccounts(AccountPlatform.STOCKTWITS, stocktwitsAccounts);
+    await this.syncPlatformAccounts(
+      AccountPlatform.STOCKTWITS,
+      stocktwitsAccounts,
+    );
     await this.syncPlatformAccounts(AccountPlatform.TELEGRAM, telegramAccounts);
   }
 
@@ -86,7 +89,11 @@ export class AccountsService {
     });
 
     for (const candidate of candidates) {
-      const quotaOk = await this.isWithinQuota(candidate.id, policy, scheduledAt);
+      const quotaOk = await this.isWithinQuota(
+        candidate.id,
+        policy,
+        scheduledAt,
+      );
       if (!quotaOk) {
         continue;
       }
@@ -130,7 +137,10 @@ export class AccountsService {
       const refreshedCurrent = await this.prisma.accountProfile.findUnique({
         where: { id: currentAccountId },
       });
-      if (refreshedCurrent && refreshedCurrent.status === AccountStatus.ACTIVE) {
+      if (
+        refreshedCurrent &&
+        refreshedCurrent.status === AccountStatus.ACTIVE
+      ) {
         return refreshedCurrent;
       }
     }
@@ -232,7 +242,7 @@ export class AccountsService {
             outcome.restricted || nextHealth <= 0.35 ? new Date() : null,
           replacementNotes:
             outcome.restricted || nextHealth <= 0.35
-              ? outcome.reason ?? 'Account requires manual review'
+              ? (outcome.reason ?? 'Account requires manual review')
               : null,
         },
       });
@@ -259,18 +269,18 @@ export class AccountsService {
             ? (currentState?.consecutiveSuccesses ?? 0) + 1
             : 0,
           softFailureCount: outcome.success
-            ? currentState?.softFailureCount ?? 0
+            ? (currentState?.softFailureCount ?? 0)
             : (currentState?.softFailureCount ?? 0) + 1,
           restrictionCount: outcome.restricted
             ? (currentState?.restrictionCount ?? 0) + 1
-            : currentState?.restrictionCount ?? 0,
+            : (currentState?.restrictionCount ?? 0),
           lastOutcome: outcome.success ? 'success' : 'failure',
           lastPublishedAt: outcome.success
             ? new Date()
-            : currentState?.lastPublishedAt ?? null,
+            : (currentState?.lastPublishedAt ?? null),
           lastRestrictedAt: outcome.restricted
             ? new Date()
-            : currentState?.lastRestrictedAt ?? null,
+            : (currentState?.lastRestrictedAt ?? null),
         },
       });
 
@@ -290,7 +300,8 @@ export class AccountsService {
     await this.recordHealthEvent(
       accountId,
       outcome.success ? 'info' : outcome.restricted ? 'error' : 'warn',
-      outcome.reason ?? (outcome.success ? 'Publish succeeded' : 'Publish failed'),
+      outcome.reason ??
+        (outcome.success ? 'Publish succeeded' : 'Publish failed'),
       outcome.metadata,
     );
 
@@ -341,9 +352,14 @@ export class AccountsService {
         message: reason,
       },
     });
-    await this.auditService.record('account.quarantined', 'account', accountId, {
-      reason,
-    });
+    await this.auditService.record(
+      'account.quarantined',
+      'account',
+      accountId,
+      {
+        reason,
+      },
+    );
   }
 
   async requestReplacement(accountId: string, notes?: string): Promise<void> {
@@ -362,9 +378,14 @@ export class AccountsService {
       },
     });
 
-    await this.auditService.record('account.replacement.requested', 'account', accountId, {
-      notes: notes ?? null,
-    });
+    await this.auditService.record(
+      'account.replacement.requested',
+      'account',
+      accountId,
+      {
+        notes: notes ?? null,
+      },
+    );
   }
 
   async activateReplacement(input: {
@@ -425,11 +446,16 @@ export class AccountsService {
       },
     });
 
-    await this.auditService.record('account.replacement.activated', 'account', row.id, {
-      platform: input.platform,
-      handle: input.accountHandle,
-      secretRef: input.secretRef,
-    });
+    await this.auditService.record(
+      'account.replacement.activated',
+      'account',
+      row.id,
+      {
+        platform: input.platform,
+        handle: input.accountHandle,
+        secretRef: input.secretRef,
+      },
+    );
   }
 
   async listAccountsDashboard(platform?: AccountPlatform): Promise<
@@ -510,11 +536,11 @@ export class AccountsService {
 
   private async syncPlatformAccounts(
     platform: AccountPlatform,
-    accounts: Array<
-      StocktwitsAccountSecret | TelegramBotSecret
-    >,
+    accounts: Array<StocktwitsAccountSecret | TelegramBotSecret>,
   ): Promise<void> {
-    const handles = Array.from(new Set(accounts.map((account) => account.handle)));
+    const handles = Array.from(
+      new Set(accounts.map((account) => account.handle)),
+    );
 
     await this.prisma.$transaction(async (tx) => {
       for (const account of accounts) {
@@ -605,7 +631,9 @@ export class AccountsService {
           perAccountQuota: this.configService.getOrThrow<number>(
             'PHASE2_PER_ACCOUNT_QUOTA',
           ),
-          globalQuota: this.configService.getOrThrow<number>('PHASE2_GLOBAL_QUOTA'),
+          globalQuota: this.configService.getOrThrow<number>(
+            'PHASE2_GLOBAL_QUOTA',
+          ),
           quietHoursStart: this.optionalNumber('PHASE2_QUIET_HOURS_START'),
           quietHoursEnd: this.optionalNumber('PHASE2_QUIET_HOURS_END'),
           minDelayMinutes: this.configService.getOrThrow<number>(
@@ -626,7 +654,9 @@ export class AccountsService {
           perAccountQuota: this.configService.getOrThrow<number>(
             'PHASE2_PER_ACCOUNT_QUOTA',
           ),
-          globalQuota: this.configService.getOrThrow<number>('PHASE2_GLOBAL_QUOTA'),
+          globalQuota: this.configService.getOrThrow<number>(
+            'PHASE2_GLOBAL_QUOTA',
+          ),
           quietHoursStart: this.optionalNumber('PHASE2_QUIET_HOURS_START'),
           quietHoursEnd: this.optionalNumber('PHASE2_QUIET_HOURS_END'),
           minDelayMinutes: this.configService.getOrThrow<number>(
@@ -792,6 +822,105 @@ export class AccountsService {
 
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  // ── dlvr.it account management ───────────────────────────────────────────────
+
+  async listDlvritAccounts(): Promise<
+    Array<{
+      id: string;
+      accountHandle: string;
+      dlvritAccountId: number | null;
+      status: AccountStatus;
+    }>
+  > {
+    const rows = await this.prisma.accountProfile.findMany({
+      where: { platform: AccountPlatform.STOCKTWITS },
+      select: {
+        id: true,
+        accountHandle: true,
+        dlvritAccountId: true,
+        status: true,
+      },
+      orderBy: { accountHandle: 'asc' },
+    });
+    return rows;
+  }
+
+  async upsertDlvritAccount(
+    accountHandle: string,
+    dlvritAccountId: number,
+  ): Promise<{ id: string; accountHandle: string; dlvritAccountId: number }> {
+    const existing = await this.prisma.accountProfile.findUnique({
+      where: {
+        platform_accountHandle: {
+          platform: AccountPlatform.STOCKTWITS,
+          accountHandle,
+        },
+      },
+    });
+
+    if (existing) {
+      const updated = await this.prisma.accountProfile.update({
+        where: { id: existing.id },
+        data: { dlvritAccountId, status: AccountStatus.ACTIVE },
+      });
+      return {
+        id: updated.id,
+        accountHandle: updated.accountHandle,
+        dlvritAccountId: updated.dlvritAccountId!,
+      };
+    }
+
+    const created = await this.prisma.accountProfile.create({
+      data: {
+        platform: AccountPlatform.STOCKTWITS,
+        accountHandle,
+        dlvritAccountId,
+        status: AccountStatus.ACTIVE,
+        healthScore: 1.0,
+        config: {},
+      },
+    });
+    return {
+      id: created.id,
+      accountHandle: created.accountHandle,
+      dlvritAccountId: created.dlvritAccountId!,
+    };
+  }
+
+  async setDlvritAccountStatus(
+    accountId: string,
+    status: AccountStatus,
+  ): Promise<void> {
+    await this.prisma.accountProfile.update({
+      where: { id: accountId },
+      data: { status },
+    });
+  }
+
+  async getDlvritAccountId(accountHandle: string): Promise<number | null> {
+    const row = await this.prisma.accountProfile.findUnique({
+      where: {
+        platform_accountHandle: {
+          platform: AccountPlatform.STOCKTWITS,
+          accountHandle,
+        },
+      },
+      select: { dlvritAccountId: true },
+    });
+    return row?.dlvritAccountId ?? null;
+  }
+
+  async deleteStocktwitsAccounts(ids: string[]): Promise<number> {
+    if (!ids.length) return 0;
+    const result = await this.prisma.accountProfile.deleteMany({
+      where: {
+        id: { in: ids },
+        platform: AccountPlatform.STOCKTWITS,
+      },
+    });
+    return result.count;
   }
 }
 

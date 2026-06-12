@@ -32,7 +32,9 @@ describe('AccountsService', () => {
           },
         }),
       },
-      $transaction: jest.fn().mockImplementation(async (callback) => callback(tx)),
+      $transaction: jest
+        .fn()
+        .mockImplementation(async (callback) => callback(tx)),
       accountHealthEvent: {
         create: jest.fn().mockResolvedValue(undefined),
       },

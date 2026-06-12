@@ -94,6 +94,10 @@ export class OrchestrationController {
     body: {
       body?: string;
       stocktwitsSymbol?: string;
+      stocktwitsItems?: Array<{
+        symbol?: string;
+        body?: string;
+      }>;
       publishToStocktwits?: boolean;
       publishToDiscord?: boolean;
       discordServerUrl?: string;
@@ -102,6 +106,7 @@ export class OrchestrationController {
     return this.publishingService.publishManualPost({
       body: body.body ?? '',
       stocktwitsSymbol: body.stocktwitsSymbol,
+      stocktwitsItems: body.stocktwitsItems,
       publishToStocktwits: body.publishToStocktwits,
       publishToDiscord: body.publishToDiscord,
       discordServerUrl: body.discordServerUrl,
@@ -165,7 +170,11 @@ export class OrchestrationController {
   @Post('publish/replay-window')
   async replayFailedWindow(
     @Body()
-    body: { fromIso: string; toIso: string; platform?: string },
+    body: {
+      fromIso: string;
+      toIso: string;
+      platform?: string;
+    },
   ): Promise<Record<string, unknown>> {
     const platform = this.parsePublishPlatform(body.platform);
     return this.publishingService.replayFailedWindow({

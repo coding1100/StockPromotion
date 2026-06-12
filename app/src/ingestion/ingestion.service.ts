@@ -93,9 +93,7 @@ export class IngestionService {
       stocktwitsSignal,
       news,
     })
-      .filter(
-        ([, value]) => value.configured && value.healthy && value.fresh,
-      )
+      .filter(([, value]) => value.configured && value.healthy && value.fresh)
       .sort(([, left], [, right]) => right.priority - left.priority)
       .map(([key]) => key as ConnectorName);
 
@@ -120,7 +118,10 @@ export class IngestionService {
       'pipeline.ingestion.records',
       stocktwitsSignal.ingested,
     );
-    this.telemetryService.increment('pipeline.ingestion.records', news.ingested);
+    this.telemetryService.increment(
+      'pipeline.ingestion.records',
+      news.ingested,
+    );
 
     await this.auditService.record(
       'ingestion.completed',
@@ -260,10 +261,10 @@ export class IngestionService {
       .filter(Boolean);
     return Boolean(
       rapidApiKey &&
-        rapidApiHost &&
-        rapidApiBaseUrl &&
-        rapidApiPathTemplate &&
-        subreddits.length > 0,
+      rapidApiHost &&
+      rapidApiBaseUrl &&
+      rapidApiPathTemplate &&
+      subreddits.length > 0,
     );
   }
 
@@ -491,7 +492,8 @@ export class IngestionService {
       this.asString(payload.author) ||
       this.asString(payload.username) ||
       this.asString(payload.user);
-    const createdRaw = payload.created_utc ?? payload.createdAt ?? payload.created;
+    const createdRaw =
+      payload.created_utc ?? payload.createdAt ?? payload.created;
     const occurredAt = this.asDate(createdRaw);
 
     return {
@@ -650,7 +652,8 @@ export class IngestionService {
         }).filter((value) => value !== primarySymbol),
       ];
       const sourceUrl =
-        this.asString(item.url) || `https://stocktwits.com/symbol/${primarySymbol}`;
+        this.asString(item.url) ||
+        `https://stocktwits.com/symbol/${primarySymbol}`;
       const author = this.asString(item.author) || 'mock-stocktwits-user';
       const createdRaw = item.createdAt;
       const occurredAt = this.asDate(createdRaw);
@@ -779,14 +782,16 @@ export class IngestionService {
     }
 
     const rows = payload.map((item, index) => {
-      const title = this.asString(item.title) || `Mock market update ${index + 1}`;
+      const title =
+        this.asString(item.title) || `Mock market update ${index + 1}`;
       const body =
         this.asString(item.summary) ||
         this.asString(item.description) ||
         this.asString(item.body) ||
         title;
       const sourceUrl =
-        this.asString(item.url) || `https://example.test/mock-news/${index + 1}`;
+        this.asString(item.url) ||
+        `https://example.test/mock-news/${index + 1}`;
       const author = this.asString(item.source) || 'mock-news';
       const createdRaw = item.publishedAt ?? item.time ?? item.createdAt;
       const occurredAt = this.asDate(createdRaw);
@@ -1071,7 +1076,9 @@ export class IngestionService {
   }
 
   private resolveRedditQueryKeywords(): string[] {
-    const explicit = (this.configService.get<string>('REDDIT_QUERY_KEYWORDS') || '')
+    const explicit = (
+      this.configService.get<string>('REDDIT_QUERY_KEYWORDS') || ''
+    )
       .split(',')
       .map((value) => value.trim())
       .filter(Boolean);

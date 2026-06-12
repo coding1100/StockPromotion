@@ -54,7 +54,8 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
       publishAttemptsDays: this.configService.getOrThrow<number>(
         'RETENTION_PUBLISH_ATTEMPTS_DAYS',
       ),
-      deadLetterDays: this.configService.getOrThrow<number>('RETENTION_DLQ_DAYS'),
+      deadLetterDays:
+        this.configService.getOrThrow<number>('RETENTION_DLQ_DAYS'),
     };
   }
 
@@ -91,7 +92,9 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
     );
     const attemptsCutoff = new Date(
       now -
-        this.configService.getOrThrow<number>('RETENTION_PUBLISH_ATTEMPTS_DAYS') *
+        this.configService.getOrThrow<number>(
+          'RETENTION_PUBLISH_ATTEMPTS_DAYS',
+        ) *
           24 *
           60 *
           60 *
