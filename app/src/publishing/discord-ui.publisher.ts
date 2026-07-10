@@ -227,10 +227,16 @@ export class DiscordUiPublisher {
         }
 
         if (si < serverUrls.length - 1) {
-          const delay = this.randomInterServerDelayMs();
+          // Direct channel links use a much shorter pause than full server
+          // broadcasts — the user explicitly picked these channels so
+          // treating them like separate server-level spams is too conservative.
+          const isDirectChannel = !!this.extractChannelId(serverUrl);
+          const delay = isDirectChannel
+            ? this.randomDirectChannelDelayMs()
+            : this.randomInterServerDelayMs();
           this.logger.log(
-            `Discord inter-server pause: ${Math.round(delay / 1000)}s before server ` +
-            `${si + 2}/${serverUrls.length}`,
+            `Discord pause: ${Math.round(delay / 1000)}s before ` +
+            `URL ${si + 2}/${serverUrls.length}`,
           );
           await page.waitForTimeout(delay);
         }
@@ -291,18 +297,36 @@ export class DiscordUiPublisher {
       timeout: this.navigationTimeoutMs,
     });
 
+    // Discord is a React SPA: domcontentloaded fires before React initialises.
+    // If the user is not authenticated, React will redirect to /login after
+    // its JS runs — we must wait for that redirect before checking login state.
+    await page
+      .waitForURL(/\/(login|register)/, { timeout: 5_000 })
+      .catch(() => null); // no redirect = already logged in, that's fine
+
     await this.ensureLoggedIn(page, email, password);
-    if (!page.url().includes(`/channels/${guildId}`)) {
-      await page.goto(serverUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.navigationTimeoutMs,
-      });
-    }
 
     // ── Determine target channels ───────────────────────────────────────────
     // Direct channel link  → post only to that channel, no sidebar scanning.
     // Server link          → discover community channels, apply cap.
     const directChannelId = this.extractChannelId(serverUrl);
+
+    if (directChannelId) {
+      // For a direct channel link, navigate exactly to that channel after login.
+      // The guild-level check is insufficient — Discord may redirect to a
+      // different channel in the same guild after login.
+      if (!page.url().includes(`/${directChannelId}`)) {
+        await page.goto(serverUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: this.navigationTimeoutMs,
+        });
+      }
+    } else if (!page.url().includes(`/channels/${guildId}`)) {
+      await page.goto(serverUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: this.navigationTimeoutMs,
+      });
+    }
 
     let channels: Array<{ channelId: string; channelName: string; channelUrl: string }>;
 
@@ -431,6 +455,17 @@ export class DiscordUiPublisher {
     return (
       this.configService.get<number>('DISCORD_UI_MAX_CHANNELS_PER_SESSION') ?? 2
     );
+  }
+
+  // Delay between direct channel link posts: 15–45 seconds by default.
+  // Override with DISCORD_UI_DIRECT_CHANNEL_DELAY_MIN_MS / _MAX_MS.
+  private randomDirectChannelDelayMs(): number {
+    const min =
+      this.configService.get<number>('DISCORD_UI_DIRECT_CHANNEL_DELAY_MIN_MS') ?? 15_000;
+    const max =
+      this.configService.get<number>('DISCORD_UI_DIRECT_CHANNEL_DELAY_MAX_MS') ?? 45_000;
+    if (max <= min) return Math.max(0, min);
+    return min + Math.floor(Math.random() * (max - min + 1));
   }
 
   // Safe defaults: 5–15 minutes between servers.
@@ -712,22 +747,26 @@ export class DiscordUiPublisher {
 
   private async isLoginRequired(page: Page): Promise<boolean> {
     const url = page.url();
-    // Fast path: URL already tells us
+    // Fast path: URL already tells us we're on the login page
     if (url.includes('/login') || url.includes('/register')) {
       return true;
     }
-    // Logged-in Discord always lands on /channels/... or /channels/@me
-    if (url.includes('/channels/')) {
-      return false;
-    }
 
+    // DOM check before trusting the URL. Discord's React SPA can render the
+    // login form on a /channels/ URL while the client-side redirect is still
+    // in flight (JS runs after domcontentloaded, so the URL may not have
+    // changed yet when this function is first called).
     const loginUiDetected = await this.hasLoginUi(page);
     if (loginUiDetected) {
       return true;
     }
 
-    // Final fallback: check for the email input with a short timeout.
-    // On a valid session this input never appears, so 800ms is enough.
+    // URL is /channels/ and no login form in DOM → session is active
+    if (url.includes('/channels/')) {
+      return false;
+    }
+
+    // Final fallback: look for the email input with a short timeout.
     const emailInput = page
       .locator('input[name="email"], input[type="email"]')
       .first();
@@ -1651,12 +1690,19 @@ export class DiscordUiPublisher {
   ): Promise<DiscordUiChannelResult> {
     try {
       if (input.isFirstChannel) {
-        // First channel in a server: full navigation is expected and natural
-        await page.goto(input.channelUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: this.navigationTimeoutMs,
-        });
-        await page.waitForTimeout(this.jitter(1800, 600));
+        // Navigate to the channel. Skip the goto if we're already on this
+        // channel (happens when the caller navigated there just before calling
+        // this method — e.g. a direct channel link).
+        if (!page.url().includes(`/${input.channelId}`)) {
+          await page.goto(input.channelUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: this.navigationTimeoutMs,
+          });
+          await page.waitForTimeout(this.jitter(1800, 600));
+        } else {
+          // Already on the right channel — just let React finish rendering
+          await page.waitForTimeout(this.jitter(600, 200));
+        }
       } else {
         // Subsequent channels: click the sidebar link — no reload, like a real user
         const clicked = await this.clickChannelInSidebar(

@@ -83,6 +83,7 @@ function createService() {
 
   const discordUiPublisher = {
     broadcastToWritableChannels: jest.fn(),
+    broadcastToMultipleServers: jest.fn(),
   };
 
   const stocktwitsComplianceService = {
@@ -324,30 +325,41 @@ describe('PublishingService manual direct publish', () => {
       externalPostId: 'st-post-1',
       evidenceUri: 'artifacts/stocktwits/manual.png',
     });
-    mocks.discordUiPublisher.broadcastToWritableChannels.mockResolvedValue({
-      guildId: '725851172266573915',
-      channelCount: 2,
-      postedCount: 2,
-      skippedCount: 0,
-      failedCount: 0,
-      channels: [
+    mocks.discordUiPublisher.broadcastToMultipleServers.mockResolvedValue({
+      serverCount: 1,
+      totalChannelCount: 2,
+      totalPostedCount: 2,
+      totalSkippedCount: 0,
+      totalFailedCount: 0,
+      servers: [
         {
-          channelId: '444444444444444444',
-          channelUrl:
-            'https://discord.com/channels/725851172266573915/444444444444444444',
-          channelName: 'chan-1',
-          posted: true,
-          skipped: false,
-          reason: null,
-        },
-        {
-          channelId: '555555555555555555',
-          channelUrl:
-            'https://discord.com/channels/725851172266573915/555555555555555555',
-          channelName: 'chan-2',
-          posted: true,
-          skipped: false,
-          reason: null,
+          serverUrl:
+            'https://discord.com/channels/725851172266573915/1072593749978398850',
+          guildId: '725851172266573915',
+          channelCount: 2,
+          postedCount: 2,
+          skippedCount: 0,
+          failedCount: 0,
+          channels: [
+            {
+              channelId: '444444444444444444',
+              channelUrl:
+                'https://discord.com/channels/725851172266573915/444444444444444444',
+              channelName: 'chan-1',
+              posted: true,
+              skipped: false,
+              reason: null,
+            },
+            {
+              channelId: '555555555555555555',
+              channelUrl:
+                'https://discord.com/channels/725851172266573915/555555555555555555',
+              channelName: 'chan-2',
+              posted: true,
+              skipped: false,
+              reason: null,
+            },
+          ],
         },
       ],
     });
@@ -373,7 +385,7 @@ describe('PublishingService manual direct publish', () => {
       }),
     );
     expect(
-      mocks.discordUiPublisher.broadcastToWritableChannels,
+      mocks.discordUiPublisher.broadcastToMultipleServers,
     ).toHaveBeenCalledTimes(1);
     expect(
       mocks.stocktwitsComplianceService.enforceManualPublishCompliance,
@@ -487,39 +499,50 @@ describe('PublishingService manual direct publish', () => {
 
   it('publishes manual content to discord via UI mode across writable channels', async () => {
     const { service, mocks } = createService();
-    mocks.discordUiPublisher.broadcastToWritableChannels.mockResolvedValue({
-      guildId: '725851172266573915',
-      channelCount: 3,
-      postedCount: 2,
-      skippedCount: 1,
-      failedCount: 0,
-      channels: [
+    mocks.discordUiPublisher.broadcastToMultipleServers.mockResolvedValue({
+      serverCount: 1,
+      totalChannelCount: 3,
+      totalPostedCount: 2,
+      totalSkippedCount: 1,
+      totalFailedCount: 0,
+      servers: [
         {
-          channelId: '111111111111111111',
-          channelUrl:
-            'https://discord.com/channels/725851172266573915/111111111111111111',
-          channelName: 'general',
-          posted: true,
-          skipped: false,
-          reason: null,
-        },
-        {
-          channelId: '222222222222222222',
-          channelUrl:
-            'https://discord.com/channels/725851172266573915/222222222222222222',
-          channelName: 'alpha',
-          posted: true,
-          skipped: false,
-          reason: null,
-        },
-        {
-          channelId: '333333333333333333',
-          channelUrl:
-            'https://discord.com/channels/725851172266573915/333333333333333333',
-          channelName: 'locked',
-          posted: false,
-          skipped: true,
-          reason: 'discord_ui_channel_read_only',
+          serverUrl:
+            'https://discord.com/channels/725851172266573915/1072593749978398850',
+          guildId: '725851172266573915',
+          channelCount: 3,
+          postedCount: 2,
+          skippedCount: 1,
+          failedCount: 0,
+          channels: [
+            {
+              channelId: '111111111111111111',
+              channelUrl:
+                'https://discord.com/channels/725851172266573915/111111111111111111',
+              channelName: 'general',
+              posted: true,
+              skipped: false,
+              reason: null,
+            },
+            {
+              channelId: '222222222222222222',
+              channelUrl:
+                'https://discord.com/channels/725851172266573915/222222222222222222',
+              channelName: 'alpha',
+              posted: true,
+              skipped: false,
+              reason: null,
+            },
+            {
+              channelId: '333333333333333333',
+              channelUrl:
+                'https://discord.com/channels/725851172266573915/333333333333333333',
+              channelName: 'locked',
+              posted: false,
+              skipped: true,
+              reason: 'discord_ui_channel_read_only',
+            },
+          ],
         },
       ],
     });
@@ -538,11 +561,12 @@ describe('PublishingService manual direct publish', () => {
     expect(result.discord.successCount).toBe(2);
     expect(result.discord.failedCount).toBe(0);
     expect(
-      mocks.discordUiPublisher.broadcastToWritableChannels,
+      mocks.discordUiPublisher.broadcastToMultipleServers,
     ).toHaveBeenCalledWith(
       expect.objectContaining({
-        serverUrl:
+        serverUrls: [
           'https://discord.com/channels/725851172266573915/1072593749978398850',
+        ],
         message: 'UI mode broadcast',
       }),
     );

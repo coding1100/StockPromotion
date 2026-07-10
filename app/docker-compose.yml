@@ -59,6 +59,9 @@ services:
       DISPLAY: ":99"
       STOCKTWITS_HEADLESS: "false"
       DLVRIT_USER_DATA_DIR: /usr/src/app/artifacts/dlvrit-user-data
+      # Override the Windows path from .env — store the Firefox session inside
+      # the artifacts volume so login persists across container rebuilds.
+      DISCORD_UI_USER_DATA_DIR: /usr/src/app/artifacts/discord-user-data
     ports:
       - "3000:3000"
       - "6080:6080"
