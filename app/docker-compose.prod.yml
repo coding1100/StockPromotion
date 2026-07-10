@@ -1,0 +1,66 @@
+# Production compose: no host port bindings for postgres/redis so they never
+# clash with services already running on the server. Only the app is exposed.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: stockpromo-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stockpromo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d stockpromo"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: stockpromo-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stockpromo-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/stockpromo?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      LISTEN_HOST: 0.0.0.0
+      STOCKTWITS_USER_DATA_DIR: /usr/src/app/artifacts/stocktwits-user-data
+      STOCKTWITS_BROWSER_BINARY: ""
+      DISCORD_UI_BROWSER_BINARY: ""
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      DISPLAY: ":99"
+      STOCKTWITS_HEADLESS: "false"
+      DLVRIT_USER_DATA_DIR: /usr/src/app/artifacts/dlvrit-user-data
+      DISCORD_UI_USER_DATA_DIR: /usr/src/app/artifacts/discord-user-data
+    ports:
+      - "3000:3000"
+      - "6080:6080"
+    volumes:
+      - ./artifacts:/usr/src/app/artifacts
+
+volumes:
+  postgres_data:
+  redis_data:
