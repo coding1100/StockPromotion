@@ -33,9 +33,20 @@ type UpsertDlvritAccountBody = {
 @Controller('manual-ui')
 @Public()
 export class ManualUiController {
+  private lastStocktwitsPostAt: Date | null = null;
+  private readonly STOCKTWITS_COOLDOWN_MS = 90_000;
+
   constructor(
     private readonly publishingService: PublishingService,
   ) {}
+
+  @Get('st-cooldown')
+  getStCooldown(): Record<string, unknown> {
+    if (!this.lastStocktwitsPostAt) return { remainingMs: 0 };
+    const elapsed = Date.now() - this.lastStocktwitsPostAt.getTime();
+    const remaining = Math.max(0, this.STOCKTWITS_COOLDOWN_MS - elapsed);
+    return { remainingMs: remaining };
+  }
 
   // ── dlvr.it Account Management API ─────────────────────────────────────────
 
@@ -318,6 +329,17 @@ export class ManualUiController {
     .t-err{background:#450a0a;color:#fee2e2}
     .t-info{background:#0f172a;color:#e2e8f0}
 
+    /* ── Cooldown bar ── */
+    .cooldown-wrap{padding:14px 24px;border-top:1px solid var(--bdr);
+      background:#f0fdf4;display:none}
+    .cooldown-wrap.on{display:block}
+    .cooldown-hd{display:flex;justify-content:space-between;align-items:center;
+      margin-bottom:8px;font-size:12px;font-weight:600;color:#166534}
+    .cooldown-hd-icon{display:flex;align-items:center;gap:6px}
+    .cooldown-track{height:7px;background:#dcfce7;border-radius:4px;overflow:hidden}
+    .cooldown-fill{height:100%;background:linear-gradient(90deg,#10b981,#34d399);
+      border-radius:4px;transition:width .3s linear}
+
     @media(max-width:640px){
       .app-bar,.tab-nav{padding:0 14px}
       .page{padding:16px 10px 60px}
@@ -423,6 +445,21 @@ export class ManualUiController {
           <span id="st-status" class="pub-status"></span>
         </div>
 
+        <div id="st-cooldown" class="cooldown-wrap">
+          <div class="cooldown-hd">
+            <span class="cooldown-hd-icon">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#166534" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+              StockTwits rate limit — cooldown active
+            </span>
+            <span id="st-cooldown-lbl">90s remaining</span>
+          </div>
+          <div class="cooldown-track">
+            <div id="st-cooldown-fill" class="cooldown-fill" style="width:100%"></div>
+          </div>
+        </div>
+
         <div id="st-res-wrap" class="res-wrap" style="display:none">
           <div class="res-head" onclick="toggleRes('st')">
             <span>&#9660; Result</span>
@@ -517,11 +554,13 @@ export class ManualUiController {
           </div>
 
           <div class="field">
-            <label for="dc-urls">Server URLs <span class="lbl-opt">one per line</span></label>
-            <textarea id="dc-urls" placeholder="https://discord.com/channels/1234567890123456789&#10;https://discord.com/channels/9876543210987654321"></textarea>
+            <label for="dc-urls">Channel or Server URLs <span class="lbl-opt">one per line</span></label>
+            <textarea id="dc-urls" placeholder="https://discord.com/channels/1234567890123456789/9876543210987654321&#10;https://discord.com/channels/1111111111111111111/2222222222222222222"></textarea>
             <div class="hint">
-              Right-click a server name in Discord → <strong>Copy Link</strong> to get the URL.
-              The automation scans every writable text channel and skips questions/QA/read-only channels automatically.
+              Right-click a channel in Discord → <strong>Copy Link</strong> to get a direct channel URL
+              (<code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:11px;">/channels/SERVER_ID/CHANNEL_ID</code>).
+              The automation goes straight to that channel and posts — no server scanning needed.
+              You can also paste a server-only URL to broadcast to all writable channels automatically.
             </div>
           </div>
 
@@ -615,6 +654,42 @@ export class ManualUiController {
 
 <script>
   const base = window.location.pathname.replace(/\\/$/, '');
+  const ST_COOLDOWN_MS = 90000;
+  const ST_BTN_HTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> Publish to StockTwits';
+  let _stCooldownTimer = null;
+
+  function startSTCooldown(remainingMs) {
+    if (_stCooldownTimer) { clearTimeout(_stCooldownTimer); _stCooldownTimer = null; }
+    const endTime = Date.now() + remainingMs;
+    const wrap = document.getElementById('st-cooldown');
+    const fill = document.getElementById('st-cooldown-fill');
+    const lbl  = document.getElementById('st-cooldown-lbl');
+    const btn  = document.getElementById('st-btn');
+    btn.disabled = true;
+    btn.innerHTML = ST_BTN_HTML;
+    wrap.classList.add('on');
+    function tick() {
+      const left = Math.max(0, endTime - Date.now());
+      fill.style.width = (left / ST_COOLDOWN_MS * 100) + '%';
+      lbl.textContent = Math.ceil(left / 1000) + 's remaining';
+      if (left <= 0) {
+        wrap.classList.remove('on');
+        btn.disabled = false;
+        _stCooldownTimer = null;
+        return;
+      }
+      _stCooldownTimer = setTimeout(tick, 250);
+    }
+    tick();
+  }
+
+  async function checkSTCooldown() {
+    try {
+      const res = await fetch(base + '/st-cooldown');
+      const json = await res.json();
+      if (json.remainingMs > 0) startSTCooldown(json.remainingMs);
+    } catch {}
+  }
 
   // ── Tabs ──────────────────────────────────────────────────────────────
   function switchTab(name) {
@@ -672,9 +747,10 @@ export class ManualUiController {
       for (const line of batchLines) {
         const d = line.indexOf('|');
         if (d <= 0) throw new Error('Invalid batch row — use: SYMBOL | post text');
-        const sym = line.slice(0, d).trim().replace(/^\\$/, '');
+        const symRaw = line.slice(0, d).trim();
+        const sym = symRaw.startsWith('$') ? symRaw : '$' + symRaw;
         const txt = line.slice(d + 1).trim();
-        if (!sym) throw new Error('Batch row has empty symbol');
+        if (sym === '$') throw new Error('Batch row has empty symbol');
         if (!txt) throw new Error('Batch row for ' + sym + ' has no text');
         items.push({ symbol: sym, body: txt });
       }
@@ -687,7 +763,7 @@ export class ManualUiController {
 
     const payload = {
       body: bodyVal, platforms: ['stocktwits'],
-      stocktwitsSymbol: document.getElementById('st-symbol').value.trim() || undefined,
+      stocktwitsSymbol: (s => s ? (s.startsWith('$') ? s : '$' + s) : undefined)(document.getElementById('st-symbol').value.trim()),
       stocktwitsAccountHandle: document.getElementById('st-account').value || undefined,
       stocktwitsItems: items.length ? items : undefined,
     };
@@ -697,11 +773,13 @@ export class ManualUiController {
     status.textContent = 'Sending to StockTwits…';
     hideRes('st');
 
+    let _apiCalled = false;
     try {
       const res = await fetch(base + '/publish', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      _apiCalled = true;
       const json = await res.json();
       showRes('st', JSON.stringify(json, null, 2));
       toast(json.success === false ? 'Post failed — see result.' : 'Posted to StockTwits!',
@@ -710,9 +788,13 @@ export class ManualUiController {
       showRes('st', '⚠ ' + e.message);
       toast(e.message, 'err');
     } finally {
-      btn.disabled = false;
-      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> Publish to StockTwits';
       status.textContent = '';
+      if (_apiCalled) {
+        startSTCooldown(ST_COOLDOWN_MS);
+      } else {
+        btn.disabled = false;
+        btn.innerHTML = ST_BTN_HTML;
+      }
     }
   }
 
@@ -969,6 +1051,7 @@ export class ManualUiController {
   }
 
   loadAccounts();
+  checkSTCooldown();
 </script>
 </body>
 </html>`;
@@ -989,7 +1072,7 @@ export class ManualUiController {
   ): Promise<Record<string, unknown>> {
     const platforms = Array.isArray(body.platforms) ? body.platforms : [];
 
-    return this.publishingService.publishManualPost({
+    const result = await this.publishingService.publishManualPost({
       body: body.body ?? '',
       stocktwitsSymbol: body.stocktwitsSymbol,
       stocktwitsAccountHandle: body.stocktwitsAccountHandle,
@@ -1004,5 +1087,11 @@ export class ManualUiController {
       discordEmail: body.discordEmail,
       discordPassword: body.discordPassword,
     });
+
+    if (platforms.includes('stocktwits')) {
+      this.lastStocktwitsPostAt = new Date();
+    }
+
+    return result;
   }
 }
