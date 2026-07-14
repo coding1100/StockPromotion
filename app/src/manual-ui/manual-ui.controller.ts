@@ -245,6 +245,12 @@ export class ManualUiController {
     .btn-blue{background:#2563eb;color:#fff}
     .btn-ghost{background:var(--surf);color:var(--tx2);border:1.5px solid var(--bdr)}
     .btn-ghost:hover:not(:disabled){background:#f8fafc;opacity:1}
+    .btn-vnc.live{border-color:var(--dc);color:var(--dc);
+      animation:vncpulse 1.6s ease-in-out infinite}
+    @keyframes vncpulse{
+      0%,100%{box-shadow:0 0 0 0 rgba(88,101,242,.35)}
+      50%{box-shadow:0 0 0 6px rgba(88,101,242,0)}
+    }
     .btn-sm{padding:6px 12px;font-size:12px;border-radius:6px}
     .btn-lg{padding:11px 22px;font-size:14px}
     .spin{width:14px;height:14px;border-radius:50%;
@@ -614,6 +620,13 @@ export class ManualUiController {
             </svg>
             Publish to Discord
           </button>
+          <button id="dc-vnc-btn" class="btn btn-ghost btn-lg btn-vnc" onclick="openVnc()"
+            title="Opens the live browser view (noVNC) in a new tab">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+            </svg>
+            Watch Live (VNC)
+          </button>
           <span id="dc-status" class="pub-status"></span>
         </div>
 
@@ -817,6 +830,10 @@ export class ManualUiController {
   }
 
   // ── Discord publish ───────────────────────────────────────────────────
+  function openVnc() {
+    window.open('http://' + location.hostname + ':6080/vnc.html?autoconnect=1&resize=scale', '_blank');
+  }
+
   async function pubDC() {
     const bodyVal = document.getElementById('dc-body').value.trim();
     const urls = document.getElementById('dc-urls').value.split('\\n').map(u => u.trim()).filter(Boolean);
@@ -837,7 +854,8 @@ export class ManualUiController {
 
     btn.disabled = true;
     btn.innerHTML = '<span class="spin"></span> Publishing…';
-    status.textContent = 'Posting to Discord channels…';
+    status.textContent = 'Posting to Discord channels — click "Watch Live (VNC)" to see the browser.';
+    document.getElementById('dc-vnc-btn').classList.add('live');
     hideRes('dc');
 
     try {
@@ -858,6 +876,7 @@ export class ManualUiController {
       btn.disabled = false;
       btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> Publish to Discord';
       status.textContent = '';
+      document.getElementById('dc-vnc-btn').classList.remove('live');
     }
   }
 
