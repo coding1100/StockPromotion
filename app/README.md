@@ -73,12 +73,19 @@ NODE_ENV=development
 PORT=3000
 ADMIN_API_KEY=pick-a-strong-secret-here   # required in production; protects non-health endpoints
 
+MANUAL_UI_USERNAME=admin                  # required in production; login for /api/manual-ui
+MANUAL_UI_PASSWORD=pick-a-strong-password
+MANUAL_UI_SESSION_SECRET=                 # optional; keeps sessions valid across restarts
+MANUAL_UI_SESSION_TTL_HOURS=168
+
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5433/stockpromo?schema=public
 REDIS_HOST=localhost
 REDIS_PORT=6379
 ```
 
 All non-`/health` endpoints require the header `x-api-key: <ADMIN_API_KEY>` once that's set.
+The manual UI at `/api/manual-ui` is gated by a sign-in page (`/api/manual-ui/login`) using
+`MANUAL_UI_USERNAME` / `MANUAL_UI_PASSWORD`; both are mandatory when `NODE_ENV=production`.
 
 ### Required: At least one LLM provider
 

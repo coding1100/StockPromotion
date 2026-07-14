@@ -18,10 +18,13 @@ import { LlmModule } from './llm/llm.module';
 import { TelemetryModule } from './telemetry/telemetry.module';
 import { envValidationSchema } from './config/environment.validation';
 import { ApiKeyGuard } from './auth/api-key.guard';
+import { ManualUiSessionGuard } from './auth/manual-ui-session.guard';
+import { ManualUiSessionService } from './auth/manual-ui-session.service';
 import { ManualUiController } from './manual-ui/manual-ui.controller';
+import { ManualUiAuthController } from './manual-ui/manual-ui-auth.controller';
 
 @Module({
-  controllers: [ManualUiController],
+  controllers: [ManualUiController, ManualUiAuthController],
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
@@ -70,6 +73,8 @@ import { ManualUiController } from './manual-ui/manual-ui.controller';
     TelemetryModule,
   ],
   providers: [
+    ManualUiSessionService,
+    ManualUiSessionGuard,
     {
       provide: APP_GUARD,
       useClass: ApiKeyGuard,

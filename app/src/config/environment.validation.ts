@@ -10,6 +10,16 @@ export const envValidationSchema = Joi.object({
   SWAGGER_ENABLED: Joi.boolean().default(false),
   ADMIN_API_KEY: Joi.string().allow('').optional(),
 
+  // Manual UI login gate
+  MANUAL_UI_USERNAME: Joi.string().allow('').optional(),
+  MANUAL_UI_PASSWORD: Joi.string().allow('').optional(),
+  MANUAL_UI_SESSION_SECRET: Joi.string().allow('').optional(),
+  MANUAL_UI_SESSION_TTL_HOURS: Joi.number()
+    .integer()
+    .min(1)
+    .max(720)
+    .default(168),
+
   DATABASE_URL: Joi.string().uri().required(),
 
   REDIS_HOST: Joi.string().default('127.0.0.1'),
@@ -390,6 +400,17 @@ export const envValidationSchema = Joi.object({
     return helpers.error('any.custom', {
       message:
         'ADMIN_API_KEY must be configured in production to protect orchestration and publishing endpoints.',
+    });
+  }
+
+  const manualUiUsername =
+    (env.MANUAL_UI_USERNAME as string | undefined)?.trim() ?? '';
+  const manualUiPassword =
+    (env.MANUAL_UI_PASSWORD as string | undefined)?.trim() ?? '';
+  if (isProduction && (!manualUiUsername || !manualUiPassword)) {
+    return helpers.error('any.custom', {
+      message:
+        'MANUAL_UI_USERNAME and MANUAL_UI_PASSWORD must be configured in production to gate the manual UI.',
     });
   }
 

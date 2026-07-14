@@ -8,6 +8,7 @@ import { HealthService } from '../src/health/health.service';
 import { OrchestrationService } from '../src/orchestration/orchestration.service';
 import { PublishingService } from '../src/publishing/publishing.service';
 import { RetentionService } from '../src/retention/retention.service';
+import { IngestionService } from '../src/ingestion/ingestion.service';
 
 @Module({
   controllers: [HealthController, OrchestrationController],
@@ -46,6 +47,12 @@ import { RetentionService } from '../src/retention/retention.service';
         listPublishJobs: jest.fn().mockResolvedValue([]),
         getPublishJob: jest.fn().mockResolvedValue(null),
         retryPublishJob: jest.fn().mockResolvedValue(undefined),
+      },
+    },
+    {
+      provide: IngestionService,
+      useValue: {
+        listConnectorStates: jest.fn().mockResolvedValue([]),
       },
     },
     {

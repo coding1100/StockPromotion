@@ -1,5 +1,16 @@
-import { Body, Controller, Delete, Get, Header, Param, Post, Put } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Header,
+  Param,
+  Post,
+  Put,
+  UseGuards,
+} from '@nestjs/common';
 import { Public } from '../auth/public.decorator';
+import { ManualUiSessionGuard } from '../auth/manual-ui-session.guard';
 import { PublishingService } from '../publishing/publishing.service';
 import { AccountStatus } from '@prisma/client';
 
@@ -32,6 +43,7 @@ type UpsertDlvritAccountBody = {
 
 @Controller('manual-ui')
 @Public()
+@UseGuards(ManualUiSessionGuard)
 export class ManualUiController {
   private lastStocktwitsPostAt: Date | null = null;
   private readonly STOCKTWITS_COOLDOWN_MS = 90_000;
@@ -362,6 +374,12 @@ export class ManualUiController {
     Stock Promotion
   </a>
   <span class="app-bar-right">Manual Publisher</span>
+  <form method="post" action="/api/manual-ui/logout" style="margin:0">
+    <button type="submit" style="border:1px solid var(--bdr);background:none;border-radius:8px;
+      padding:6px 14px;font-size:12px;font-weight:600;color:var(--tx2);cursor:pointer;font-family:inherit">
+      Sign out
+    </button>
+  </form>
 </header>
 
 <!-- ── Tab nav ───────────────────────────────────────────────── -->
