@@ -8,11 +8,17 @@ export DISPLAY=:99
 # Give Xvfb a moment to initialise
 sleep 1
 
-# Start VNC server (no password, localhost only inside the container)
-x11vnc -display :99 -forever -nopw -shared -bg -quiet
-
-# Start noVNC websocket proxy on port 6080, serving the noVNC web files
-websockify --web=/usr/share/novnc 6080 localhost:5900 &
+# VNC is published on 6080 — require a password; in production fail closed.
+if [ -n "$VNC_PASSWORD" ]; then
+  x11vnc -storepasswd "$VNC_PASSWORD" /tmp/.vncpass >/dev/null 2>&1
+  x11vnc -display :99 -forever -rfbauth /tmp/.vncpass -shared -bg -quiet
+  websockify --web=/usr/share/novnc 6080 localhost:5900 &
+elif [ "$NODE_ENV" != "production" ]; then
+  x11vnc -display :99 -forever -nopw -shared -bg -quiet
+  websockify --web=/usr/share/novnc 6080 localhost:5900 &
+else
+  echo "VNC/noVNC disabled: set VNC_PASSWORD to enable the live browser view in production"
+fi
 
 # Run the app
 exec sh -c "npx prisma migrate deploy && node dist/main.js"

@@ -19,6 +19,9 @@ export const envValidationSchema = Joi.object({
     .min(1)
     .max(720)
     .default(168),
+  // Consumed by entrypoint.sh: gates the noVNC live browser view (port 6080).
+  // Without it, VNC is disabled in production (classic VNC auth uses the first 8 chars).
+  VNC_PASSWORD: Joi.string().allow('').optional(),
 
   DATABASE_URL: Joi.string().uri().required(),
 
