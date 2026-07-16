@@ -20,6 +20,7 @@ import { envValidationSchema } from './config/environment.validation';
 import { ApiKeyGuard } from './auth/api-key.guard';
 import { ManualUiSessionGuard } from './auth/manual-ui-session.guard';
 import { ManualUiSessionService } from './auth/manual-ui-session.service';
+import { ManualUiLoginLimiter } from './auth/manual-ui-login.limiter';
 import { ManualUiController } from './manual-ui/manual-ui.controller';
 import { ManualUiAuthController } from './manual-ui/manual-ui-auth.controller';
 
@@ -75,6 +76,7 @@ import { ManualUiAuthController } from './manual-ui/manual-ui-auth.controller';
   providers: [
     ManualUiSessionService,
     ManualUiSessionGuard,
+    ManualUiLoginLimiter,
     {
       provide: APP_GUARD,
       useClass: ApiKeyGuard,

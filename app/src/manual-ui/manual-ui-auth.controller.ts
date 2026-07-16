@@ -1,8 +1,18 @@
-import { Body, Controller, Get, Post, Query, Req, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Logger,
+  Post,
+  Query,
+  Req,
+  Res,
+} from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { Public } from '../auth/public.decorator';
 import { parseCookie } from '../auth/manual-ui-session.guard';
+import { ManualUiLoginLimiter } from '../auth/manual-ui-login.limiter';
 import {
   MANUAL_UI_SESSION_COOKIE,
   ManualUiSessionService,
@@ -16,7 +26,12 @@ type LoginBody = {
 @Controller('manual-ui')
 @Public()
 export class ManualUiAuthController {
-  constructor(private readonly sessionService: ManualUiSessionService) {}
+  private readonly logger = new Logger(ManualUiAuthController.name);
+
+  constructor(
+    private readonly sessionService: ManualUiSessionService,
+    private readonly loginLimiter: ManualUiLoginLimiter,
+  ) {}
 
   @Get('login')
   loginPage(
@@ -32,20 +47,38 @@ export class ManualUiAuthController {
     res
       .status(200)
       .type('text/html; charset=utf-8')
-      .send(this.renderLoginPage(error === '1'));
+      .send(this.renderLoginPage(error));
   }
 
   @Post('login')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  login(@Body() body: LoginBody, @Res() res: Response): void {
+  login(
+    @Body() body: LoginBody,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): void {
     const username = String(body.username ?? '').trim();
     const password = String(body.password ?? '');
+    const ip = req.ip ?? 'unknown';
+
+    // IP-independent lockout: per-IP throttling is bypassable with rotating IPs.
+    if (this.loginLimiter.isLockedOut()) {
+      this.logger.warn(
+        `Manual UI login rejected during lockout (user="${username}" ip=${ip})`,
+      );
+      res.redirect(303, '/api/manual-ui/login?error=locked');
+      return;
+    }
 
     if (!this.sessionService.validateCredentials(username, password)) {
+      this.loginLimiter.registerFailure();
+      this.logger.warn(`Manual UI login failed (user="${username}" ip=${ip})`);
       res.redirect(303, '/api/manual-ui/login?error=1');
       return;
     }
 
+    this.loginLimiter.registerSuccess();
+    this.logger.log(`Manual UI login succeeded (user="${username}" ip=${ip})`);
     res.cookie(MANUAL_UI_SESSION_COOKIE, this.sessionService.issueToken(), {
       httpOnly: true,
       sameSite: 'lax',
@@ -61,7 +94,13 @@ export class ManualUiAuthController {
     res.redirect(303, '/api/manual-ui/login');
   }
 
-  private renderLoginPage(showError: boolean): string {
+  private renderLoginPage(error?: string): string {
+    const errorMessage =
+      error === 'locked'
+        ? 'Too many failed attempts. Login is temporarily locked — try again in a few minutes.'
+        : error === '1'
+          ? 'Invalid username or password.'
+          : '';
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -103,7 +142,7 @@ export class ManualUiAuthController {
   <main class="card">
     <div class="logo"><span class="logo-badge">&#128640;</span> Stock Promotion</div>
     <p class="sub">Sign in to access the manual publisher.</p>
-    ${showError ? '<div class="error">Invalid username or password.</div>' : ''}
+    ${errorMessage ? `<div class="error">${errorMessage}</div>` : ''}
     <form method="post" action="/api/manual-ui/login" autocomplete="off">
       <div class="field">
         <label for="username">Username</label>
