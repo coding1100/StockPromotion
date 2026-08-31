@@ -14,35 +14,62 @@ const NOT_AUTHENTICATED_PATTERNS = ['/login', '/signin', '/auth', 'accounts.goog
 @Injectable()
 export class DlvritSessionService {
   private readonly logger = new Logger(DlvritSessionService.name);
-  private cachedCookie: string | null = null;
-  private cachedAt: number = 0;
+  private readonly sessions = new Map<string, { cookie: string; cachedAt: number }>();
+  private readonly refreshes = new Map<string, Promise<string>>();
   private readonly CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
 
   constructor(private readonly configService: ConfigService) {
-    this.loadFromDisk();
+    this.loadFromDisk('legacy');
   }
 
-  async getSessionCookie(): Promise<string> {
-    if (this.cachedCookie && Date.now() - this.cachedAt < this.CACHE_TTL_MS) {
-      return this.cachedCookie;
+  async getSessionCookie(workspaceId = 'legacy'): Promise<string> {
+    const cached = this.sessions.get(workspaceId) ?? this.loadFromDisk(workspaceId);
+    if (cached && Date.now() - cached.cachedAt < this.CACHE_TTL_MS) {
+      return cached.cookie;
     }
-    return this.refreshSession();
+    return this.refreshSession(workspaceId);
   }
 
-  async refreshSession(): Promise<string> {
-    return this.refreshViaPlaywright();
+  async loginWorkspace(workspaceId: string, email: string, password: string): Promise<string> {
+    return this.refreshSession(workspaceId, { email, password });
+  }
+
+  async refreshSession(
+    workspaceId = 'legacy',
+    credentials?: { email: string; password: string },
+  ): Promise<string> {
+    const inFlight = this.refreshes.get(workspaceId);
+    if (inFlight) return inFlight;
+    const refresh = this.refreshViaPlaywright(workspaceId, credentials).finally(() => {
+      this.refreshes.delete(workspaceId);
+    });
+    this.refreshes.set(workspaceId, refresh);
+    return refresh;
+  }
+
+  removeWorkspace(workspaceId: string): void {
+    this.sessions.delete(workspaceId);
   }
 
   // ── Playwright automation ───────────────────────────────────────────────────
 
-  private async refreshViaPlaywright(): Promise<string> {
-    this.logger.log('Refreshing dlvr.it session via Playwright…');
-    const userDataDir = this.resolveUserDataDir();
+  private async refreshViaPlaywright(
+    workspaceId: string,
+    credentials?: { email: string; password: string },
+  ): Promise<string> {
+    this.logger.log(`Refreshing dlvr.it session for workspace ${workspaceId}…`);
+    const userDataDir = this.resolveUserDataDir(workspaceId);
     const headless =
       (this.configService.get<string>('DLVRIT_HEADLESS') ?? 'true') !== 'false';
+    const configuredBrowserBinary =
+      this.configService.get<string>('DLVRIT_BROWSER_BINARY')?.trim();
+    const systemChrome = '/usr/bin/google-chrome';
+    const executablePath = configuredBrowserBinary ||
+      (fs.existsSync(systemChrome) ? systemChrome : undefined);
 
     const context = await chromium.launchPersistentContext(userDataDir, {
       headless,
+      executablePath,
       viewport: { width: 1280, height: 800 },
       ignoreHTTPSErrors: true,
       ignoreDefaultArgs: [
@@ -58,9 +85,18 @@ export class DlvritSessionService {
       const page = await context.newPage();
 
       // Navigate to app root — the SPA redirects to its own login route
-      await page.goto(DLVRIT_APP_URL, { waitUntil: 'networkidle', timeout: 30_000 });
-      // Wait for any SPA routing to settle
-      await page.waitForTimeout(2_000);
+      // The SPA keeps analytics/background requests open, so networkidle can
+      // time out even when the login page is fully usable.
+      await page.goto(DLVRIT_APP_URL, {
+        waitUntil: 'domcontentloaded',
+        timeout: 45_000,
+      });
+      // The root document boots a SPA and only then routes unauthenticated
+      // users to /login. Waiting for that client-side route avoids treating
+      // the initial app shell as an authenticated dashboard.
+      await page
+        .waitForURL((url) => url.pathname !== '/', { timeout: 20_000 })
+        .catch(() => undefined);
       const landedUrl = page.url();
       this.logger.log(`Landed on: ${landedUrl}`);
       await this.saveDebugScreenshot(page, 'after-app-root');
@@ -70,7 +106,7 @@ export class DlvritSessionService {
 
       if (needsLogin) {
         this.logger.log('Login page detected — attempting email/password login…');
-        await this.doEmailPasswordLogin(page);
+        await this.doEmailPasswordLogin(page, credentials, workspaceId === 'legacy');
 
         // Wait for redirect back to authenticated dlvr.it dashboard
         this.logger.log('Credentials submitted — waiting for redirect to dashboard…');
@@ -91,24 +127,32 @@ export class DlvritSessionService {
       }
 
       const cookie = await this.extractCookie(context, page);
-      this.store(cookie);
-      this.logger.log('dlvr.it session cookie refreshed successfully.');
+      this.store(workspaceId, cookie);
+      this.logger.log(`dlvr.it session refreshed for workspace ${workspaceId}.`);
       return cookie;
     } catch (err) {
-      this.wipeBrowserCookies();
+      this.wipeBrowserCookies(workspaceId);
       throw err;
     } finally {
       await context.close();
     }
   }
 
-  private async doEmailPasswordLogin(page: Page): Promise<void> {
-    const email = this.configService.get<string>('DLVRIT_LOGIN_EMAIL') ?? '';
-    const password = this.configService.get<string>('DLVRIT_LOGIN_PASSWORD') ?? '';
+  private async doEmailPasswordLogin(
+    page: Page,
+    credentials?: { email: string; password: string },
+    allowLegacyEnvironmentCredentials = false,
+  ): Promise<void> {
+    const email = credentials?.email ?? (allowLegacyEnvironmentCredentials
+      ? this.configService.get<string>('DLVRIT_LOGIN_EMAIL') ?? ''
+      : '');
+    const password = credentials?.password ?? (allowLegacyEnvironmentCredentials
+      ? this.configService.get<string>('DLVRIT_LOGIN_PASSWORD') ?? ''
+      : '');
 
     if (!email || !password) {
       throw new Error(
-        'dlvrit_credentials_missing: Set DLVRIT_LOGIN_EMAIL and DLVRIT_LOGIN_PASSWORD in .env.',
+        'dlvrit_credentials_missing: This workspace needs reconnection. Use Connect dlvr.it and enter its own credentials again.',
       );
     }
 
@@ -166,8 +210,7 @@ export class DlvritSessionService {
 
   private async saveDebugScreenshot(page: Page, label: string): Promise<void> {
     try {
-      const dir = this.resolveUserDataDir();
-      const file = path.join(dir, `debug-${label}-${Date.now()}.png`);
+      const file = path.join(this.resolveBaseDir(), `debug-${label}-${Date.now()}.png`);
       await page.screenshot({ path: file, fullPage: true });
       this.logger.log(`Screenshot: ${file}`);
     } catch {
@@ -175,9 +218,9 @@ export class DlvritSessionService {
     }
   }
 
-  private wipeBrowserCookies(): void {
+  private wipeBrowserCookies(workspaceId: string): void {
     try {
-      const dir = this.resolveUserDataDir();
+      const dir = this.resolveUserDataDir(workspaceId);
       for (const f of ['Default/Cookies', 'Default/Cookies-journal']) {
         const p = path.join(dir, f);
         if (fs.existsSync(p)) fs.unlinkSync(p);
@@ -190,44 +233,51 @@ export class DlvritSessionService {
 
   // ── Persistence ─────────────────────────────────────────────────────────────
 
-  private store(value: string): void {
-    this.cachedCookie = value;
-    this.cachedAt = Date.now();
+  private store(workspaceId: string, value: string): void {
+    const cachedAt = Date.now();
+    this.sessions.set(workspaceId, { cookie: value, cachedAt });
     try {
       fs.writeFileSync(
-        this.sessionFilePath(),
-        JSON.stringify({ value, storedAt: this.cachedAt }),
+        this.sessionFilePath(workspaceId),
+        JSON.stringify({ value, storedAt: cachedAt }),
       );
     } catch {
       // non-fatal
     }
   }
 
-  private loadFromDisk(): void {
+  private loadFromDisk(workspaceId: string): { cookie: string; cachedAt: number } | null {
     try {
-      const raw = fs.readFileSync(this.sessionFilePath(), 'utf8');
+      const raw = fs.readFileSync(this.sessionFilePath(workspaceId), 'utf8');
       const { value, storedAt } = JSON.parse(raw) as { value: string; storedAt: number };
       if (value && Date.now() - storedAt < this.CACHE_TTL_MS) {
-        this.cachedCookie = value;
-        this.cachedAt = storedAt;
-        this.logger.log('dlvr.it session loaded from disk.');
+        const session = { cookie: value, cachedAt: storedAt };
+        this.sessions.set(workspaceId, session);
+        this.logger.log(`dlvr.it session loaded for workspace ${workspaceId}.`);
+        return session;
       }
     } catch {
       // no session file yet
     }
+    return null;
   }
 
-  private sessionFilePath(): string {
-    const dir =
-      this.configService.get<string>('DLVRIT_USER_DATA_DIR') ??
-      path.join(process.cwd(), 'artifacts', 'dlvrit-user-data');
-    return path.join(dir, SESSION_FILE);
+  private sessionFilePath(workspaceId: string): string {
+    return path.join(this.resolveUserDataDir(workspaceId), SESSION_FILE);
   }
 
-  private resolveUserDataDir(): string {
-    const dir =
+  private resolveBaseDir(): string {
+    return (
       this.configService.get<string>('DLVRIT_USER_DATA_DIR') ??
-      path.join(process.cwd(), 'artifacts', 'dlvrit-user-data');
+      path.join(process.cwd(), 'artifacts', 'dlvrit-user-data')
+    );
+  }
+
+  private resolveUserDataDir(workspaceId: string): string {
+    const safeWorkspaceId = workspaceId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const dir = workspaceId === 'legacy'
+      ? this.resolveBaseDir()
+      : path.join(this.resolveBaseDir(), 'workspaces', safeWorkspaceId);
     fs.mkdirSync(dir, { recursive: true });
     return dir;
   }

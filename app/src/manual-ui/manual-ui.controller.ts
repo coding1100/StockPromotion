@@ -23,6 +23,7 @@ type ManualUiPublishBody = {
   discordPassword?: string;
   stocktwitsSymbol?: string;
   stocktwitsAccountHandle?: string;
+  stocktwitsAccountId?: string;
   stocktwitsUsername?: string;
   stocktwitsPassword?: string;
   stocktwitsProxy?: string;
@@ -39,7 +40,17 @@ type ManualUiProxyTestBody = {
 type UpsertDlvritAccountBody = {
   accountHandle: string;
   dlvritAccountId: number;
+  dlvritWorkspaceId?: string;
 };
+
+type StocktwitsCampaignBody = {
+  symbols?: string[];
+  templates?: string[];
+  postCount?: number;
+  dlvritWorkspaceIds?: string[];
+};
+
+type LoginDlvritWorkspaceBody = { label?: string; email?: string; password?: string };
 
 @Controller('manual-ui')
 @Public()
@@ -78,6 +89,7 @@ export class ManualUiController {
     const account = await this.publishingService.upsertDlvritAccount(
       body.accountHandle.trim(),
       Number(body.dlvritAccountId),
+      body.dlvritWorkspaceId || null,
     );
     return { success: true, account };
   }
@@ -119,10 +131,51 @@ export class ManualUiController {
     }
   }
 
+  @Get('dlvrit-workspaces')
+  async listDlvritWorkspaces(): Promise<Record<string, unknown>> {
+    return { workspaces: await this.publishingService.listDlvritWorkspaces() };
+  }
+
+  @Post('dlvrit-workspaces/login')
+  async loginDlvritWorkspace(
+    @Body() body: LoginDlvritWorkspaceBody,
+  ): Promise<Record<string, unknown>> {
+    try {
+      const workspace = await this.publishingService.loginDlvritWorkspace({
+        label: body.label,
+        email: body.email ?? '',
+        password: body.password ?? '',
+      });
+      return { success: true, workspace };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : 'unknown error' };
+    }
+  }
+
+  @Post('dlvrit-workspaces/:id/refresh')
+  async refreshDlvritWorkspace(@Param('id') id: string): Promise<Record<string, unknown>> {
+    try {
+      const workspace = await this.publishingService.refreshDlvritWorkspace(id);
+      return { success: true, workspace };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : 'unknown error' };
+    }
+  }
+
+  @Get('dlvrit-workspaces/:id/accounts')
+  async listDlvritWorkspaceAccounts(@Param('id') id: string): Promise<Record<string, unknown>> {
+    try {
+      const accounts = await this.publishingService.listDlvritConnectedAccounts(id);
+      return { success: true, accounts };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : 'unknown error' };
+    }
+  }
+
   @Get('dlvrit-connected-accounts')
   async listDlvritConnectedAccounts(): Promise<Record<string, unknown>> {
     try {
-      const accounts = await this.publishingService.listDlvritConnectedAccounts();
+      const accounts = await this.publishingService.listAllDlvritConnectedAccounts();
       return { success: true, accounts };
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : 'unknown error' };
@@ -132,6 +185,23 @@ export class ManualUiController {
   @Get('dlvrit-connected-accounts/raw')
   async listDlvritConnectedAccountsRaw(): Promise<unknown> {
     return this.publishingService.listDlvritConnectedAccountsRaw();
+  }
+
+  @Post('stocktwits-campaigns')
+  async createStocktwitsCampaign(
+    @Body() body: StocktwitsCampaignBody,
+  ): Promise<Record<string, unknown>> {
+    return this.publishingService.scheduleStocktwitsCsvCampaign({
+      symbols: Array.isArray(body.symbols) ? body.symbols : [],
+      templates: Array.isArray(body.templates) ? body.templates : [],
+      postCount:
+        Number.isInteger(body.postCount) && Number(body.postCount) > 0
+          ? Number(body.postCount)
+          : undefined,
+      dlvritWorkspaceIds: Array.isArray(body.dlvritWorkspaceIds)
+        ? body.dlvritWorkspaceIds.filter(Boolean)
+        : undefined,
+    });
   }
 
   // ── UI ───────────────────────────────────────────────────────────────────────
@@ -145,6 +215,13 @@ export class ManualUiController {
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Publisher — Stock Promotion</title>
+  <script>
+    (() => {
+      const saved = localStorage.getItem('publisher-theme');
+      const dark = saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    })();
+  </script>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     :root{
@@ -352,10 +429,157 @@ export class ManualUiController {
     .cooldown-fill{height:100%;background:linear-gradient(90deg,#10b981,#34d399);
       border-radius:4px;transition:width .3s linear}
 
+    /* ── Operations workspace theme ── */
+    :root{
+      --st:#176b4d;--st-dk:#10533b;--dc:#334155;--dc-dk:#1e293b;
+      --bg:#f3f5f1;--surf:#fff;--bdr:#dfe4dd;
+      --tx:#18221d;--tx2:#58645e;--tx3:#849089;
+      --r:14px;--sh:0 1px 2px rgba(20,35,27,.04),0 10px 30px rgba(20,35,27,.035)
+    }
+    body{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      background:var(--bg);letter-spacing:-.005em}
+    .app-bar{height:68px;padding:0 max(28px,calc((100vw - 1180px)/2));gap:18px;
+      background:#17211c;border:0;color:#fff;position:sticky}
+    .app-logo{font-size:15px;color:#fff;letter-spacing:-.01em}
+    .brand-copy{display:flex;flex-direction:column;line-height:1.15}
+    .brand-copy small{margin-top:4px;color:#91a198;font-size:10px;font-weight:600;
+      letter-spacing:.14em;text-transform:uppercase}
+    .app-bar-right{color:#91a198;font-size:11px;text-transform:uppercase;letter-spacing:.1em}
+    .signout-btn{border:1px solid #3a4740;background:transparent;border-radius:8px;
+      padding:7px 13px;font-size:12px;font-weight:650;color:#d9e1dc;cursor:pointer;font-family:inherit}
+    .signout-btn:hover{border-color:#617069;color:#fff}
+    .tab-nav{padding:0 max(28px,calc((100vw - 1180px)/2));gap:6px;background:#fff}
+    .tab-btn{padding:15px 16px 13px;border-bottom-width:2px;color:#66736c}
+    .tab-btn.active[data-tab="stocktwits"],.tab-btn.active[data-tab="discord"]{
+      color:var(--st);border-bottom-color:var(--st)}
+    .page{max-width:1180px;padding:40px 28px 90px}
+    .page-intro{display:flex;justify-content:space-between;align-items:flex-end;gap:32px;margin-bottom:26px}
+    .eyebrow{font-size:10px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--st)}
+    .page-intro h1{font-size:30px;line-height:1.12;letter-spacing:-.035em;margin:7px 0 9px;font-weight:720}
+    .page-intro p{max-width:650px;color:var(--tx2);font-size:14px}
+    .status-cluster{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    .status-pill{display:inline-flex;align-items:center;gap:7px;background:#fff;border:1px solid var(--bdr);
+      border-radius:999px;padding:7px 11px;font-size:11px;font-weight:700;color:var(--tx2)}
+    .status-pill::before{content:'';width:7px;height:7px;border-radius:50%;background:#2b8a63;
+      box-shadow:0 0 0 3px #e5f3ec}
+    .workflow{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--bdr);
+      background:#fff;border-radius:12px;margin-bottom:20px;overflow:hidden}
+    .workflow-step{padding:15px 18px;display:flex;align-items:center;gap:12px;border-right:1px solid var(--bdr)}
+    .workflow-step:last-child{border-right:0}
+    .step-no{width:25px;height:25px;display:grid;place-items:center;border-radius:7px;background:#edf4ef;
+      color:var(--st);font-size:11px;font-weight:800}
+    .step-copy strong{display:block;font-size:12px}.step-copy span{font-size:11px;color:var(--tx3)}
+    .stack{display:flex;flex-direction:column;gap:20px}.stack>*+*{margin-top:0}
+    .campaign-card{order:1;border-top:3px solid var(--st)}
+    .workspace-card{order:0}.compose-card{order:2}.accounts-card{order:3}
+    .workspace-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+    .workspace-item{border:1px solid var(--bdr);border-radius:10px;padding:14px;background:rgba(255,255,255,.3)}
+    .workspace-item-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+    .workspace-item strong{font-size:13px}.workspace-item p{font-size:11px;color:var(--tx3);margin:4px 0 10px}
+    .workspace-actions{display:flex;gap:7px;align-items:center}
+    .workspace-choice{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+    .workspace-choice label{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid var(--bdr);
+      border-radius:8px;text-transform:none;letter-spacing:0;background:rgba(255,255,255,.25);cursor:pointer}
+    .card{box-shadow:var(--sh);border-color:var(--bdr)}
+    .card-head{padding:20px 24px;background:#fcfdfb}
+    .card-title{font-size:15px}.card-sub{font-size:12px;color:#748079;margin-top:3px}
+    .card-icon{background:#e8f2ec;color:var(--st);font-size:10px;font-weight:800;letter-spacing:.04em}
+    .ic-dc{background:#eef1f3;color:#334155}
+    .card-body{padding:26px 24px}
+    label{color:#526059;letter-spacing:.075em}
+    input[type=text],input[type=email],input[type=password],input[type=number],select,textarea{
+      border:1px solid #d7ddd8;border-radius:9px;padding:11px 12px;background:#fdfefd}
+    input:focus,select:focus,textarea:focus{border-color:var(--st);box-shadow:0 0 0 3px rgba(23,107,77,.1);background:#fff}
+    input[type=file]{width:100%;border:1px dashed #c9d2cc;border-radius:9px;padding:9px;background:#f8faf7;color:var(--tx2)}
+    input[type=file]::file-selector-button{border:0;border-radius:6px;background:#e7efe9;color:#315846;
+      padding:7px 10px;margin-right:10px;font-weight:700;cursor:pointer}
+    .creds{background:#f7f9f6;border-color:#dce2dd}
+    .sep::before,.sep::after{background:#e5e9e5}
+    .btn{border-radius:8px;font-weight:680}.btn:hover:not(:disabled){opacity:1;filter:brightness(.95)}
+    .btn-st,.btn-ok{background:var(--st)}.btn-dc,.btn-blue{background:#26342d}
+    .btn-ghost{background:#fff;border:1px solid #d5dcd7;color:#48554e}
+    .pub-foot{background:#f8faf7;padding:17px 24px}.pub-status{color:#758179}
+    .bulk-bar{background:#eef6f1;color:var(--st);border-color:#d5e8dc}
+    .table-scroll{overflow-x:auto}
+    .acc-table{min-width:800px}.acc-table th{background:#f7f9f6;color:#758078}
+    .acc-table tr.sel td{background:#edf6f0}.acc-table tr:hover:not(.sel) td{background:#fafcf9}
+    .acc-table input[type=checkbox]{accent-color:var(--st)}
+    .account-note{padding:13px 24px;border-top:1px solid var(--bdr);background:#f8faf7}
+    .account-note p{font-size:12px;color:var(--tx3);margin:0}
+    .res-head,pre.res-body{background:#17211c}
+    .cooldown-fill{background:var(--st)}
+
+    /* ── Glass surface and theme modes ── */
+    body{
+      background:
+        radial-gradient(circle at 8% 4%,rgba(53,131,96,.11),transparent 28rem),
+        radial-gradient(circle at 92% 14%,rgba(182,155,94,.08),transparent 25rem),
+        var(--bg);
+      background-attachment:fixed
+    }
+    .app-bar{background:rgba(23,33,28,.91);backdrop-filter:blur(18px) saturate(130%);
+      -webkit-backdrop-filter:blur(18px) saturate(130%);box-shadow:0 1px 0 rgba(255,255,255,.05)}
+    .tab-nav{position:sticky;top:68px;z-index:50;background:rgba(255,255,255,.78);
+      backdrop-filter:blur(16px) saturate(135%);-webkit-backdrop-filter:blur(16px) saturate(135%)}
+    .card,.workflow,.status-pill{background:rgba(255,255,255,.77);
+      backdrop-filter:blur(18px) saturate(125%);-webkit-backdrop-filter:blur(18px) saturate(125%);
+      box-shadow:0 1px 1px rgba(20,35,27,.03),0 14px 38px rgba(20,35,27,.06),inset 0 1px rgba(255,255,255,.55)}
+    .card-head{background:rgba(250,252,249,.58)}
+    .theme-toggle{width:36px;height:36px;display:grid;place-items:center;border-radius:9px;
+      border:1px solid #3a4740;background:rgba(255,255,255,.03);color:#dbe4df;cursor:pointer;
+      transition:background .18s,border-color .18s,transform .18s}
+    .theme-toggle:hover{background:rgba(255,255,255,.09);border-color:#66756d;transform:translateY(-1px)}
+    .theme-toggle svg{width:16px;height:16px}.theme-toggle .moon{display:none}
+    html[data-theme="dark"]{
+      color-scheme:dark;
+      --bg:#101612;--surf:#18201c;--bdr:#344039;
+      --tx:#ecf2ee;--tx2:#b3c0b9;--tx3:#8f9d95;
+      --st:#55b98b;--st-dk:#78cba5;--sh:0 14px 42px rgba(0,0,0,.24)
+    }
+    html[data-theme="dark"] body{
+      background:radial-gradient(circle at 8% 4%,rgba(46,126,90,.18),transparent 30rem),
+        radial-gradient(circle at 94% 12%,rgba(153,125,66,.09),transparent 26rem),var(--bg)}
+    html[data-theme="dark"] .app-bar{background:rgba(11,17,14,.86)}
+    html[data-theme="dark"] .tab-nav{background:rgba(19,27,23,.8)}
+    html[data-theme="dark"] .card,html[data-theme="dark"] .workflow,
+    html[data-theme="dark"] .status-pill{background:rgba(25,34,29,.76);border-color:rgba(117,139,127,.27);
+      box-shadow:0 16px 42px rgba(0,0,0,.22),inset 0 1px rgba(255,255,255,.035)}
+    html[data-theme="dark"] .card-head,html[data-theme="dark"] .pub-foot,
+    html[data-theme="dark"] .account-note,html[data-theme="dark"] .acc-table th,
+    html[data-theme="dark"] .modal-ft{background:rgba(14,21,17,.42)}
+    html[data-theme="dark"] input[type=text],html[data-theme="dark"] input[type=email],
+    html[data-theme="dark"] input[type=password],html[data-theme="dark"] input[type=number],
+    html[data-theme="dark"] select,html[data-theme="dark"] textarea{
+      background:rgba(9,15,12,.52);border-color:#3c4942;color:var(--tx)}
+    html[data-theme="dark"] input[type=file],html[data-theme="dark"] .creds{
+      background:rgba(9,15,12,.4);border-color:#405048;color:var(--tx2)}
+    html[data-theme="dark"] input[type=file]::file-selector-button{background:#263a30;color:#cce4d7}
+    html[data-theme="dark"] input:focus,html[data-theme="dark"] select:focus,
+    html[data-theme="dark"] textarea:focus{background:#131c17;border-color:var(--st)}
+    html[data-theme="dark"] .btn-ghost{background:rgba(255,255,255,.025);border-color:#435048;color:#c2cec7}
+    html[data-theme="dark"] .ic-st,html[data-theme="dark"] .card-icon,
+    html[data-theme="dark"] .step-no{background:#203a2e;color:#70c69d}
+    html[data-theme="dark"] .ic-dc{background:#29332e;color:#b7c3bc}
+    html[data-theme="dark"] .acc-table tr:hover:not(.sel) td{background:rgba(86,121,101,.09)}
+    html[data-theme="dark"] .acc-table tr.sel td{background:rgba(42,128,86,.13)}
+    html[data-theme="dark"] .acc-table td{border-bottom-color:rgba(110,132,120,.18)}
+    html[data-theme="dark"] .tab-btn{color:#8e9d95}
+    html[data-theme="dark"] code{background:#25302a!important;color:#d6e2db}
+    html[data-theme="dark"] .modal{background:#19221d;border:1px solid #3a463f}
+    html[data-theme="dark"] .workspace-item,html[data-theme="dark"] .workspace-choice label{background:rgba(6,12,9,.25)}
+    html[data-theme="dark"] .theme-toggle .sun{display:none}
+    html[data-theme="dark"] .theme-toggle .moon{display:block}
+    @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
     @media(max-width:640px){
       .app-bar,.tab-nav{padding:0 14px}
-      .page{padding:16px 10px 60px}
+      .app-bar-right{display:none}.brand-copy small{display:none}
+      .page{padding:24px 12px 60px}
+      .page-intro{display:block}.page-intro h1{font-size:25px}.status-cluster{justify-content:flex-start;margin-top:18px}
+      .workflow{grid-template-columns:1fr}.workflow-step{border-right:0;border-bottom:1px solid var(--bdr)}
+      .workflow-step:last-child{border-bottom:0}
       .card-head,.card-body,.pub-foot{padding:14px}
+      .card-head{align-items:flex-start;gap:12px;flex-direction:column}
       .row2{grid-template-columns:1fr}
       .acc-table th:nth-child(3),.acc-table td:nth-child(3){display:none}
     }
@@ -371,12 +595,15 @@ export class ManualUiController {
       <path d="M7 20L13 9l6 11" stroke="#e2e8f0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
       <path d="M9.5 16h7" stroke="#10b981" stroke-width="2.2" stroke-linecap="round"/>
     </svg>
-    Stock Promotion
+    <span class="brand-copy">Stock Promotion<small>Publishing Operations</small></span>
   </a>
-  <span class="app-bar-right">Manual Publisher</span>
+  <span class="app-bar-right">Operator workspace</span>
+  <button id="theme-toggle" class="theme-toggle" type="button" onclick="toggleTheme()" aria-label="Switch to dark mode" title="Switch color theme">
+    <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></svg>
+    <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+  </button>
   <form method="post" action="/api/manual-ui/logout" style="margin:0">
-    <button type="submit" style="border:1px solid var(--bdr);background:none;border-radius:8px;
-      padding:6px 14px;font-size:12px;font-weight:600;color:var(--tx2);cursor:pointer;font-family:inherit">
+    <button type="submit" class="signout-btn">
       Sign out
     </button>
   </form>
@@ -400,12 +627,42 @@ export class ManualUiController {
 
 <main class="page">
 
+  <section class="page-intro">
+    <div>
+      <div class="eyebrow">Campaign workspace</div>
+      <h1>Publishing control center</h1>
+      <p>Prepare symbol campaigns, coordinate connected accounts, and control every outbound post from one focused workspace.</p>
+    </div>
+    <div class="status-cluster" aria-label="Publishing status">
+      <span class="status-pill">dlvr.it connected</span>
+      <span class="status-pill">90 sec cadence</span>
+    </div>
+  </section>
+
   <!-- ══════════════════════════ STOCKTWITS TAB ══════════════════════════ -->
   <div id="tab-stocktwits" class="tab-pane on">
+    <div class="workflow" aria-label="Campaign workflow">
+      <div class="workflow-step"><span class="step-no">01</span><span class="step-copy"><strong>Import symbols</strong><span>Upload and validate ticker CSV</span></span></div>
+      <div class="workflow-step"><span class="step-no">02</span><span class="step-copy"><strong>Build posts</strong><span>Mix templates with unique tickers</span></span></div>
+      <div class="workflow-step"><span class="step-no">03</span><span class="step-copy"><strong>Queue campaign</strong><span>Rotate accounts automatically</span></span></div>
+    </div>
     <div class="stack">
 
+      <div class="card workspace-card">
+        <div class="card-head">
+          <div class="card-title">
+            <div class="card-icon ic-st">DL</div>
+            <div>dlvr.it Workspaces<div class="card-sub">Keep independent sessions and their StockTwits routes separated</div></div>
+          </div>
+          <button class="btn btn-st btn-sm" onclick="openWorkspaceModal()">+ Connect dlvr.it</button>
+        </div>
+        <div class="card-body">
+          <div id="workspace-grid" class="workspace-grid"><div class="hint">Loading connected workspaces…</div></div>
+        </div>
+      </div>
+
       <!-- Compose card -->
-      <div class="card">
+      <div class="card compose-card">
         <div class="card-head">
           <div class="card-title">
             <div class="card-icon ic-st">
@@ -426,7 +683,6 @@ export class ManualUiController {
             <textarea id="st-body" placeholder="Write your market insight here…" oninput="charCount('st-body','st-cc',280)"></textarea>
             <div><span id="st-cc" class="char-ct">0 / 280</span></div>
           </div>
-
           <div class="row2">
             <div>
               <label for="st-symbol">Symbol</label>
@@ -487,8 +743,53 @@ export class ManualUiController {
         </div>
       </div>
 
+      <!-- CSV campaign card -->
+      <div class="card campaign-card">
+        <div class="card-head">
+          <div class="card-title">
+            <div class="card-icon ic-st">CSV</div>
+            <div>
+              One-click Symbol Campaign
+              <div class="card-sub">Upload symbols, mix 2–3 per post, rotate accounts, and publish every 90 seconds</div>
+            </div>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="row2">
+            <div class="field" style="margin-top:0">
+              <label for="campaign-csv">Ticker CSV</label>
+              <input id="campaign-csv" type="file" accept=".csv,text/csv" onchange="readCampaignCsv(this.files[0])"/>
+              <div id="campaign-csv-info" class="hint">First column or a column named symbol/ticker is used. Duplicates are removed.</div>
+            </div>
+            <div class="field" style="margin-top:0">
+              <label for="campaign-count">Total posts <span class="lbl-opt">optional</span></label>
+              <input id="campaign-count" type="number" min="1" placeholder="Auto-calculate"/>
+              <div class="hint">Must allow 2–3 unique tickers in every post.</div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="campaign-templates">Post templates <span class="lbl-opt">separate templates with a blank line</span></label>
+            <textarea id="campaign-templates" class="tall" placeholder="Watching {{symbols}} for momentum and volume confirmation.\n\nFresh market setup across {{tickers}} — keeping these names on radar."></textarea>
+            <div class="hint">Use <code>{{symbols}}</code> or <code>{{tickers}}</code> where cashtags should appear. Templates rotate automatically.</div>
+          </div>
+          <div class="field">
+            <label>Publishing workspaces <span class="lbl-opt">all active workspaces by default</span></label>
+            <div id="campaign-workspaces" class="workspace-choice"><span class="hint">Loading workspaces…</span></div>
+          </div>
+          <div id="campaign-preview" class="hint"></div>
+        </div>
+        <div class="pub-foot">
+          <button id="campaign-btn" class="btn btn-st btn-lg" onclick="scheduleCampaign()">Schedule Entire Campaign</button>
+          <span id="campaign-status" class="pub-status"></span>
+        </div>
+        <div id="campaign-res-wrap" class="res-wrap" style="display:none">
+          <div class="res-head" onclick="toggleRes('campaign')"><span>&#9660; Campaign schedule</span></div>
+          <pre id="campaign-res" class="res-body"></pre>
+        </div>
+      </div>
+
       <!-- Account management card -->
-      <div class="card">
+      <div class="card accounts-card">
         <div class="card-head">
           <div class="card-title">
             <div class="card-icon ic-st">
@@ -499,7 +800,7 @@ export class ManualUiController {
             </div>
             <div>
               dlvr.it Accounts
-              <div class="card-sub">Stocktwits accounts linked to dlvr.it routes</div>
+              <div class="card-sub">All social accounts currently linked to your dlvr.it account</div>
             </div>
           </div>
           <div style="display:flex;gap:8px">
@@ -519,25 +820,27 @@ export class ManualUiController {
           <button class="btn btn-ghost btn-sm" onclick="clearSel()">Clear</button>
         </div>
 
-        <table class="acc-table">
+        <div class="table-scroll"><table class="acc-table">
           <thead>
             <tr>
               <th><input type="checkbox" id="sel-all" title="Select all" onchange="toggleAll(this)"/></th>
               <th>Handle</th>
-              <th>dlvr.it Route ID</th>
-              <th>Status</th>
+              <th>dlvr.it Login</th>
+              <th>dlvr.it Account ID</th>
+              <th>dlvr.it Status</th>
+              <th>App Status</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody id="acc-body">
-            <tr><td colspan="5"><div class="empty"><div class="empty-ico">⏳</div><p>Loading…</p></div></td></tr>
+            <tr><td colspan="7"><div class="empty"><div class="empty-ico">⏳</div><p>Loading…</p></div></td></tr>
           </tbody>
-        </table>
+        </table></div>
 
-        <div style="padding:12px 24px;border-top:1px solid var(--bdr);background:#fafafa">
-          <p style="font-size:12px;color:var(--tx3);margin:0">
-            Create a Route in <strong>dlvrit.com</strong> pointing to StockTwits, then click
-            <strong>+ Add Account</strong> and use <strong>Fetch from dlvr.it</strong> to pick the Route ID.
+        <div class="account-note">
+          <p>
+            Accounts linked in <strong>dlvr.it</strong> appear here automatically. Use
+            <strong>Add to App</strong> to enable an account for publishing from this dashboard.
           </p>
         </div>
       </div>
@@ -631,6 +934,21 @@ export class ManualUiController {
 
 </main>
 
+<!-- ── Connect dlvr.it workspace modal ─────────────────────────────── -->
+<div class="overlay" id="workspace-overlay" onclick="if(event.target===this)closeWorkspaceModal()">
+  <div class="modal">
+    <div class="modal-hd"><h2>Connect dlvr.it account</h2><button class="modal-x" onclick="closeWorkspaceModal()" title="Close">&#x2715;</button></div>
+    <div class="modal-bd">
+      <div class="field"><label for="ws-label">Workspace label <span class="lbl-opt">optional</span></label><input id="ws-label" type="text" placeholder="e.g. Main portfolio"/></div>
+      <div class="field"><label for="ws-email">dlvr.it email</label><input id="ws-email" type="email" autocomplete="username" placeholder="name@example.com"/></div>
+      <div class="field"><label for="ws-password">dlvr.it password</label><input id="ws-password" type="password" autocomplete="current-password"/></div>
+      <div class="hint">The password is used only during this login and is not stored. Each account gets its own isolated browser profile and session cookie.</div>
+      <div class="modal-err" id="workspace-err"></div>
+    </div>
+    <div class="modal-ft"><button class="btn btn-ghost" onclick="closeWorkspaceModal()">Cancel</button><button id="workspace-login-btn" class="btn btn-ok" onclick="loginWorkspace()">Connect & discover accounts</button></div>
+  </div>
+</div>
+
 <!-- ── Add / Edit Account Modal ──────────────────────────────────────── -->
 <div class="overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
   <div class="modal">
@@ -644,14 +962,18 @@ export class ManualUiController {
         <input id="m-handle" type="text" placeholder="e.g. myaccount" autocomplete="off"/>
       </div>
       <div class="field">
-        <label for="m-id">dlvr.it Route ID</label>
+        <label for="m-workspace">dlvr.it Login</label>
+        <select id="m-workspace"><option value="">Default / legacy session</option></select>
+      </div>
+      <div class="field">
+        <label for="m-id">dlvr.it Account ID</label>
         <div style="display:flex;gap:8px;align-items:flex-start">
           <input id="m-id" type="number" placeholder="e.g. 2676570" autocomplete="off" style="flex:1"/>
           <button type="button" class="btn btn-ghost" id="fetch-btn" onclick="fetchDlvrit()">Fetch from dlvr.it</button>
         </div>
-        <div class="hint">Click <strong>Fetch from dlvr.it</strong> to load your routes, or enter the ID manually from dlvrit.com.</div>
+        <div class="hint">Click <strong>Fetch from dlvr.it</strong> to load linked accounts, or enter the account ID manually.</div>
         <div id="dlvrit-picker" style="display:none;margin-top:10px">
-          <label style="font-size:12px;color:var(--tx3);margin-bottom:4px;display:block">Pick a route:</label>
+          <label style="font-size:12px;color:var(--tx3);margin-bottom:4px;display:block">Pick an account:</label>
           <select id="dlvrit-select" style="width:100%" onchange="onRouteSelect(this)">
             <option value="">— select —</option>
           </select>
@@ -752,6 +1074,70 @@ export class ManualUiController {
     el.style.display = el.style.display === 'none' ? 'block' : 'none';
   }
 
+  // ── One-click CSV campaign ───────────────────────────────────────────
+  let campaignSymbols = [];
+
+  function parseCsvLine(line) {
+    const cells = []; let value = ''; let quoted = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"' && line[i + 1] === '"' && quoted) { value += '"'; i++; }
+      else if (ch === '"') quoted = !quoted;
+      else if (ch === ',' && !quoted) { cells.push(value.trim()); value = ''; }
+      else value += ch;
+    }
+    cells.push(value.trim()); return cells;
+  }
+
+  async function readCampaignCsv(file) {
+    if (!file) return;
+    const lines = (await file.text()).split(/\\r?\\n/).filter(line => line.trim());
+    if (!lines.length) { toast('CSV is empty.', 'err'); return; }
+    const first = parseCsvLine(lines[0]);
+    const headerIndex = first.findIndex(value => /^(symbol|ticker|tickers)$/i.test(value.trim()));
+    const column = headerIndex >= 0 ? headerIndex : 0;
+    const dataLines = headerIndex >= 0 ? lines.slice(1) : lines;
+    campaignSymbols = Array.from(new Set(dataLines
+      .map(line => (parseCsvLine(line)[column] || '').replace(/^\\$/, '').trim().toUpperCase())
+      .filter(value => /^[A-Z][A-Z0-9.-]{0,9}$/.test(value))));
+    const min = Math.ceil(campaignSymbols.length / 3);
+    const max = Math.floor(campaignSymbols.length / 2);
+    document.getElementById('campaign-csv-info').textContent =
+      campaignSymbols.length + ' unique symbols loaded.';
+    document.getElementById('campaign-preview').textContent = campaignSymbols.length >= 2
+      ? 'Campaign can contain ' + min + '–' + max + ' posts. Auto mode creates ' + min + '.'
+      : 'At least two valid symbols are required.';
+  }
+
+  async function scheduleCampaign() {
+    const templates = document.getElementById('campaign-templates').value
+      .split(/\\n\\s*\\n/).map(value => value.trim()).filter(Boolean);
+    const countRaw = document.getElementById('campaign-count').value.trim();
+    if (campaignSymbols.length < 2) { toast('Upload a CSV with at least two symbols.', 'err'); return; }
+    if (!templates.length) { toast('Add at least one post template.', 'err'); return; }
+    const btn = document.getElementById('campaign-btn');
+    const status = document.getElementById('campaign-status');
+    btn.disabled = true; status.textContent = 'Creating posts and scheduling account rotation…';
+    hideRes('campaign');
+    try {
+      const res = await fetch(base + '/stocktwits-campaigns', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbols: campaignSymbols,
+          templates,
+          postCount: countRaw ? Number(countRaw) : undefined,
+          dlvritWorkspaceIds: Array.from(document.querySelectorAll('input[name="campaign-workspace"]:checked')).map(el => el.value),
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok || json.statusCode >= 400) throw new Error(json.message || 'Campaign scheduling failed.');
+      showRes('campaign', JSON.stringify(json, null, 2));
+      toast(json.postCount + ' posts scheduled successfully.', 'ok');
+    } catch (e) {
+      showRes('campaign', '⚠ ' + e.message); toast(e.message, 'err');
+    } finally { btn.disabled = false; status.textContent = ''; }
+  }
+
   // ── StockTwits publish ────────────────────────────────────────────────
   async function pubST() {
     const bodyVal = document.getElementById('st-body').value.trim();
@@ -782,7 +1168,7 @@ export class ManualUiController {
     const payload = {
       body: bodyVal, platforms: ['stocktwits'],
       stocktwitsSymbol: (s => s ? (s.startsWith('$') ? s : '$' + s) : undefined)(document.getElementById('st-symbol').value.trim()),
-      stocktwitsAccountHandle: document.getElementById('st-account').value || undefined,
+      stocktwitsAccountId: document.getElementById('st-account').value || undefined,
       stocktwitsItems: items.length ? items : undefined,
     };
 
@@ -878,16 +1264,82 @@ export class ManualUiController {
     }
   }
 
+  // ── Multiple dlvr.it workspaces ─────────────────────────────────────
+  const workspaceOverlay = document.getElementById('workspace-overlay');
+  let dlvritWorkspaces = [];
+
+  function openWorkspaceModal() {
+    document.getElementById('workspace-err').style.display = 'none';
+    document.getElementById('ws-password').value = '';
+    workspaceOverlay.classList.add('on');
+    setTimeout(() => document.getElementById('ws-email').focus(), 80);
+  }
+  function closeWorkspaceModal() { workspaceOverlay.classList.remove('on'); }
+
+  async function loginWorkspace() {
+    const email = document.getElementById('ws-email').value.trim();
+    const password = document.getElementById('ws-password').value;
+    const label = document.getElementById('ws-label').value.trim();
+    const btn = document.getElementById('workspace-login-btn');
+    const err = document.getElementById('workspace-err');
+    if (!email || !password) { err.textContent = 'Email and password are required.'; err.style.display = 'block'; return; }
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Connecting…'; err.style.display = 'none';
+    try {
+      const res = await fetch(base + '/dlvrit-workspaces/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, label: label || undefined }),
+      });
+      const json = await res.json();
+      if (!json.success) { err.textContent = json.error || 'Login failed.'; err.style.display = 'block'; return; }
+      closeWorkspaceModal();
+      document.getElementById('ws-password').value = '';
+      await loadWorkspaces(); await loadAccounts();
+      toast('dlvr.it account connected and routes discovered.', 'ok');
+    } catch (e) { err.textContent = 'Network error: ' + e.message; err.style.display = 'block'; }
+    finally { btn.disabled = false; btn.textContent = 'Connect & discover accounts'; }
+  }
+
+  async function refreshWorkspace(id) {
+    try {
+      const res = await fetch(base + '/dlvrit-workspaces/' + encodeURIComponent(id) + '/refresh', { method: 'POST' });
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error || 'Refresh failed');
+      await loadWorkspaces(); await loadAccounts(); toast('Workspace refreshed.', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+  }
+
+  async function loadWorkspaces() {
+    const res = await fetch(base + '/dlvrit-workspaces');
+    const json = await res.json();
+    dlvritWorkspaces = json.workspaces || [];
+    const grid = document.getElementById('workspace-grid');
+    const choices = document.getElementById('campaign-workspaces');
+    const modalSelect = document.getElementById('m-workspace');
+    modalSelect.innerHTML = '<option value="">Default / legacy session</option>';
+    dlvritWorkspaces.forEach(ws => {
+      const option = document.createElement('option'); option.value = ws.id; option.textContent = ws.label + ' — ' + ws.email; modalSelect.appendChild(option);
+    });
+    if (!dlvritWorkspaces.length) {
+      grid.innerHTML = '<div class="empty" style="grid-column:1/-1;padding:20px"><p>No additional dlvr.it logins connected yet.</p></div>';
+      choices.innerHTML = '<span class="hint">The default dlvr.it session will be used.</span>';
+      return;
+    }
+    grid.innerHTML = dlvritWorkspaces.map(ws => '<div class="workspace-item"><div class="workspace-item-head"><strong>' + ws.label + '</strong><span class="badge ' + (ws.status === 'ACTIVE' ? 'b-ok' : 'b-warn') + '">' + ws.status.replaceAll('_',' ') + '</span></div><p>' + ws.email + ' · ' + ws._count.accounts + ' StockTwits route(s)</p><div class="workspace-actions"><button class="btn btn-ghost btn-sm" data-workspace="' + ws.id + '" onclick="refreshWorkspace(this.dataset.workspace)">Refresh routes</button></div></div>').join('');
+    choices.innerHTML = dlvritWorkspaces.filter(ws => ws.status === 'ACTIVE').map(ws => '<label><input type="checkbox" name="campaign-workspace" value="' + ws.id + '" checked/> ' + ws.label + '</label>').join('');
+  }
+
   // ── Modal ─────────────────────────────────────────────────────────────
   const overlay   = document.getElementById('modal-overlay');
   const mTitle    = document.getElementById('modal-title');
   const mHandle   = document.getElementById('m-handle');
   const mId       = document.getElementById('m-id');
+  const mWorkspace = document.getElementById('m-workspace');
   const mErr      = document.getElementById('modal-err');
   const mSaveBtn  = document.getElementById('modal-save');
 
-  function openModal(handle, rid) {
+  function openModal(handle, rid, workspaceId) {
     mHandle.value = handle || ''; mId.value = rid || '';
+    mWorkspace.value = workspaceId || '';
     mTitle.textContent = handle ? 'Edit Account' : 'Add Account';
     mErr.style.display = 'none';
     overlay.classList.add('on');
@@ -908,7 +1360,10 @@ export class ManualUiController {
     btn.disabled = true; btn.textContent = 'Loading…';
     err.style.display = 'none'; picker.style.display = 'none';
     try {
-      const res = await fetch(base + '/dlvrit-connected-accounts');
+      const workspaceId = mWorkspace.value;
+      const res = await fetch(workspaceId
+        ? base + '/dlvrit-workspaces/' + encodeURIComponent(workspaceId) + '/accounts'
+        : base + '/dlvrit-connected-accounts');
       const json = await res.json();
       if (!json.success) { err.textContent = json.error || 'Failed to fetch'; err.style.display = 'block'; return; }
       const accs = json.accounts || [];
@@ -940,7 +1395,7 @@ export class ManualUiController {
     try {
       const res = await fetch(base + '/accounts', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accountHandle: handle, dlvritAccountId: rid }),
+        body: JSON.stringify({ accountHandle: handle, dlvritAccountId: rid, dlvritWorkspaceId: mWorkspace.value || undefined }),
       });
       const json = await res.json();
       if (!json.success) { showMErr(json.error || 'Failed to save account.'); return; }
@@ -1016,58 +1471,111 @@ export class ManualUiController {
 
   async function loadAccounts() {
     try {
-      const res = await fetch(base + '/accounts');
-      const json = await res.json();
-      const accs = json.accounts || [];
+      const [localRes, linkedRes] = await Promise.all([
+        fetch(base + '/accounts'),
+        fetch(base + '/dlvrit-connected-accounts'),
+      ]);
+      const localJson = await localRes.json();
+      const linkedJson = await linkedRes.json();
+      const accs = localJson.accounts || [];
+      const linked = linkedJson.success ? (linkedJson.accounts || []) : [];
+      const routeKey = (workspaceId, routeId) => (workspaceId || 'legacy') + ':' + Number(routeId);
+      const localByDlvritId = new Map(
+        accs.filter(a => a.dlvritAccountId).map(a => [routeKey(a.dlvritWorkspaceId, a.dlvritAccountId), a]),
+      );
+      const linkedIds = new Set(linked.map(a => routeKey(a.workspaceId, a.id)));
 
       const prev = stAccSel.value;
       stAccSel.innerHTML = '<option value="">— Auto-select eligible account —</option>';
       accs.filter(a => a.status === 'ACTIVE' && a.dlvritAccountId).forEach(a => {
         const o = document.createElement('option');
-        o.value = a.accountHandle;
-        o.textContent = a.accountHandle + '  (Route: ' + a.dlvritAccountId + ')';
+        o.value = a.id;
+        o.textContent = a.accountHandle + ' — ' + (a.dlvritWorkspace?.label || 'Default dlvr.it') + ' (Route: ' + a.dlvritAccountId + ')';
         stAccSel.appendChild(o);
       });
       if (prev) stAccSel.value = prev;
 
       selAll.checked = false; selAll.indeterminate = false; bulkBar.classList.remove('on');
 
-      if (!accs.length) {
-        accBody.innerHTML = \`<tr><td colspan="5">
+      if (!linked.length && !accs.length) {
+        accBody.innerHTML = \`<tr><td colspan="7">
           <div class="empty">
             <div class="empty-ico">👤</div>
-            <p>No accounts yet.<br>Click <strong>+ Add Account</strong> to get started.</p>
+            <p>No linked dlvr.it accounts found.</p>
           </div>
         </td></tr>\`;
         return;
       }
 
-      accBody.innerHTML = accs.map(a => {
-        const bc = a.dlvritAccountId ? (a.status === 'ACTIVE' ? 'b-ok' : 'b-off') : 'b-warn';
-        const bl = a.dlvritAccountId ? (a.status === 'ACTIVE' ? 'Active' : 'Disabled') : 'Not configured';
-        const rid = a.dlvritAccountId
-          ? \`<code style="background:#f1f5f9;padding:2px 8px;border-radius:5px;font-size:12px;font-family:monospace">\${a.dlvritAccountId}</code>\`
+      const rows = linked.map(remote => ({ remote, local: localByDlvritId.get(routeKey(remote.workspaceId, remote.id)) }))
+        .concat(accs.filter(a => !a.dlvritAccountId || !linkedIds.has(routeKey(a.dlvritWorkspaceId, a.dlvritAccountId)))
+          .map(local => ({ remote: null, local })));
+
+      accBody.innerHTML = rows.map(row => {
+        const a = row.local;
+        const remote = row.remote;
+        const handle = remote?.name || a?.accountHandle || 'Unknown';
+        const dlvritId = remote?.id || a?.dlvritAccountId;
+        const workspaceId = remote?.workspaceId || a?.dlvritWorkspaceId || '';
+        const workspaceLabel = remote?.workspaceLabel || a?.dlvritWorkspace?.label || 'Default dlvr.it';
+        const remoteClass = remote ? (remote.needsReconnect || !remote.active ? 'b-warn' : 'b-ok') : 'b-off';
+        const remoteLabel = remote
+          ? (remote.needsReconnect ? 'Reconnect required' : (remote.active ? 'Linked & active' : 'Linked & inactive'))
+          : 'Not found in dlvr.it';
+        const appClass = a ? (a.status === 'ACTIVE' ? 'b-ok' : 'b-off') : 'b-warn';
+        const appLabel = a ? (a.status === 'ACTIVE' ? 'Ready' : 'Disabled') : 'Not added';
+        const rid = dlvritId
+          ? \`<code style="background:#f1f5f9;padding:2px 8px;border-radius:5px;font-size:12px;font-family:monospace">\${dlvritId}</code>\`
           : \`<span style="color:var(--tx3);font-style:italic">—</span>\`;
+        if (!a) {
+          return \`<tr>
+            <td></td>
+            <td><strong>\${handle}</strong></td>
+            <td><strong>\${workspaceLabel}</strong></td>
+            <td>\${rid}</td>
+            <td><span class="badge \${remoteClass}">\${remoteLabel}</span></td>
+            <td><span class="badge \${appClass}">\${appLabel}</span></td>
+            <td><button class="btn btn-sm btn-blue" onclick="openModal('\${handle}',\${dlvritId},'\${workspaceId}')">Add to App</button></td>
+          </tr>\`;
+        }
         const tog = a.status === 'ACTIVE'
           ? \`<button class="btn btn-sm btn-del" onclick="toggleAcc('\${a.id}','disable')">Disable</button>\`
           : \`<button class="btn btn-sm btn-ok" onclick="toggleAcc('\${a.id}','enable')">Enable</button>\`;
         return \`<tr>
           <td><input type="checkbox" data-id="\${a.id}" onchange="onRowCheck(this)"/></td>
-          <td><strong>\${a.accountHandle}</strong></td>
+          <td><strong>\${handle}</strong></td>
+          <td><strong>\${workspaceLabel}</strong></td>
           <td>\${rid}</td>
-          <td><span class="badge \${bc}">\${bl}</span></td>
+          <td><span class="badge \${remoteClass}">\${remoteLabel}</span></td>
+          <td><span class="badge \${appClass}">\${appLabel}</span></td>
           <td><div class="act-row">
-            <button class="btn btn-sm btn-blue" onclick="openModal('\${a.accountHandle}',\${a.dlvritAccountId||''})">Edit</button>
+            <button class="btn btn-sm btn-blue" onclick="openModal('\${handle}',\${dlvritId||''},'\${workspaceId}')">Edit</button>
             \${tog}
-            <button class="btn btn-sm btn-del" onclick="deleteSingle('\${a.id}','\${a.accountHandle}')">Delete</button>
+            <button class="btn btn-sm btn-del" onclick="deleteSingle('\${a.id}','\${handle}')">Delete</button>
           </div></td>
         </tr>\`;
       }).join('');
     } catch {
-      accBody.innerHTML = '<tr><td colspan="5" style="padding:16px;color:#ef4444;font-size:13px">Failed to load accounts.</td></tr>';
+      accBody.innerHTML = '<tr><td colspan="7" style="padding:16px;color:#ef4444;font-size:13px">Failed to load accounts.</td></tr>';
     }
   }
 
+  function syncThemeToggle() {
+    const dark = document.documentElement.dataset.theme === 'dark';
+    const btn = document.getElementById('theme-toggle');
+    btn.setAttribute('aria-label', dark ? 'Switch to light mode' : 'Switch to dark mode');
+    btn.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+  }
+
+  function toggleTheme() {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('publisher-theme', next);
+    syncThemeToggle();
+  }
+
+  syncThemeToggle();
+  loadWorkspaces();
   loadAccounts();
   checkSTCooldown();
 </script>
@@ -1094,6 +1602,7 @@ export class ManualUiController {
       body: body.body ?? '',
       stocktwitsSymbol: body.stocktwitsSymbol,
       stocktwitsAccountHandle: body.stocktwitsAccountHandle,
+      stocktwitsAccountId: body.stocktwitsAccountId,
       stocktwitsUsername: body.stocktwitsUsername,
       stocktwitsPassword: body.stocktwitsPassword,
       stocktwitsProxy: body.stocktwitsProxy,

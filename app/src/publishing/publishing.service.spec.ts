@@ -9,6 +9,7 @@ function createService() {
     },
     accountProfile: {
       findUnique: jest.fn(),
+      findFirst: jest.fn(),
     },
     telegramGroupCandidate: {
       findMany: jest.fn().mockResolvedValue([]),
@@ -394,6 +395,36 @@ describe('PublishingService manual direct publish', () => {
         body: 'Manual trading update for today',
         symbol: 'ORCL',
         publishToStocktwits: true,
+      }),
+    );
+  });
+
+  it('routes a selected StockTwits profile through its owning dlvr.it workspace', async () => {
+    const { service, mocks } = createService();
+    mocks.prisma.accountProfile.findFirst.mockResolvedValue({
+      id: 'stock-acct-workspace-2',
+      accountHandle: 'second-stocktwits',
+      dlvritAccountId: 991122,
+      dlvritWorkspaceId: 'dlvrit-workspace-2',
+    });
+    mocks.dlvritPublisher.postToAccount.mockResolvedValue({
+      externalPostId: 'dlvrit-post-2',
+      evidenceUri: '',
+    });
+
+    const result = await service.publishManualPost({
+      body: 'Workspace-specific market note',
+      stocktwitsSymbol: 'NVDA',
+      stocktwitsAccountId: 'stock-acct-workspace-2',
+      publishToStocktwits: true,
+      publishToDiscord: false,
+    });
+
+    expect(result.stocktwits.success).toBe(true);
+    expect(mocks.dlvritPublisher.postToAccount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dlvritAccountId: 991122,
+        dlvritWorkspaceId: 'dlvrit-workspace-2',
       }),
     );
   });
