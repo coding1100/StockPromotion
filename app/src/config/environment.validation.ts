@@ -263,6 +263,7 @@ export const envValidationSchema = Joi.object({
   DLVRIT_API_KEY: Joi.string().allow('').optional(),
   DLVRIT_SESSION_COOKIE: Joi.string().allow('').optional(),
   DLVRIT_USER_DATA_DIR: Joi.string().allow('').optional(),
+  DLVRIT_BROWSER_BINARY: Joi.string().allow('').optional(),
   DLVRIT_HEADLESS: Joi.string().allow('').optional(),
   DLVRIT_LOGIN_EMAIL: Joi.string().allow('').optional(),
   DLVRIT_LOGIN_PASSWORD: Joi.string().allow('').optional(),

@@ -4,7 +4,7 @@ import axios from 'axios';
 import { DlvritSessionService } from './dlvrit-session.service';
 
 const DLVRIT_POST_URL = 'https://api.dlvrit.com/2.0/post/postplus';
-const DLVRIT_ROUTES_URL = 'https://api.dlvrit.com/1/routes.json';
+const DLVRIT_SOCIALS_URL = 'https://api.dlvrit.com/2.0/social/list';
 
 // StockTwits content type key in dlvr.it's v2 API payload
 const DLVRIT_STOCKTWITS_CONTENT_KEY = '22';
@@ -17,6 +17,9 @@ export type DlvritPostResult = {
 export type DlvritRoute = {
   id: number;
   name: string;
+  active: boolean;
+  needsReconnect: boolean;
+  platformId: number | null;
 };
 
 @Injectable()
@@ -30,8 +33,8 @@ export class DlvritPublisher {
 
   // ── Session management ────────────────────────────────────────────────────
 
-  private async getSession(): Promise<string> {
-    const cookie = await this.sessionService.getSessionCookie();
+  private async getSession(workspaceId?: string): Promise<string> {
+    const cookie = await this.sessionService.getSessionCookie(workspaceId);
     return `dlvrit=${cookie}`;
   }
 
@@ -39,6 +42,7 @@ export class DlvritPublisher {
 
   async postToAccount(params: {
     dlvritAccountId: number;
+    dlvritWorkspaceId?: string | null;
     message: string;
     jobId: string;
   }): Promise<DlvritPostResult> {
@@ -52,14 +56,16 @@ export class DlvritPublisher {
       return { externalPostId: `dry-run-${params.jobId}`, evidenceUri: '' };
     }
 
-    const session = await this.getSession();
+    const session = await this.getSession(params.dlvritWorkspaceId ?? undefined);
 
     try {
       return await this.callPostPlus(session, params);
     } catch (err) {
       if (axios.isAxiosError(err) && err.response?.status === 401) {
         this.logger.warn('dlvr.it session expired — refreshing automatically…');
-        const fresh = await this.sessionService.refreshSession();
+        const fresh = await this.sessionService.refreshSession(
+          params.dlvritWorkspaceId ?? undefined,
+        );
         return this.callPostPlus(`dlvrit=${fresh}`, params);
       }
       throw err;
@@ -148,63 +154,53 @@ export class DlvritPublisher {
 
   // ── Route listing (for UI "Fetch from dlvr.it") ───────────────────────────
 
-  async listConnectedAccounts(): Promise<DlvritRoute[]> {
-    const apiKey = this.configService.get<string>('DLVRIT_API_KEY');
-    if (!apiKey) {
-      throw new Error('dlvrit_api_key_missing: DLVRIT_API_KEY is not configured.');
-    }
+  async listConnectedAccounts(workspaceId?: string): Promise<DlvritRoute[]> {
+    const data = await this.fetchConnectedSocials(workspaceId);
+    return data.map((r) => ({
+      id: Number(r.id),
+      name: String(r.name ?? ''),
+      active: Number(r.activeFlag) === 1,
+      needsReconnect: Number(r.sysActionFlag) !== 0,
+      platformId: r.psID == null ? null : Number(r.psID),
+    }));
+  }
 
-    const timeoutMs =
-      this.configService.get<number>('HTTP_REQUEST_TIMEOUT_MS') ?? 10_000;
+  async listConnectedAccountsRaw(workspaceId?: string): Promise<unknown> {
+    return this.fetchConnectedSocials(workspaceId);
+  }
 
-    type RoutesResponse = {
-      routes?: Array<{ id?: unknown; name?: unknown }>;
-      error?: { code?: number; message?: string };
-      status?: string | number;
-      message?: string;
-    };
+  private async fetchConnectedSocials(workspaceId?: string): Promise<
+    Array<{ id?: unknown; name?: unknown; [key: string]: unknown }>
+  > {
+    const timeoutMs = this.configService.get<number>('HTTP_REQUEST_TIMEOUT_MS') ?? 10_000;
+    const request = async (cookie: string) =>
+      axios.get<Array<{ id?: unknown; name?: unknown; [key: string]: unknown }>>(
+        DLVRIT_SOCIALS_URL,
+        {
+          headers: {
+            cookie: `dlvrit=${cookie}`,
+            origin: 'https://app.dlvrit.com',
+            referer: 'https://app.dlvrit.com/content/post',
+          },
+          timeout: timeoutMs,
+        },
+      );
 
-    let data: RoutesResponse;
     try {
-      const response = await axios.get<RoutesResponse>(DLVRIT_ROUTES_URL, {
-        params: { key: apiKey },
-        timeout: timeoutMs,
-      });
-      data = response.data;
+      const cookie = await this.sessionService.getSessionCookie(workspaceId);
+      return (await request(cookie)).data;
     } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 401) {
+        const fresh = await this.sessionService.refreshSession(workspaceId);
+        return (await request(fresh)).data;
+      }
       if (axios.isAxiosError(err)) {
-        const status = err.response?.status;
-        const body = err.response?.data;
         throw new Error(
-          `dlvrit_http_error: HTTP ${status ?? 'network'} from dlvr.it. ` +
-            `Body: ${JSON.stringify(body ?? err.message)}`,
+          `dlvrit_http_error: HTTP ${err.response?.status ?? 'network'} from dlvr.it. ` +
+            `Body: ${JSON.stringify(err.response?.data ?? err.message)}`,
         );
       }
       throw err;
     }
-
-    if (data.error) {
-      throw new Error(
-        `dlvrit_api_error (code ${data.error.code ?? 0}): "${data.error.message ?? 'unknown'}"`,
-      );
-    }
-
-    return (data.routes ?? []).map((r) => ({
-      id: Number(r.id),
-      name: String(r.name ?? ''),
-    }));
-  }
-
-  async listConnectedAccountsRaw(): Promise<unknown> {
-    const apiKey = this.configService.get<string>('DLVRIT_API_KEY');
-    if (!apiKey) {
-      throw new Error('dlvrit_api_key_missing: DLVRIT_API_KEY is not configured.');
-    }
-    const timeoutMs = this.configService.get<number>('HTTP_REQUEST_TIMEOUT_MS') ?? 10_000;
-    const response = await axios.get(DLVRIT_ROUTES_URL, {
-      params: { key: apiKey },
-      timeout: timeoutMs,
-    });
-    return response.data;
   }
 }

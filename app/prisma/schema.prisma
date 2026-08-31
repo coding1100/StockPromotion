@@ -141,6 +141,8 @@ model AccountProfile {
   healthScore            Float                  @default(1.0)
   config                 Json
   dlvritAccountId        Int?
+  dlvritWorkspaceId      String?
+  dlvritWorkspace        DlvritWorkspace?       @relation(fields: [dlvritWorkspaceId], references: [id], onDelete: SetNull)
   replacementRequestedAt DateTime?
   replacementNotes       String?
   lastSelectedAt         DateTime?
@@ -153,6 +155,20 @@ model AccountProfile {
   restrictionEvents      RestrictionEvent[]
 
   @@unique([platform, accountHandle])
+  @@unique([dlvritWorkspaceId, dlvritAccountId])
+  @@index([dlvritWorkspaceId])
+}
+
+model DlvritWorkspace {
+  id              String           @id @default(cuid())
+  label           String
+  email           String           @unique
+  status          String           @default("ACTIVE")
+  lastConnectedAt DateTime?
+  lastError       String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  accounts        AccountProfile[]
 }
 
 model AccountCredentialsRef {

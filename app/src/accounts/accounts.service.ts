@@ -831,6 +831,8 @@ export class AccountsService {
       id: string;
       accountHandle: string;
       dlvritAccountId: number | null;
+      dlvritWorkspaceId: string | null;
+      dlvritWorkspace: { id: string; label: string; email: string; status: string } | null;
       status: AccountStatus;
     }>
   > {
@@ -840,7 +842,9 @@ export class AccountsService {
         id: true,
         accountHandle: true,
         dlvritAccountId: true,
+        dlvritWorkspaceId: true,
         status: true,
+        dlvritWorkspace: { select: { id: true, label: true, email: true, status: true } },
       },
       orderBy: { accountHandle: 'asc' },
     });
@@ -850,6 +854,7 @@ export class AccountsService {
   async upsertDlvritAccount(
     accountHandle: string,
     dlvritAccountId: number,
+    dlvritWorkspaceId?: string | null,
   ): Promise<{ id: string; accountHandle: string; dlvritAccountId: number }> {
     const existing = await this.prisma.accountProfile.findUnique({
       where: {
@@ -863,7 +868,7 @@ export class AccountsService {
     if (existing) {
       const updated = await this.prisma.accountProfile.update({
         where: { id: existing.id },
-        data: { dlvritAccountId, status: AccountStatus.ACTIVE },
+        data: { dlvritAccountId, dlvritWorkspaceId: dlvritWorkspaceId ?? null, status: AccountStatus.ACTIVE },
       });
       return {
         id: updated.id,
@@ -877,6 +882,7 @@ export class AccountsService {
         platform: AccountPlatform.STOCKTWITS,
         accountHandle,
         dlvritAccountId,
+        dlvritWorkspaceId: dlvritWorkspaceId ?? null,
         status: AccountStatus.ACTIVE,
         healthScore: 1.0,
         config: {},
@@ -910,6 +916,16 @@ export class AccountsService {
       select: { dlvritAccountId: true },
     });
     return row?.dlvritAccountId ?? null;
+  }
+
+  async getDlvritRouting(accountId: string): Promise<{
+    dlvritAccountId: number | null;
+    dlvritWorkspaceId: string | null;
+  } | null> {
+    return this.prisma.accountProfile.findUnique({
+      where: { id: accountId },
+      select: { dlvritAccountId: true, dlvritWorkspaceId: true },
+    });
   }
 
   async deleteStocktwitsAccounts(ids: string[]): Promise<number> {

@@ -12,12 +12,15 @@ import { AxiosError } from 'axios';
 import {
   AccountPlatform,
   AccountStatus,
+  AssetClass,
   DeadLetterStatus,
   DraftStatus,
   Prisma,
   PublishPlatform,
   PublishStatus,
   ReviewStatus,
+  RiskLevel,
+  TrendWindow,
 } from '@prisma/client';
 import { createHash, randomInt } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -29,7 +32,7 @@ import {
 } from '../common/constants/queue.constants';
 import { TelegramPublisher } from './telegram.publisher';
 import { StocktwitsPublisher } from './stocktwits.publisher';
-import { DlvritPublisher } from './dlvrit.publisher';
+import { DlvritPublisher, DlvritRoute } from './dlvrit.publisher';
 import { DlvritSessionService } from './dlvrit-session.service';
 import { TelemetryService } from '../telemetry/telemetry.service';
 import { calculateContentSimilarity } from '../common/utils/content-similarity.util';
@@ -470,10 +473,15 @@ export class PublishingService {
           if (!activeAccount) {
             throw new Error('StockTwits account is not available');
           }
-          const credentials = this.accountsService.getStocktwitsCredentials(
-            activeAccount.accountHandle,
-          );
-          if (!credentials) {
+          const useLegacyPoster =
+            this.configService.get<boolean>('STOCKTWITS_USE_LEGACY_POSTER') ??
+            false;
+          const credentials = useLegacyPoster
+            ? this.accountsService.getStocktwitsCredentials(
+                activeAccount.accountHandle,
+              )
+            : null;
+          if (useLegacyPoster && !credentials) {
             throw new Error('StockTwits account credentials missing');
           }
 
@@ -531,7 +539,9 @@ export class PublishingService {
               // skipping. This builds genuine activity history even while the
               // account is below the promotional-post threshold.
               try {
-                await this.stocktwitsPublisher.runEngagementSession(credentials);
+                if (credentials) {
+                  await this.stocktwitsPublisher.runEngagementSession(credentials);
+                }
                 this.logger.log(
                   `Warm-up engagement for "${activeAccount.accountHandle}" complete.`,
                 );
@@ -579,13 +589,9 @@ export class PublishingService {
             }
           }
 
-          const useLegacyPoster =
-            this.configService.get<boolean>('STOCKTWITS_USE_LEGACY_POSTER') ??
-            false;
-
           if (useLegacyPoster) {
             const result = await this.stocktwitsPublisher.publish(
-              credentials,
+              credentials!,
               stocktwitsMessage,
               job.id,
               stocktwitsTargetSymbol ?? undefined,
@@ -606,6 +612,7 @@ export class PublishingService {
             }
             const result = await this.dlvritPublisher.postToAccount({
               dlvritAccountId,
+              dlvritWorkspaceId: activeAccount.dlvritWorkspaceId,
               message: stocktwitsMessage,
               jobId: job.id,
             });
@@ -1419,6 +1426,7 @@ export class PublishingService {
     stocktwitsPassword?: string;
     stocktwitsProxy?: string;
     stocktwitsAccountHandle?: string;
+    stocktwitsAccountId?: string;
     publishToStocktwits?: boolean;
     publishToDiscord?: boolean;
     discordServerUrl?: string;
@@ -1668,29 +1676,35 @@ export class PublishingService {
         // dlvr.it path: pick by handle from UI or auto-select eligible account.
         // Legacy path: use manual credentials if provided, otherwise auto-select.
         if (!useLegacyPoster) {
-          const handle =
-            (input.stocktwitsAccountHandle || '').trim() ||
-            (await this.accountsService.getEligibleAccount(
+          const requestedAccountId = (input.stocktwitsAccountId || '').trim();
+          let handle: string | null = (input.stocktwitsAccountHandle || '').trim() || null;
+          if (!requestedAccountId && !handle) {
+            handle = await this.accountsService.getEligibleAccount(
               AccountPlatform.STOCKTWITS,
               { scheduledAt: new Date() },
-            ).then((a) => a?.accountHandle ?? null));
+            ).then((a) => a?.accountHandle ?? null);
+          }
 
-          if (!handle) {
+          if (!requestedAccountId && !handle) {
             throw new Error('stocktwits_no_eligible_account');
           }
 
-          const dlvritProfile = await this.prisma.accountProfile.findUnique({
-            where: {
-              platform_accountHandle: {
-                platform: AccountPlatform.STOCKTWITS,
-                accountHandle: handle,
-              },
-            },
-          });
+          const dlvritProfile = requestedAccountId
+            ? await this.prisma.accountProfile.findFirst({
+                where: { id: requestedAccountId, platform: AccountPlatform.STOCKTWITS },
+              })
+            : await this.prisma.accountProfile.findUnique({
+                where: {
+                  platform_accountHandle: {
+                    platform: AccountPlatform.STOCKTWITS,
+                accountHandle: handle!,
+                  },
+                },
+              });
 
           if (!dlvritProfile) {
             throw new Error(
-              `stocktwits_account_not_found: "${handle}" not found in DB.`,
+              `stocktwits_account_not_found: "${requestedAccountId || handle}" not found in DB.`,
             );
           }
 
@@ -1734,6 +1748,7 @@ export class PublishingService {
             try {
               const result = await this.dlvritPublisher.postToAccount({
                 dlvritAccountId,
+                dlvritWorkspaceId: dlvritProfile.dlvritWorkspaceId,
                 message,
                 jobId: `${stocktwitsPublishId}-${item.symbol}-${i + 1}`,
               });
@@ -2269,6 +2284,167 @@ export class PublishingService {
     return normalized;
   }
 
+  async scheduleStocktwitsCsvCampaign(input: {
+    symbols: string[];
+    templates: string[];
+    postCount?: number;
+    dlvritWorkspaceIds?: string[];
+  }): Promise<Record<string, unknown>> {
+    const symbols = Array.from(
+      new Set(
+        input.symbols
+          .map((value) => this.normalizeStocktwitsTargetSymbol(value))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    );
+    const templates = input.templates.map((value) => value.trim()).filter(Boolean);
+    if (symbols.length < 2) {
+      throw new BadRequestException('CSV must contain at least two valid, unique symbols.');
+    }
+    if (templates.length < 1 || templates.length > 10) {
+      throw new BadRequestException('Provide between 1 and 10 post templates.');
+    }
+
+    const minimumPosts = Math.ceil(symbols.length / 3);
+    const maximumPosts = Math.floor(symbols.length / 2);
+    const postCount = input.postCount ?? minimumPosts;
+    if (postCount < minimumPosts || postCount > maximumPosts) {
+      throw new BadRequestException(
+        `For ${symbols.length} symbols, post count must be between ${minimumPosts} and ${maximumPosts} so every post has 2–3 unique symbols.`,
+      );
+    }
+
+    const workspaceFilter = input.dlvritWorkspaceIds?.filter(Boolean) ?? [];
+    const workspaces = await this.prisma.dlvritWorkspace.findMany({
+      where: {
+        status: 'ACTIVE',
+        ...(workspaceFilter.length ? { id: { in: workspaceFilter } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    const connected: Array<DlvritRoute & { workspaceId: string | null }> = [];
+    if (workspaces.length === 0) {
+      const legacyRoutes = await this.dlvritPublisher.listConnectedAccounts();
+      connected.push(...legacyRoutes.map((route) => ({ ...route, workspaceId: null })));
+    } else {
+      for (const workspace of workspaces) {
+        try {
+          const routes = await this.dlvritPublisher.listConnectedAccounts(workspace.id);
+          connected.push(...routes.map((route) => ({ ...route, workspaceId: workspace.id })));
+        } catch (error) {
+          await this.prisma.dlvritWorkspace.update({
+            where: { id: workspace.id },
+            data: { status: 'RECONNECT_REQUIRED', lastError: error instanceof Error ? error.message : 'unknown error' },
+          });
+        }
+      }
+    }
+    const eligibleConnected = connected.filter(
+      (account) => account.active && !account.needsReconnect && account.platformId === 22,
+    );
+    if (eligibleConnected.length === 0) {
+      throw new BadRequestException('No active Stocktwits accounts are linked in dlvr.it.');
+    }
+    for (const account of eligibleConnected) {
+      await this.upsertDlvritAccount(account.name, account.id, account.workspaceId);
+    }
+    const accounts = await this.prisma.accountProfile.findMany({
+      where: {
+        platform: AccountPlatform.STOCKTWITS,
+        status: AccountStatus.ACTIVE,
+        OR: eligibleConnected.map((account) => ({
+          dlvritAccountId: account.id,
+          dlvritWorkspaceId: account.workspaceId,
+        })),
+      },
+      orderBy: [{ lastSelectedAt: 'asc' }, { accountHandle: 'asc' }],
+    });
+
+    const groups: string[][] = [];
+    let cursor = 0;
+    for (let index = 0; index < postCount; index += 1) {
+      const postsLeft = postCount - index;
+      const symbolsLeft = symbols.length - cursor;
+      const groupSize = symbolsLeft - postsLeft * 2 >= 1 ? 3 : 2;
+      groups.push(symbols.slice(cursor, cursor + groupSize));
+      cursor += groupSize;
+    }
+
+    const campaignId = `csv-${Date.now()}-${randomInt(100000, 1_000_000)}`;
+    const scheduled: Array<Record<string, unknown>> = [];
+    for (let index = 0; index < groups.length; index += 1) {
+      const group = groups[index];
+      const account = accounts[index % accounts.length];
+      const cashtags = group.map((symbol) => `$${symbol}`).join(' ');
+      const template = templates[index % templates.length];
+      const rendered = template
+        .replace(/\{\{\s*symbols?\s*\}\}/gi, cashtags)
+        .replace(/\{\{\s*tickers?\s*\}\}/gi, cashtags);
+      const variations = [
+        'Market watch:',
+        'On the radar:',
+        'Momentum check:',
+        'Today’s watchlist:',
+      ];
+      const body = rendered === template
+        ? `${cashtags}\n\n${variations[index % variations.length]} ${template}`
+        : rendered;
+      const maxLength = this.configService.get<number>('STOCKTWITS_MAX_MESSAGE_LENGTH') ?? 1000;
+      this.stocktwitsComplianceService.enforceManualPublishCompliance({
+        body,
+        symbol: group[0],
+        publishToStocktwits: true,
+        maxMessageLength: maxLength,
+      });
+      const scheduleAt = new Date(Date.now() + index * 90_000);
+      const trend = await this.prisma.trendTopic.create({
+        data: {
+          symbol: group[0],
+          assetClass: AssetClass.EQUITY,
+          windowType: TrendWindow.H1,
+          score: 0,
+          mentionCount: group.length,
+          windowStart: new Date(),
+          windowEnd: new Date(),
+          evidence: { campaignId, symbols: group, source: 'manual_csv' },
+        },
+      });
+      const contentHash = createHash('sha256').update(`${campaignId}:${index}:${body}`).digest('hex');
+      const draft = await this.prisma.contentDraft.create({
+        data: {
+          trendTopicId: trend.id,
+          body,
+          disclaimer: MANDATORY_DISCLAIMER,
+          riskLevel: RiskLevel.LOW,
+          policyFlags: [],
+          provider: 'template',
+          model: 'csv-campaign',
+          promptVersion: 'csv-v1',
+          status: DraftStatus.AUTO_APPROVED,
+          approvedAt: new Date(),
+          contentHash,
+        },
+      });
+      await this.createAndQueuePublishJob({
+        draftId: draft.id,
+        platform: PublishPlatform.STOCKTWITS,
+        accountId: account.id,
+        targetRef: group[0],
+        scheduleAt,
+        cooldownMinutes: 1.5,
+        similarityThreshold: 1,
+      });
+      scheduled.push({
+        index: index + 1,
+        symbols: group,
+        account: account.accountHandle,
+        dlvritWorkspaceId: account.dlvritWorkspaceId,
+        scheduledAt: scheduleAt.toISOString(),
+      });
+    }
+    return { campaignId, postCount: scheduled.length, intervalSeconds: 90, scheduled };
+  }
+
   private buildStocktwitsSymbolMessage(
     body: string,
     symbol: string | null,
@@ -2800,10 +2976,15 @@ export class PublishingService {
     return this.accountsService.listDlvritAccounts();
   }
 
-  async upsertDlvritAccount(accountHandle: string, dlvritAccountId: number) {
+  async upsertDlvritAccount(
+    accountHandle: string,
+    dlvritAccountId: number,
+    dlvritWorkspaceId?: string | null,
+  ) {
     return this.accountsService.upsertDlvritAccount(
       accountHandle,
       dlvritAccountId,
+      dlvritWorkspaceId,
     );
   }
 
@@ -2815,16 +2996,106 @@ export class PublishingService {
     return this.accountsService.deleteStocktwitsAccounts(ids);
   }
 
-  async listDlvritConnectedAccounts() {
-    return this.dlvritPublisher.listConnectedAccounts();
+  async listDlvritConnectedAccounts(workspaceId?: string) {
+    return this.dlvritPublisher.listConnectedAccounts(workspaceId);
   }
 
-  async listDlvritConnectedAccountsRaw() {
-    return this.dlvritPublisher.listConnectedAccountsRaw();
+  async listAllDlvritConnectedAccounts() {
+    const workspaces = await this.prisma.dlvritWorkspace.findMany({ orderBy: { createdAt: 'asc' } });
+    if (workspaces.length === 0) {
+      return (await this.dlvritPublisher.listConnectedAccounts()).map((route) => ({
+        ...route,
+        workspaceId: null,
+        workspaceLabel: 'Default dlvr.it',
+        workspaceEmail: null,
+      }));
+    }
+    const rows: Array<DlvritRoute & { workspaceId: string; workspaceLabel: string; workspaceEmail: string }> = [];
+    for (const workspace of workspaces) {
+      try {
+        const routes = await this.dlvritPublisher.listConnectedAccounts(workspace.id);
+        rows.push(...routes.map((route) => ({
+          ...route,
+          workspaceId: workspace.id,
+          workspaceLabel: workspace.label,
+          workspaceEmail: workspace.email,
+        })));
+      } catch (error) {
+        this.logger.warn(`Unable to list routes for dlvr.it workspace ${workspace.label}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+    return rows;
   }
 
-  async refreshDlvritSession(): Promise<void> {
-    await this.dlvritSessionService.refreshSession();
+  async listDlvritConnectedAccountsRaw(workspaceId?: string) {
+    return this.dlvritPublisher.listConnectedAccountsRaw(workspaceId);
+  }
+
+  async refreshDlvritSession(workspaceId?: string): Promise<void> {
+    await this.dlvritSessionService.refreshSession(workspaceId);
+  }
+
+  async listDlvritWorkspaces() {
+    return this.prisma.dlvritWorkspace.findMany({
+      include: {
+        _count: { select: { accounts: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async loginDlvritWorkspace(input: { label?: string; email: string; password: string }) {
+    const email = input.email.trim().toLowerCase();
+    const label = input.label?.trim() || email;
+    if (!email || !input.password) {
+      throw new BadRequestException('dlvr.it email and password are required.');
+    }
+    const workspace = await this.prisma.dlvritWorkspace.upsert({
+      where: { email },
+      create: { email, label, status: 'CONNECTING' },
+      update: { label, status: 'CONNECTING', lastError: null },
+    });
+    try {
+      await this.dlvritSessionService.loginWorkspace(workspace.id, email, input.password);
+      const routes = await this.dlvritPublisher.listConnectedAccounts(workspace.id);
+      for (const route of routes.filter((item) => item.platformId === 22)) {
+        await this.upsertDlvritAccount(route.name, route.id, workspace.id);
+      }
+      return this.prisma.dlvritWorkspace.update({
+        where: { id: workspace.id },
+        data: { status: 'ACTIVE', lastConnectedAt: new Date(), lastError: null },
+        include: { _count: { select: { accounts: true } } },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      await this.prisma.dlvritWorkspace.update({
+        where: { id: workspace.id },
+        data: { status: 'RECONNECT_REQUIRED', lastError: message },
+      });
+      throw error;
+    }
+  }
+
+  async refreshDlvritWorkspace(workspaceId: string) {
+    const workspace = await this.prisma.dlvritWorkspace.findUnique({ where: { id: workspaceId } });
+    if (!workspace) throw new NotFoundException('dlvr.it workspace not found.');
+    try {
+      await this.dlvritSessionService.refreshSession(workspaceId);
+      const routes = await this.dlvritPublisher.listConnectedAccounts(workspaceId);
+      for (const route of routes.filter((item) => item.platformId === 22)) {
+        await this.upsertDlvritAccount(route.name, route.id, workspaceId);
+      }
+      return this.prisma.dlvritWorkspace.update({
+        where: { id: workspaceId },
+        data: { status: 'ACTIVE', lastConnectedAt: new Date(), lastError: null },
+      });
+    } catch (error) {
+      await this.prisma.dlvritWorkspace.update({
+        where: { id: workspaceId },
+        data: { status: 'RECONNECT_REQUIRED', lastError: error instanceof Error ? error.message : 'unknown error' },
+      });
+      throw error;
+    }
   }
 
 }
